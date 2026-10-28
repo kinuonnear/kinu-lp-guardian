@@ -24,7 +24,9 @@ Status (28 Oct 2026):
   `tools/bunker-quote.mjs` fetches a live quote and prints the two arguments.
 - Mainnet proofs in DAY1.md (28 Oct): a contract opened and closed a Rhea DCL position; the vault ran a
   Bunker exit: 3 USDC -> 0.00203427 ZEC into a shielded Zodl address (Zcash tx 362d709d...).
-- Next: exact in-range minimum amounts (CLMM math); TEE-hosted agent; KINU page for owners.
+- **Agent in a TEE** (agent/): runs on OutLayer, key bound to its exact build; on mainnet it opened a
+  Rhea position and later ran the Bunker exit to shielded ZEC, every step signed in the TEE (agent/RUNS.md).
+- Next: exact in-range minimum amounts (CLMM math); KINU page for owners.
 
 ## Try it
 

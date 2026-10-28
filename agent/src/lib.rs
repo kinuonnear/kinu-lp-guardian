@@ -31,6 +31,7 @@ pub struct PositionRef {
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct VaultView {
+    pub owner: String,
     pub agent: Option<String>,
     pub policy: Policy,
     pub frozen: bool,
@@ -68,6 +69,10 @@ pub enum Action {
     BunkerExit { token: String, amount: u128 },
 }
 
+/// A one-sided range starts at least this many points away from the price, so a small move between
+/// reading the pool and the transaction landing cannot put the price inside it (Rhea then wants both tokens).
+pub const ONE_SIDED_MARGIN: i32 = 20;
+
 fn floor_to(v: i32, d: i32) -> i32 {
     v.div_euclid(d) * d
 }
@@ -99,12 +104,12 @@ pub fn decide(w: &World) -> Action {
             }
             if cur < pos.left_point {
                 // Price fell below the range: the position is all token X; re-enter just above the price.
-                let left = floor_to(cur, d) + d;
+                let left = floor_to(cur + ONE_SIDED_MARGIN, d) + d;
                 return Action::Rebalance { pool_id: pos.pool_id.clone(), left_point: left, right_point: left + wd };
             }
             if cur >= pos.right_point {
                 // Price rose above the range: all token Y; re-enter just below the price.
-                let right = floor_to(cur, d);
+                let right = floor_to(cur - ONE_SIDED_MARGIN, d);
                 return Action::Rebalance { pool_id: pos.pool_id.clone(), left_point: right - wd, right_point: right };
             }
             if v.high_point.is_none_or(|h| cur > h) {
@@ -125,12 +130,12 @@ pub fn decide(w: &World) -> Action {
             }
             if x > 0 {
                 // Only token X: a range just above the price uses X alone.
-                let left = floor_to(cur, d) + d;
+                let left = floor_to(cur + ONE_SIDED_MARGIN, d) + d;
                 return Action::Rebalance { pool_id: p.pool_id.clone(), left_point: left, right_point: left + wd };
             }
             if y > 0 {
                 // Only token Y: just below the price.
-                let right = floor_to(cur, d);
+                let right = floor_to(cur - ONE_SIDED_MARGIN, d);
                 return Action::Rebalance { pool_id: p.pool_id.clone(), left_point: right - wd, right_point: right };
             }
             Action::Noop("nothing to manage")
@@ -156,6 +161,7 @@ pub struct FunctionCall {
 /// Only the variants the agent sends; borsh tags follow NEAR's Action enum order.
 pub enum NearAction {
     FunctionCall(FunctionCall),
+    Transfer(u128),
 }
 
 impl BorshSerialize for NearAction {
@@ -164,6 +170,10 @@ impl BorshSerialize for NearAction {
             NearAction::FunctionCall(f) => {
                 2u8.serialize(w)?; // CreateAccount 0, DeployContract 1, FunctionCall 2
                 f.serialize(w)
+            }
+            NearAction::Transfer(amount) => {
+                3u8.serialize(w)?; // Transfer 3
+                amount.serialize(w)
             }
         }
     }
@@ -232,6 +242,7 @@ mod tests {
     }
     fn vault(position: Option<(i32, i32)>, high: Option<i32>) -> VaultView {
         VaultView {
+            owner: "owner".into(),
             agent: Some(ME.into()),
             policy: policy(),
             frozen: false,
@@ -259,15 +270,15 @@ mod tests {
         let only_x = decide(&World { me: ME, vault: &v, pool: &pool(1000), wallet: &[], dcl: (5, 0) });
         assert_eq!(only_x, Action::Rebalance { pool_id: "x|y|100".into(), left_point: 1040, right_point: 1200 });
         let only_y = decide(&World { me: ME, vault: &v, pool: &pool(1000), wallet: &[], dcl: (0, 5) });
-        assert_eq!(only_y, Action::Rebalance { pool_id: "x|y|100".into(), left_point: 840, right_point: 1000 });
+        assert_eq!(only_y, Action::Rebalance { pool_id: "x|y|100".into(), left_point: 800, right_point: 960 });
     }
 
     #[test]
     fn re_enters_one_sided_next_to_the_price() {
         // Below the range: just above the price, multiples of 40, width 160.
-        assert_eq!(run(&vault(Some((1000, 1160)), Some(1100)), 950, &[], false), Action::Rebalance { pool_id: "x|y|100".into(), left_point: 960, right_point: 1120 });
+        assert_eq!(run(&vault(Some((1000, 1160)), Some(1100)), 950, &[], false), Action::Rebalance { pool_id: "x|y|100".into(), left_point: 1000, right_point: 1160 });
         // Above the range: just below the price.
-        assert_eq!(run(&vault(Some((1000, 1160)), Some(1100)), 1210, &[], false), Action::Rebalance { pool_id: "x|y|100".into(), left_point: 1040, right_point: 1200 });
+        assert_eq!(run(&vault(Some((1000, 1160)), Some(1100)), 1210, &[], false), Action::Rebalance { pool_id: "x|y|100".into(), left_point: 1000, right_point: 1160 });
     }
 
     #[test]

@@ -1,6 +1,6 @@
 {
   "display": { "name": "KINU LP Guardian agent" },
-  "operations": ["pubkey", "tick"],
+  "operations": ["pubkey", "tick", "retire"],
   "capabilities": { "network": ["1click.chaindefuser.com"] },
   "signing_keys": [
     { "path": "agent", "type": "ed25519", "bind": "wasm" }

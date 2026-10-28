@@ -17,25 +17,27 @@ use near_sdk::{AccountId, BorshStorageKey, Gas, NearToken, PanicOnDefault, Promi
 use policy::{Policy, RateWindow, RebalanceRequest, Refusal, check_rebalance};
 use std::collections::HashMap;
 
-// Gas budget (mainnet DCL burns ~6 TGas for remove_liquidity, ~3 for withdraw_asset).
+// Gas budget, measured on mainnet (28-29 Oct): a full remove_liquidity schedules its own work and
+// fails with 30 TGas (KINU's app attaches 150); add_liquidity burns ~5, withdraw_asset ~3.
+// Every chain below fits in one 300 TGas transaction.
 const GAS_VIEW: Gas = Gas::from_tgas(10);
 const GAS_STORAGE: Gas = Gas::from_tgas(10);
 const GAS_FT_CALL: Gas = Gas::from_tgas(60);
 const GAS_ADD: Gas = Gas::from_tgas(40);
-const GAS_REMOVE: Gas = Gas::from_tgas(30);
-const GAS_WITHDRAW: Gas = Gas::from_tgas(30);
+const GAS_REMOVE: Gas = Gas::from_tgas(110);
+const GAS_WITHDRAW: Gas = Gas::from_tgas(25);
 const GAS_TRANSFER: Gas = Gas::from_tgas(10);
 const GAS_CB: Gas = Gas::from_tgas(10);
 /// on_ready_to_add: add_liquidity + on_added.
-const GAS_CB_ADD: Gas = Gas::from_tgas(70);
+const GAS_CB_ADD: Gas = Gas::from_tgas(60);
 /// on_liquidity_for_rebalance: remove + on_removed + list_user_assets + on_ready_to_add.
-const GAS_CB_REMOVE_ADD: Gas = Gas::from_tgas(140);
+const GAS_CB_REMOVE_ADD: Gas = Gas::from_tgas(200);
 /// on_pool_for_rebalance: get_liquidity + on_liquidity_for_rebalance.
-const GAS_CB_REBALANCE: Gas = Gas::from_tgas(170);
+const GAS_CB_REBALANCE: Gas = Gas::from_tgas(225);
 /// on_liquidity_for_exit: remove + on_removed + 2 withdraws + on_exited.
-const GAS_CB_REMOVE_EXIT: Gas = Gas::from_tgas(130);
+const GAS_CB_REMOVE_EXIT: Gas = Gas::from_tgas(195);
 /// on_pool_for_exit: get_liquidity + on_liquidity_for_exit.
-const GAS_CB_EXIT: Gas = Gas::from_tgas(150);
+const GAS_CB_EXIT: Gas = Gas::from_tgas(220);
 /// Registers a 1Click deposit address on the token before paying it (as KINU's bridge does).
 const STORAGE_FT: NearToken = NearToken::from_micronear(1_250);
 const ZERO: NearToken = NearToken::from_yoctonear(0);
@@ -265,7 +267,7 @@ impl Vault {
     #[private]
     pub fn on_removed(&mut self, #[callback_result] removed: Result<Value, PromiseError>) {
         if removed.is_err() {
-            env::panic_str("Rhea DCL refused to close the old position; nothing else was done");
+            env::panic_str("Rhea DCL refused to close the position; it stays open and no new one is opened");
         }
         if let Some(old) = self.position.take() {
             emit("position_closed", json!({ "lpt_id": old.lpt_id }));
@@ -356,6 +358,11 @@ impl Vault {
 
     #[private]
     pub fn on_exited(&mut self) {
+        // on_removed clears the position only when Rhea really closed it.
+        if let Some(pos) = &self.position {
+            emit("exit_failed", json!({ "lpt_id": pos.lpt_id, "why": "Rhea DCL did not close the position; it stays open" }));
+            return;
+        }
         self.high_point = None;
         emit("exited", json!({ "funds": "in the vault wallet; owner sweeps them or sends them to the Zcash exit address" }));
     }

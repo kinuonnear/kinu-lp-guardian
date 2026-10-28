@@ -50,7 +50,7 @@ mod run_impl {
     use serde_json::{Value, json};
 
     /// The published vault build this agent serves (cargo-near build of the vault in this repo).
-    pub const VAULT_CODE_HASH: &str = "CGYt988XAD9ALcafEU2VPFLCMG6MxfwbN14siLkvB1Kj";
+    pub const VAULT_CODE_HASH: &str = "BEjFkn4oiy48fyjgZm2vPHfFLabV1rWwes2Q1DBfAzW6";
     pub const DCL: &str = "dclv2.ref-labs.near";
     const GAS: u64 = 300_000_000_000_000;
 
@@ -78,6 +78,11 @@ mod run_impl {
 
     /// Builds, signs (in the TEE) and sends one function call from the agent's implicit account.
     fn send(me: &str, pk: &[u8; 32], receiver: &str, method: &str, args: String) -> Result<String, String> {
+        let call = NearAction::FunctionCall(FunctionCall { method_name: method.to_string(), args: args.into_bytes(), gas: GAS, deposit: 0 });
+        send_actions(me, pk, receiver, vec![call])
+    }
+
+    fn send_actions(me: &str, pk: &[u8; 32], receiver: &str, actions: Vec<NearAction>) -> Result<String, String> {
         let (ak, err) = rpc::view_access_key(me, &near_public_key(pk), "final");
         if !err.is_empty() {
             return Err(format!("access key: {err} (fund the agent account {me})"));
@@ -95,7 +100,7 @@ mod run_impl {
             nonce,
             receiver_id: receiver.to_string(),
             block_hash,
-            actions: vec![NearAction::FunctionCall(FunctionCall { method_name: method.to_string(), args: args.into_bytes(), gas: GAS, deposit: 0 })],
+            actions,
         };
         // The key signs the hash of a transaction this module composed from checked chain state.
         let sig = keys::sign("agent", None, &tx.hash()).map_err(|e| format!("sign: {e}"))?;
@@ -221,6 +226,21 @@ mod run_impl {
             return Ok(json!({ "ok": true, "agent": me, "action": "noop", "why": "not the published vault build", "code_hash": acct["code_hash"] }));
         }
         let v: VaultView = serde_json::from_value(view(vault, "get_vault", json!({}))?).map_err(|e| e.to_string())?;
+        if req["cmd"] == "retire" {
+            // Hands the agent's gas back to this vault's owner (read from the published vault, never
+            // from the input) — for a build that is being replaced.
+            let (mine, err) = rpc::view_account(&me, "final");
+            if !err.is_empty() {
+                return Err(format!("agent account: {err}"));
+            }
+            let amount: u128 = rpc_result(&mine)?["amount"].as_str().and_then(|a| a.parse().ok()).ok_or("no balance")?;
+            let keep: u128 = 10_000_000_000_000_000_000_000; // 0.01 NEAR for this transaction and storage
+            if amount <= keep {
+                return Ok(json!({ "ok": true, "agent": me, "action": "retire: nothing to return" }));
+            }
+            let tx = send_actions(&me, &pk, &v.owner, vec![NearAction::Transfer(amount - keep)])?;
+            return Ok(json!({ "ok": true, "agent": me, "action": "retire", "to": v.owner, "yocto": (amount - keep).to_string(), "tx": tx }));
+        }
         let pool_id = v.position.as_ref().map(|p| p.pool_id.clone()).or_else(|| v.policy.allowed_pools.first().cloned()).ok_or("no pool")?;
         let pool: PoolView = serde_json::from_value(view(DCL, "get_pool", json!({ "pool_id": pool_id }))?).map_err(|e| e.to_string())?;
         let mut wallet = Vec::new();
