@@ -22,7 +22,8 @@ Status (28 Oct 2026):
   call it only after an exit, so a crash can end in the owner's shielded pool without the owner online;
   a deposit address swapped in by a compromised agent fails the signature check.
   `tools/bunker-quote.mjs` fetches a live quote and prints the two arguments.
-- Mainnet proof of the DCL part: DAY1.md (a contract opened and closed a Rhea DCL position, 28 Oct).
+- Mainnet proofs in DAY1.md (28 Oct): a contract opened and closed a Rhea DCL position; the vault ran a
+  Bunker exit: 3 USDC -> 0.00203427 ZEC into a shielded Zodl address (Zcash tx 362d709d...).
 - Next: exact in-range minimum amounts (CLMM math); TEE-hosted agent; KINU page for owners.
 
 ## Try it

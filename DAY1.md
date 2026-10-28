@@ -44,3 +44,20 @@ Test account (implicit, funded by the owner with 4 NEAR + 3 USDC):
 5. remove_liquidity with amount 7024520687189: tx `HJ7MNLfjzVUrRZAiNyPU1d5ohX7sCMFudcR5pWUht8fp`;
    withdraw_asset: tx `2gbXhLsrmkzeBRRgBKW8JLqKLB9TkHKDKQ2YYtKJFbft`; 2.999999 USDC returned to
    kinuonnear.near: tx `BFvfGS7VoZY5M7gPS3av41Q3BWAnZwmw42xThLG6Kuwq`.
+
+## Bunker exit on mainnet (28 Oct 2026): PASSED
+
+The vault contract (this repo, commit 59697c2) deployed on the test account
+`74890a9ca6436e1da0b9a730a020223756e520c9812b97804b5c4a13be19e6c1`, owner = that account,
+exit address = the owner's Zodl (formerly Zashi) unified address `u1mpwfx74…n7r5p`
+(receivers checked on-chain: Sapling + Orchard, no transparent).
+
+1. `set_exit_zec`: tx `9Bfa3xxN5CkfxXWgvwXieLosuhtfBAS1nkDkZTnG3Roz`, event receivers [2, 3].
+2. The owner sent 3 USDC to the vault; `tools/bunker-quote.mjs` fetched a live 1Click quote
+   (deposit address `429511c24496456e33d1b87d372ac1eb15108daa3e319c3c94dfd4fef7e70031`, refundTo = the vault).
+3. `bunker_exit(token, signed, signature)`: tx `D7dmWwZBe1DRvkRLMujrsBFRRsrTGx1mGNrwKjFEThCE`.
+   The vault verified 1Click's ed25519 signature on-chain, checked recipient / ZEC / refund / deadline,
+   paid the deposit address 3,000,000 USDC, events `bunker_exit_started` → `bunker_exit_sent`.
+4. NEAR Intents status SUCCESS about 2 minutes later: **0.00203427 ZEC** delivered on Zcash,
+   tx `362d709d6d5f5828efb4fe06a65034a9a722d1a06d22a52b9d60a65de59ae5f1`, into the shielded pool
+   (the address has no transparent receiver).
