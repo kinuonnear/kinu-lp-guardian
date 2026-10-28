@@ -1742,6 +1742,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kinu-guardian-factory"
+version = "0.1.0"
+dependencies = [
+ "near-sdk",
+]
+
+[[package]]
 name = "kinu-guardian-mockdcl"
 version = "0.1.0"
 dependencies = [
@@ -1759,9 +1766,11 @@ dependencies = [
 name = "kinu-guardian-tests"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "near-api",
  "near-sandbox",
  "serde_json",
+ "sha2 0.10.9",
  "testresult",
  "tokio",
 ]

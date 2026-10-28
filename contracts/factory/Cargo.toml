@@ -1,0 +1,17 @@
+[package]
+name = "kinu-guardian-factory"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT"
+description = "KINU LP Guardian factory: creates vaults that run the published vault code (NEP-591 global contract)."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = { workspace = true }
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ["cfg(near)"]

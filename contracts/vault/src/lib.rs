@@ -121,8 +121,9 @@ fn call(to: &AccountId, method: &str, args: Value, deposit: NearToken, gas: Gas)
 }
 
 /// Minimum amounts the vault demands from add_liquidity, computed by the vault (never by the agent).
-/// One-sided ranges must use the deposited side fully, minus the owner's slippage.
-/// In-range: no minimum yet (the price check above bounds it); exact CLMM math is the next slice.
+/// One-sided ranges must use the deposited side fully, minus the owner's slippage. In-range: the
+/// least of each token the position would use anywhere within +-slippage of the price (KINU's
+/// `minAmountsInBand`), so a real price move past the tolerance fails but a small drift does not.
 pub fn min_amounts(left: i32, right: i32, current: i32, x: u128, y: u128, slippage_bps: u32) -> (u128, u128) {
     let keep = |v: u128| v - v * u128::from(slippage_bps) / 10_000;
     if left > current {
@@ -130,18 +131,62 @@ pub fn min_amounts(left: i32, right: i32, current: i32, x: u128, y: u128, slippa
     } else if right <= current {
         (0, keep(y))
     } else {
-        (0, 0)
+        in_band_mins(left, right, current, x, y, slippage_bps)
     }
+}
+
+// Rhea DCL (iZiSwap design): over points [left, right) a position of liquidity L holds
+// L*sqrtP(i) of Y and L/sqrtP(i) of X at every point i; these are the closed-form sums.
+const SQRT_RATE: f64 = 1.000_049_998_750_062_5; // sqrt(1.0001)
+fn sqrt_price(point: f64) -> f64 {
+    SQRT_RATE.powf(point)
+}
+fn amount_y(l: f64, left: f64, right: f64) -> f64 {
+    if right <= left { 0.0 } else { l * (sqrt_price(right) - sqrt_price(left)) / (SQRT_RATE - 1.0) }
+}
+fn amount_x(l: f64, left: f64, right: f64) -> f64 {
+    if right <= left { 0.0 } else { l * (1.0 / sqrt_price(left) - 1.0 / sqrt_price(right)) * SQRT_RATE / (SQRT_RATE - 1.0) }
+}
+
+pub fn in_band_mins(left: i32, right: i32, current: i32, x: u128, y: u128, slippage_bps: u32) -> (u128, u128) {
+    let (ax, ay) = (x as f64, y as f64);
+    let (l, r) = (f64::from(left), f64::from(right));
+    let used = |point: f64| {
+        let split = point.clamp(l, r);
+        let (ux, uy) = (amount_x(1e24, split, r), amount_y(1e24, l, split));
+        let lx = if ux > 0.0 { ax / ux } else { f64::INFINITY };
+        let ly = if uy > 0.0 { ay / uy } else { f64::INFINITY };
+        let k = lx.min(ly);
+        if k.is_finite() { (k * ux, k * uy) } else { (0.0, 0.0) }
+    };
+    let sl = (f64::from(slippage_bps) / 10_000.0).min(0.5);
+    let log_base = 1.0001f64.ln();
+    let up = ((1.0 + sl).ln() / log_base).ceil().max(1.0);
+    let down = (-(1.0 - sl).ln() / log_base).ceil().max(1.0);
+    let cur = f64::from(current);
+    let (mut mx, mut my) = (f64::INFINITY, f64::INFINITY);
+    for k in [-down, -down / 2.0, 0.0, up / 2.0, up] {
+        let (ux, uy) = used((cur + k).round());
+        mx = mx.min(ux);
+        my = my.min(uy);
+    }
+    // Rounding headroom between this float math and the contract's integer math.
+    let floor = |v: f64| if v.is_finite() && v > 0.0 { (v * 0.999).floor() as u128 } else { 0 };
+    (floor(mx), floor(my))
 }
 
 #[near]
 impl Vault {
     #[init]
-    pub fn new(owner: AccountId, agent: Option<AccountId>, dcl: AccountId, policy: Policy, oneclick_key: Option<String>) -> Self {
+    pub fn new(owner: AccountId, agent: Option<AccountId>, dcl: AccountId, policy: Policy, oneclick_key: Option<String>, exit_zec: Option<String>) -> Self {
         policy.validate().unwrap_or_else(|r| refuse(r));
+        // A factory-created vault can get its shielded exit address at birth (same Orchard rule as set_exit_zec).
+        if let Some(a) = &exit_zec {
+            zcash::validate_orchard_ua(a).unwrap_or_else(|e| env::panic_str(e.message()));
+        }
         let key = oneclick_key.as_deref().unwrap_or(oneclick::ONECLICK_MANAGER_KEY);
         let oneclick_key = oneclick::manager_key_bytes(key).unwrap_or_else(|| env::panic_str("1Click key must be a base58 ed25519 public key"));
-        Self { owner, agent, dcl, policy, frozen: false, rate: RateWindow::default(), exit_zec: None, position: None, high_point: None, oneclick_key, used_deposits: LookupSet::new(Key::UsedDeposits) }
+        Self { owner, agent, dcl, policy, frozen: false, rate: RateWindow::default(), exit_zec, position: None, high_point: None, oneclick_key, used_deposits: LookupSet::new(Key::UsedDeposits) }
     }
 
     // ---------- owner: setup ----------
@@ -479,6 +524,7 @@ mod tests {
             acc("dclv2.ref-dev.testnet"),
             Policy { allowed_pools: vec![POOL.into()], min_width: 400, max_width: 8_000, max_distance: 400, max_actions: 3, window_secs: 86_400, max_slippage_bps: 100, exit_drop_points: 2_877 },
             None,
+            None,
         )
     }
 
@@ -570,7 +616,7 @@ mod tests {
         let ctx = |who: &str| VMContextBuilder::new().predecessor_account_id(acc(who)).current_account_id(acc(TEST_VAULT)).block_timestamp(1_793_204_164 * 1_000_000_000).build();
         testing_env!(ctx("owner.testnet"));
         let policy = Policy { allowed_pools: vec![POOL.into()], min_width: 400, max_width: 8_000, max_distance: 400, max_actions: 3, window_secs: 86_400, max_slippage_bps: 100, exit_drop_points: 2_877 };
-        let mut v = Vault::new(acc("owner.testnet"), Some(acc("agent.testnet")), acc("dclv2.ref-labs.near"), policy, None);
+        let mut v = Vault::new(acc("owner.testnet"), Some(acc("agent.testnet")), acc("dclv2.ref-labs.near"), policy, None, None);
         v.set_exit_zec(UA.into());
         testing_env!(ctx(caller));
         let f: Value = near_sdk::serde_json::from_str(FIXTURE).unwrap();
@@ -610,6 +656,19 @@ mod tests {
     fn min_amounts_follow_the_range_side() {
         assert_eq!(min_amounts(200, 1200, 0, 1_000, 500, 100), (990, 0));
         assert_eq!(min_amounts(-1200, -200, 0, 1_000, 500, 100), (0, 495));
-        assert_eq!(min_amounts(-400, 400, 0, 1_000, 500, 100), (0, 0));
+    }
+
+    #[test]
+    fn in_range_minimums_are_real_and_below_the_amounts() {
+        // Amounts in the exact ratio a range centred on the price uses.
+        let (x, y) = (amount_x(1e18, 0.0, 400.0), amount_y(1e18, -400.0, 0.0));
+        let (ax, ay) = (x as u128, y as u128);
+        let (mx, my) = min_amounts(-400, 400, 0, ax, ay, 100);
+        assert!(mx > 0 && my > 0, "{mx} {my}");
+        assert!(mx < ax && my < ay);
+        // A wide range barely shifts its mix within 1%: minimums stay close to the amounts.
+        let (wx, wy) = (amount_x(1e18, 0.0, 20_000.0) as u128, amount_y(1e18, -20_000.0, 0.0) as u128);
+        let (mwx, mwy) = min_amounts(-20_000, 20_000, 0, wx, wy, 100);
+        assert!(mwx * 10 > wx * 9 && mwy * 10 > wy * 9, "{mwx}/{wx} {mwy}/{wy}");
     }
 }

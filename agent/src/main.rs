@@ -50,7 +50,7 @@ mod run_impl {
     use serde_json::{Value, json};
 
     /// The published vault build this agent serves (cargo-near build of the vault in this repo).
-    pub const VAULT_CODE_HASH: &str = "BEjFkn4oiy48fyjgZm2vPHfFLabV1rWwes2Q1DBfAzW6";
+    pub const VAULT_CODE_HASH: &str = "8hMAmATK8TC2NBGKgVCV2D7edJdvyJSkMfXMkmoAByTJ";
     pub const DCL: &str = "dclv2.ref-labs.near";
     const GAS: u64 = 300_000_000_000_000;
 
@@ -222,8 +222,11 @@ mod run_impl {
             return Err(format!("vault account: {err}"));
         }
         let acct = rpc_result(&acct)?;
-        if acct["code_hash"] != VAULT_CODE_HASH {
-            return Ok(json!({ "ok": true, "agent": me, "action": "noop", "why": "not the published vault build", "code_hash": acct["code_hash"] }));
+        // A factory vault runs the published code by reference (NEP-591): its hash is in
+        // global_contract_hash and code_hash stays at the zero sentinel.
+        let runs = acct["global_contract_hash"].as_str().or(acct["code_hash"].as_str()).unwrap_or("");
+        if runs != VAULT_CODE_HASH {
+            return Ok(json!({ "ok": true, "agent": me, "action": "noop", "why": "not the published vault build", "code_hash": runs }));
         }
         let v: VaultView = serde_json::from_value(view(vault, "get_vault", json!({}))?).map_err(|e| e.to_string())?;
         if req["cmd"] == "retire" {
