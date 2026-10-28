@@ -16,13 +16,19 @@ Status (28 Oct 2026):
 - Freeze, revoke, Orchard-only Zcash exit address (ZIP 316: bech32m + F4Jumble).
 - Proven: 3 USDC → 0.002023 ZEC through NEAR Intents to a Zodl (formerly Zashi) unified address with
   Sapling + Orchard receivers only (28 Oct, mainnet).
-- Next: Bunker exit — the vault verifies the 1Click quote signature on-chain (recipient = the owner's
-  Orchard address) before sending to its deposit address; exact in-range minimum amounts.
+- **Bunker exit** (`bunker_exit`): the vault pays a NEAR Intents 1Click deposit address only for a quote
+  1Click signed (ed25519 checked on-chain with 1Click's manager key) whose recipient is the owner's Orchard
+  address, paying native ZEC, refunding to the vault, still live, and never used before. The agent may
+  call it only after an exit, so a crash can end in the owner's shielded pool without the owner online;
+  a deposit address swapped in by a compromised agent fails the signature check.
+  `tools/bunker-quote.mjs` fetches a live quote and prints the two arguments.
+- Mainnet proof of the DCL part: DAY1.md (a contract opened and closed a Rhea DCL position, 28 Oct).
+- Next: exact in-range minimum amounts (CLMM math); TEE-hosted agent; KINU page for owners.
 
 ## Try it
 
 ```bash
-./scripts/test.sh   # builds all contracts, 19 unit tests + 1 end-to-end sandbox test
+./scripts/test.sh   # builds all contracts, 28 unit tests + 1 end-to-end sandbox test
 ```
 
 The sandbox test (tests/tests/flow.rs) runs the whole story on a local NEAR node: the owner funds the

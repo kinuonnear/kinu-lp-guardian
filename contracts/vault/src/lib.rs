@@ -6,12 +6,14 @@
 //! on-chain with a clear reason. Exit by the agent is allowed only when the owner's exit rule is met;
 //! exited funds stay in the vault until the owner moves them.
 
+pub mod oneclick;
 pub mod policy;
 pub mod zcash;
 
 use near_sdk::json_types::U128;
 use near_sdk::serde_json::{Value, json};
-use near_sdk::{AccountId, Gas, NearToken, PanicOnDefault, Promise, PromiseError, PromiseOrValue, env, near};
+use near_sdk::store::LookupSet;
+use near_sdk::{AccountId, BorshStorageKey, Gas, NearToken, PanicOnDefault, Promise, PromiseError, PromiseOrValue, env, near};
 use policy::{Policy, RateWindow, RebalanceRequest, Refusal, check_rebalance};
 use std::collections::HashMap;
 
@@ -34,6 +36,8 @@ const GAS_CB_REBALANCE: Gas = Gas::from_tgas(170);
 const GAS_CB_REMOVE_EXIT: Gas = Gas::from_tgas(130);
 /// on_pool_for_exit: get_liquidity + on_liquidity_for_exit.
 const GAS_CB_EXIT: Gas = Gas::from_tgas(150);
+/// Registers a 1Click deposit address on the token before paying it (as KINU's bridge does).
+const STORAGE_FT: NearToken = NearToken::from_micronear(1_250);
 const ZERO: NearToken = NearToken::from_yoctonear(0);
 const ONE_YOCTO: NearToken = NearToken::from_yoctonear(1);
 
@@ -75,6 +79,12 @@ pub struct VaultView {
     pub high_point: Option<i32>,
 }
 
+#[derive(BorshStorageKey)]
+#[near]
+enum Key {
+    UsedDeposits,
+}
+
 #[near(contract_state)]
 #[derive(PanicOnDefault)]
 pub struct Vault {
@@ -88,6 +98,10 @@ pub struct Vault {
     position: Option<PositionRef>,
     /// Highest pool point the vault has read itself while holding the position (exit rule).
     high_point: Option<i32>,
+    /// 1Click's quote-signing key; Bunker exit pays only quotes signed with it.
+    oneclick_key: [u8; 32],
+    /// 1Click deposit addresses already paid (a signed quote is used once).
+    used_deposits: LookupSet<String>,
 }
 
 fn refuse(r: Refusal) -> ! {
@@ -121,9 +135,11 @@ pub fn min_amounts(left: i32, right: i32, current: i32, x: u128, y: u128, slippa
 #[near]
 impl Vault {
     #[init]
-    pub fn new(owner: AccountId, agent: Option<AccountId>, dcl: AccountId, policy: Policy) -> Self {
+    pub fn new(owner: AccountId, agent: Option<AccountId>, dcl: AccountId, policy: Policy, oneclick_key: Option<String>) -> Self {
         policy.validate().unwrap_or_else(|r| refuse(r));
-        Self { owner, agent, dcl, policy, frozen: false, rate: RateWindow::default(), exit_zec: None, position: None, high_point: None }
+        let key = oneclick_key.as_deref().unwrap_or(oneclick::ONECLICK_MANAGER_KEY);
+        let oneclick_key = oneclick::manager_key_bytes(key).unwrap_or_else(|| env::panic_str("1Click key must be a base58 ed25519 public key"));
+        Self { owner, agent, dcl, policy, frozen: false, rate: RateWindow::default(), exit_zec: None, position: None, high_point: None, oneclick_key, used_deposits: LookupSet::new(Key::UsedDeposits) }
     }
 
     // ---------- owner: setup ----------
@@ -344,6 +360,51 @@ impl Vault {
         emit("exited", json!({ "funds": "in the vault wallet; owner sweeps them or sends them to the Zcash exit address" }));
     }
 
+    // ---------- Bunker exit: to the owner's shielded Zcash address via NEAR Intents ----------
+
+    /// Pays a 1Click deposit address with a token the vault holds, but only for a quote 1Click signed
+    /// whose recipient is the owner's Orchard address, paying native ZEC, refunding to the vault, still
+    /// live and never used before. The owner may call it any time; the agent only when no position is
+    /// open (after an exit), so an exit can go straight to the bunker without the owner being online.
+    pub fn bunker_exit(&mut self, token: AccountId, signed: String, signature: String) -> Promise {
+        let by_owner = env::predecessor_account_id() == self.owner;
+        if !by_owner {
+            self.assert_agent_and_live();
+            if self.position.is_some() {
+                env::panic_str("Close the position first: the agent sends only exited funds to the bunker");
+            }
+        }
+        let recipient = self.exit_zec.clone().unwrap_or_else(|| env::panic_str("The owner has not set a Zcash exit address"));
+        let me = env::current_account_id();
+        let expect = oneclick::Expect { token: &token, recipient: &recipient, refund_to: &me, now_secs: env::block_timestamp() / 1_000_000_000 };
+        let q = oneclick::verify_and_read(&signed, &signature, &self.oneclick_key, &expect).unwrap_or_else(|e| env::panic_str(e));
+        if !self.used_deposits.insert(q.deposit_address.to_string()) {
+            env::panic_str("This 1Click quote was already used");
+        }
+        emit("bunker_exit_started", json!({ "by": if by_owner { "owner" } else { "agent" }, "token": token, "amount": U128(q.amount_in), "deposit_address": q.deposit_address }));
+        let mut transfer = json!({ "receiver_id": q.deposit_address, "amount": U128(q.amount_in) });
+        if let Some(memo) = &q.deposit_memo {
+            transfer["memo"] = json!(memo);
+        }
+        call(&token, "storage_deposit", json!({ "account_id": q.deposit_address, "registration_only": true }), STORAGE_FT, GAS_STORAGE)
+            .then(call(&token, "ft_transfer", transfer, ONE_YOCTO, GAS_TRANSFER))
+            .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB).on_bunker_sent(token, U128(q.amount_in)))
+    }
+
+    #[private]
+    pub fn on_bunker_sent(&mut self, token: AccountId, amount: U128, #[callback_result] sent: Result<(), PromiseError>) -> bool {
+        let ok = sent.is_ok();
+        emit(if ok { "bunker_exit_sent" } else { "bunker_exit_failed" }, json!({ "token": token, "amount": amount }));
+        ok
+    }
+
+    /// Lets the owner follow a 1Click key rotation.
+    pub fn set_oneclick_key(&mut self, key: String) {
+        self.assert_owner();
+        self.oneclick_key = oneclick::manager_key_bytes(&key).unwrap_or_else(|| env::panic_str("1Click key must be a base58 ed25519 public key"));
+        emit("oneclick_key_set", json!({ "key": key }));
+    }
+
     // ---------- views ----------
 
     pub fn get_vault(&self) -> VaultView {
@@ -410,6 +471,7 @@ mod tests {
             Some(acc("agent.testnet")),
             acc("dclv2.ref-dev.testnet"),
             Policy { allowed_pools: vec![POOL.into()], min_width: 400, max_width: 8_000, max_distance: 400, max_actions: 3, window_secs: 86_400, max_slippage_bps: 100, exit_drop_points: 2_877 },
+            None,
         )
     }
 
@@ -490,6 +552,51 @@ mod tests {
         v.position = Some(PositionRef { lpt_id: "1".into(), pool_id: POOL.into(), left_point: -400, right_point: 400 });
         v.high_point = Some(3_000);
         let _ = v.on_pool_for_exit(false, Ok(Some(pool_view(0))));
+    }
+
+    const FIXTURE: &str = include_str!("fixtures/oneclick-quote.json");
+    const TEST_VAULT: &str = "74890a9ca6436e1da0b9a730a020223756e520c9812b97804b5c4a13be19e6c1";
+    const USDC: &str = "17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1";
+
+    /// The vault deployed at the account the real 1Click quote refunds to, at the quote's time.
+    fn bunker_vault(caller: &str) -> (Vault, String, String) {
+        let ctx = |who: &str| VMContextBuilder::new().predecessor_account_id(acc(who)).current_account_id(acc(TEST_VAULT)).block_timestamp(1_793_204_164 * 1_000_000_000).build();
+        testing_env!(ctx("owner.testnet"));
+        let policy = Policy { allowed_pools: vec![POOL.into()], min_width: 400, max_width: 8_000, max_distance: 400, max_actions: 3, window_secs: 86_400, max_slippage_bps: 100, exit_drop_points: 2_877 };
+        let mut v = Vault::new(acc("owner.testnet"), Some(acc("agent.testnet")), acc("dclv2.ref-labs.near"), policy, None);
+        v.set_exit_zec(UA.into());
+        testing_env!(ctx(caller));
+        let f: Value = near_sdk::serde_json::from_str(FIXTURE).unwrap();
+        (v, f["signed"].as_str().unwrap().into(), f["signature"].as_str().unwrap().into())
+    }
+
+    #[test]
+    fn owner_bunker_exit_with_a_signed_quote() {
+        let (mut v, signed, sig) = bunker_vault("owner.testnet");
+        let _ = v.bunker_exit(acc(USDC), signed, sig);
+    }
+
+    #[test]
+    #[should_panic(expected = "already used")]
+    fn a_quote_is_used_once() {
+        let (mut v, signed, sig) = bunker_vault("owner.testnet");
+        let _ = v.bunker_exit(acc(USDC), signed.clone(), sig.clone());
+        let _ = v.bunker_exit(acc(USDC), signed, sig);
+    }
+
+    #[test]
+    #[should_panic(expected = "not signed by NEAR Intents 1Click")]
+    fn agent_cannot_swap_the_deposit_address() {
+        let (mut v, signed, sig) = bunker_vault("agent.testnet");
+        let _ = v.bunker_exit(acc(USDC), signed.replace("7ac092ef", "0000beef"), sig);
+    }
+
+    #[test]
+    #[should_panic(expected = "Close the position first")]
+    fn agent_bunker_exit_waits_for_the_exit() {
+        let (mut v, signed, sig) = bunker_vault("agent.testnet");
+        v.position = Some(PositionRef { lpt_id: "1".into(), pool_id: POOL.into(), left_point: -400, right_point: 400 });
+        let _ = v.bunker_exit(acc(USDC), signed, sig);
     }
 
     #[test]
