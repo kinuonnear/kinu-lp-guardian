@@ -1,0 +1,14 @@
+[workspace]
+members = ["contracts/vault", "contracts/probe"]
+resolver = "3"
+
+[workspace.dependencies]
+near-sdk = "5.29"
+
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
