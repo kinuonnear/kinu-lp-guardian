@@ -1,7 +1,7 @@
 # Guardian agent on OutLayer (mainnet)
 
 The agent is a `wasm32-wasip2` component run directly from its FastFS URL (`bind: "wasm"`), started by
-the vault owner's account `74890a9c…e6c1` with `request_execution` (≈0.002 NEAR per run). Its signing
+the caller account (since build 5e0643de: `guardian.kinuonnear.near`; before: the test account `74890a9c…e6c1`) with `request_execution` (≈0.002 NEAR per run). Its signing
 key `agent` is derived inside the TEE from the exact build and the caller; its NEAR account is that
 key's implicit account. A new build has a new key, so the owner must name the new agent on the vault.
 
@@ -12,12 +12,16 @@ key's implicit account. A new build has a new key, so the owner must name the ne
 | `48e4d22b…d972` | `7cd4abef…ff43` | opens a one-sided range when the vault holds one token only |
 | `8c9a3c12…fbb6` | `5fe922cf…9989` | one-sided margin 20 points + `retire`; opened the position (below); retired: 0.3077 NEAR back to the owner, tx `2782fLPMiqrS4c74x3gHHoxg9CEzFGyWirvZD3aEG1BW` |
 | `fa3f2004…dd6c` | `64af1438…95a4` | pins vault build `BEjFkn4o…` (gas fix); ran the Bunker exit; retired: 0.309 NEAR back, tx `3BtD8PqSQ3umvYFb6PxJZHTfNc4cLYVhfRaHLyQmWBG2` |
+| `5e0643de…38b3` | `50052ebe…076a` | **current.** Caller `guardian.kinuonnear.near`. Pins vault build `8SKHf63T…` (rebalance trigger, exit on rise, owner `set_range`, `withdraw_idle`, `close_vault`); no re-entry churn; cost guard (a day of fees must pay the gas, GeckoTerminal in the TEE); no pokes with the exit rule off. Upload tx `CA8QSytEGrr3CEaZHBDvtF9pLpUL3xXnYukuwAgmtUmy`, pubkey run `5WiyGjvi6YHuYWSWVFR1ZFZcHut52mmdHWBGmJDhW6UD` (29 Oct 2026) |
 
-How to run (owner logged in with `outlayer login`):
+From build `5e0643de…` the agent is started by the factory account `guardian.kinuonnear.near`, so its
+key (and account) belongs to KINU's official deployment rather than a test account.
+
+How to run (logged in with `outlayer login` as `guardian.kinuonnear.near`):
 
 ```bash
-H=fa3f20041c4d7c2f4e6cf08fea488d9856e0a68f6770b1d9db700c6a006cdd6c
-U=https://main.fastfs.io/74890a9ca6436e1da0b9a730a020223756e520c9812b97804b5c4a13be19e6c1/outlayer.near/$H.wasm
+H=5e0643def1582ba6bb2a39b3ef5c0259978457f1b7374309fc1ef6334c4d38b3
+U=https://main.fastfs.io/guardian.kinuonnear.near/outlayer.near/$H.wasm
 echo '{"cmd":"pubkey"}' > in.json && outlayer run --wasm $U --hash $H --input in.json
 echo '{"cmd":"tick","vault":"<vault account>"}' > in.json && outlayer run --wasm $U --hash $H --input in.json
 ```

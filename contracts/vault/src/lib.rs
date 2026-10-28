@@ -14,7 +14,7 @@ use near_sdk::json_types::U128;
 use near_sdk::serde_json::{Value, json};
 use near_sdk::store::LookupSet;
 use near_sdk::{AccountId, BorshStorageKey, Gas, NearToken, PanicOnDefault, Promise, PromiseError, PromiseOrValue, env, near};
-use policy::{Policy, RateWindow, RebalanceRequest, Refusal, check_rebalance};
+use policy::{Policy, RateWindow, RebalanceRequest, Refusal, check_out_of_range, check_rebalance};
 use std::collections::HashMap;
 
 // Gas budget, measured on mainnet (28-29 Oct): a full remove_liquidity schedules its own work and
@@ -38,6 +38,11 @@ const GAS_CB_REBALANCE: Gas = Gas::from_tgas(225);
 const GAS_CB_REMOVE_EXIT: Gas = Gas::from_tgas(195);
 /// on_pool_for_exit: get_liquidity + on_liquidity_for_exit.
 const GAS_CB_EXIT: Gas = Gas::from_tgas(220);
+/// on_close_checked: the empty-code deploy and the account deletion.
+const GAS_CB_CLOSE: Gas = Gas::from_tgas(40);
+/// The smallest valid wasm module. Closing deploys it first: NEAR refuses to delete an account
+/// holding more than 10 kB, and the vault's own code is far larger.
+const EMPTY_WASM: &[u8] = b"\0asm\x01\0\0\0";
 /// Registers a 1Click deposit address on the token before paying it (as KINU's bridge does).
 const STORAGE_FT: NearToken = NearToken::from_micronear(1_250);
 const ZERO: NearToken = NearToken::from_yoctonear(0);
@@ -79,6 +84,7 @@ pub struct VaultView {
     pub exit_zec: Option<String>,
     pub position: Option<PositionRef>,
     pub high_point: Option<i32>,
+    pub low_point: Option<i32>,
 }
 
 #[derive(BorshStorageKey)]
@@ -98,8 +104,10 @@ pub struct Vault {
     rate: RateWindow,
     exit_zec: Option<String>,
     position: Option<PositionRef>,
-    /// Highest pool point the vault has read itself while holding the position (exit rule).
+    /// Highest and lowest pool points the vault has read itself while holding the position (exit
+    /// rule: the highest when it watches a fall, the lowest when it watches a rise).
     high_point: Option<i32>,
+    low_point: Option<i32>,
     /// 1Click's quote-signing key; Bunker exit pays only quotes signed with it.
     oneclick_key: [u8; 32],
     /// 1Click deposit addresses already paid (a signed quote is used once).
@@ -175,6 +183,17 @@ pub fn in_band_mins(left: i32, right: i32, current: i32, x: u128, y: u128, slipp
     (floor(mx), floor(my))
 }
 
+/// True when a balance answer holds nothing: a JSON amount string ("0") or an object of them
+/// ({} or {"token": "0"}). Anything unreadable counts as holding something.
+pub fn holds_nothing(raw: &[u8]) -> bool {
+    let zero = |v: &Value| v.as_str().and_then(|s| s.parse::<u128>().ok()) == Some(0);
+    match near_sdk::serde_json::from_slice::<Value>(raw) {
+        Ok(Value::Object(m)) => m.values().all(zero),
+        Ok(v) => zero(&v),
+        Err(_) => false,
+    }
+}
+
 #[near]
 impl Vault {
     #[init]
@@ -186,7 +205,7 @@ impl Vault {
         }
         let key = oneclick_key.as_deref().unwrap_or(oneclick::ONECLICK_MANAGER_KEY);
         let oneclick_key = oneclick::manager_key_bytes(key).unwrap_or_else(|| env::panic_str("1Click key must be a base58 ed25519 public key"));
-        Self { owner, agent, dcl, policy, frozen: false, rate: RateWindow::default(), exit_zec, position: None, high_point: None, oneclick_key, used_deposits: LookupSet::new(Key::UsedDeposits) }
+        Self { owner, agent, dcl, policy, frozen: false, rate: RateWindow::default(), exit_zec, position: None, high_point: None, low_point: None, oneclick_key, used_deposits: LookupSet::new(Key::UsedDeposits) }
     }
 
     // ---------- owner: setup ----------
@@ -287,8 +306,43 @@ impl Vault {
             refuse(Refusal::Frozen);
         }
         check_rebalance(&self.policy, &request, pool.current_point).unwrap_or_else(|r| refuse(r));
+        if let Some(open) = &self.position {
+            check_out_of_range(&self.policy, open.left_point, open.right_point, pool.current_point).unwrap_or_else(|r| refuse(r));
+        }
         self.note_point(pool.current_point);
         emit("rebalance_approved", json!({ "pool_id": request.pool_id, "left_point": request.left_point, "right_point": request.right_point, "current_point": pool.current_point }));
+        self.move_position(request, pool)
+    }
+
+    // ---------- owner: place the position ----------
+
+    /// The owner places the position where they want it: any range in an allowed pool, including a
+    /// one-sided one above or below the price (only the token on that side goes in). The agent's
+    /// limits (width, distance, rate, buffer) do not bind the owner; Rhea still needs the points on
+    /// the pool's spacing.
+    pub fn set_range(&mut self, request: RebalanceRequest) -> Promise {
+        self.assert_owner();
+        if !self.policy.allowed_pools.iter().any(|p| p == &request.pool_id) {
+            refuse(Refusal::PoolNotAllowed);
+        }
+        if request.left_point >= request.right_point {
+            refuse(Refusal::BadRange);
+        }
+        call(&self.dcl, "get_pool", json!({ "pool_id": request.pool_id }), ZERO, GAS_VIEW)
+            .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB_REBALANCE).on_pool_for_owner_range(request))
+    }
+
+    #[private]
+    pub fn on_pool_for_owner_range(&mut self, request: RebalanceRequest, #[callback_result] pool: Result<Option<PoolView>, PromiseError>) -> Promise {
+        let Ok(Some(pool)) = pool else { env::panic_str("Could not read the pool from Rhea DCL") };
+        self.note_point(pool.current_point);
+        emit("range_set_by_owner", json!({ "pool_id": request.pool_id, "left_point": request.left_point, "right_point": request.right_point, "current_point": pool.current_point }));
+        self.move_position(request, pool)
+    }
+
+    /// Closes the open position (if any) with its full liquidity, then opens `request` with
+    /// everything the vault holds in that pool.
+    fn move_position(&mut self, request: RebalanceRequest, pool: PoolView) -> Promise {
         match self.position.clone() {
             Some(old) => call(&self.dcl, "get_liquidity", json!({ "lpt_id": old.lpt_id }), ZERO, GAS_VIEW)
                 .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB_REMOVE_ADD).on_liquidity_for_rebalance(request, pool)),
@@ -347,7 +401,8 @@ impl Vault {
 
     // ---------- price watch and exit ----------
 
-    /// Anyone may ask the vault to read its pool and remember the highest point seen (for the exit rule).
+    /// Anyone may ask the vault to read its pool and remember the highest and lowest points seen (for
+    /// the exit rule). Returns the one the exit rule watches.
     pub fn poke(&mut self) -> Promise {
         let pos = self.position.clone().unwrap_or_else(|| env::panic_str("No open position"));
         call(&self.dcl, "get_pool", json!({ "pool_id": pos.pool_id }), ZERO, GAS_VIEW).then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB).on_poke())
@@ -357,12 +412,12 @@ impl Vault {
     pub fn on_poke(&mut self, #[callback_result] pool: Result<Option<PoolView>, PromiseError>) -> Option<i32> {
         let Ok(Some(pool)) = pool else { env::panic_str("Could not read the pool from Rhea DCL") };
         self.note_point(pool.current_point);
-        self.high_point
+        if self.policy.exit_on_rise { self.low_point } else { self.high_point }
     }
 
     /// Closes the position and pulls both tokens back into the vault's own wallet.
-    /// The owner may always do this; the agent only when the owner's exit rule is met
-    /// (the pool fell `exit_drop_points` below the highest point the vault saw itself).
+    /// The owner may always do this; the agent only when the owner's exit rule is met (the pool
+    /// moved `exit_drop_points` against the owner from the best point the vault saw itself).
     pub fn exit(&mut self) -> Promise {
         let by_owner = env::predecessor_account_id() == self.owner;
         if !by_owner {
@@ -379,13 +434,19 @@ impl Vault {
     #[private]
     pub fn on_pool_for_exit(&mut self, by_owner: bool, #[callback_result] pool: Result<Option<PoolView>, PromiseError>) -> Promise {
         let Ok(Some(pool)) = pool else { env::panic_str("Could not read the pool from Rhea DCL") };
-        let high = self.high_point.unwrap_or(pool.current_point).max(pool.current_point);
-        let drop = i64::from(high) - i64::from(pool.current_point);
-        if !by_owner && drop < i64::from(self.policy.exit_drop_points) {
-            env::panic_str("Exit rule not met: the price has not fallen far enough from its high");
+        let cur = pool.current_point;
+        let (mark, moved) = if self.policy.exit_on_rise {
+            let low = self.low_point.unwrap_or(cur).min(cur);
+            (low, i64::from(cur) - i64::from(low))
+        } else {
+            let high = self.high_point.unwrap_or(cur).max(cur);
+            (high, i64::from(high) - i64::from(cur))
+        };
+        if !by_owner && moved < i64::from(self.policy.exit_drop_points) {
+            env::panic_str("Exit rule not met: the price has not moved far enough against you");
         }
         let pos = self.position.clone().unwrap_or_else(|| env::panic_str("No open position"));
-        emit("exit_started", json!({ "by": if by_owner { "owner" } else { "agent" }, "lpt_id": pos.lpt_id, "high_point": high, "current_point": pool.current_point }));
+        emit("exit_started", json!({ "by": if by_owner { "owner" } else { "agent" }, "lpt_id": pos.lpt_id, "mark_point": mark, "current_point": cur, "on_rise": self.policy.exit_on_rise }));
         call(&self.dcl, "get_liquidity", json!({ "lpt_id": pos.lpt_id }), ZERO, GAS_VIEW)
             .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB_REMOVE_EXIT).on_liquidity_for_exit(pool))
     }
@@ -409,6 +470,7 @@ impl Vault {
             return;
         }
         self.high_point = None;
+        self.low_point = None;
         emit("exited", json!({ "funds": "in the vault wallet; owner sweeps them or sends them to the Zcash exit address" }));
     }
 
@@ -450,6 +512,66 @@ impl Vault {
         ok
     }
 
+    // ---------- owner: withdraw and close ----------
+
+    /// Sends the owner `token` that is not inside a position: `from_rhea` of the vault's idle balance
+    /// on Rhea (leftovers of an add, funds never placed, a refused add) plus `from_wallet` of its own
+    /// wallet, in one transaction. The page reads both amounts first. No callback (each one costs
+    /// kilobytes of code every vault pays storage for): if Rhea refuses, the transfer fails as well.
+    pub fn withdraw_idle(&mut self, token: AccountId, from_rhea: U128, from_wallet: U128) -> Promise {
+        self.assert_owner();
+        let total = from_rhea.0.checked_add(from_wallet.0).filter(|t| *t > 0).unwrap_or_else(|| env::panic_str("Nothing to withdraw"));
+        emit("withdraw_requested", json!({ "token": token, "from_rhea": from_rhea, "from_wallet": from_wallet }));
+        let send = call(&token, "ft_transfer", json!({ "receiver_id": self.owner, "amount": U128(total) }), ONE_YOCTO, GAS_TRANSFER);
+        if from_rhea.0 == 0 {
+            return send;
+        }
+        call(&self.dcl, "withdraw_asset", json!({ "token_id": token, "amount": from_rhea }), ZERO, GAS_WITHDRAW).then(send)
+    }
+
+    /// Closes the vault for good and returns its NEAR to the owner. Only once nothing is left in it:
+    /// no position, nothing on Rhea, no pool token in its wallet (they would be lost with the account).
+    /// Rhea keeps the vault's storage deposit (its DCL has no way to give it back).
+    pub fn close_vault(&mut self) -> Promise {
+        self.assert_owner();
+        if self.position.is_some() {
+            env::panic_str("Exit the position first");
+        }
+        let me = env::current_account_id();
+        let rhea = call(&self.dcl, "list_user_assets", json!({ "account_id": me }), ZERO, GAS_VIEW);
+        let checks = self.pool_tokens().iter().fold(rhea, |all, t| all.and(call(t, "ft_balance_of", json!({ "account_id": me }), ZERO, GAS_VIEW)));
+        checks.then(Self::ext(me.clone()).with_static_gas(GAS_CB_CLOSE).on_close_checked())
+    }
+
+    /// Result 0 is the Rhea balances ({"token": "amount"}), then one wallet balance per pool token.
+    #[private]
+    pub fn on_close_checked(&mut self) -> Promise {
+        for i in 0..env::promise_results_count() {
+            let Ok(raw) = env::promise_result_checked(i, 4_096) else { env::panic_str("Could not read a balance; nothing was closed") };
+            if !holds_nothing(&raw) {
+                env::panic_str(if i == 0 { "Withdraw everything from Rhea first" } else { "Send the vault's tokens to yourself first" });
+            }
+        }
+        if self.position.is_some() {
+            env::panic_str("Exit the position first");
+        }
+        emit("vault_closed", json!({ "beneficiary": self.owner }));
+        Promise::new(env::current_account_id()).deploy_contract(EMPTY_WASM.to_vec()).delete_account(self.owner.clone())
+    }
+
+    /// Every token of the pools the policy allows ("x|y|fee").
+    fn pool_tokens(&self) -> Vec<AccountId> {
+        let mut out: Vec<AccountId> = Vec::new();
+        for pool in &self.policy.allowed_pools {
+            for t in pool.split('|').take(2).filter_map(|t| t.parse::<AccountId>().ok()) {
+                if !out.contains(&t) {
+                    out.push(t);
+                }
+            }
+        }
+        out
+    }
+
     /// Lets the owner follow a 1Click key rotation.
     pub fn set_oneclick_key(&mut self, key: String) {
         self.assert_owner();
@@ -470,6 +592,7 @@ impl Vault {
             exit_zec: self.exit_zec.clone(),
             position: self.position.clone(),
             high_point: self.high_point,
+            low_point: self.low_point,
         }
     }
 
@@ -477,6 +600,7 @@ impl Vault {
 
     fn note_point(&mut self, point: i32) {
         self.high_point = Some(self.high_point.map_or(point, |h| h.max(point)));
+        self.low_point = Some(self.low_point.map_or(point, |l| l.min(point)));
     }
 
     fn assert_owner(&self) {
@@ -522,7 +646,7 @@ mod tests {
             acc("owner.testnet"),
             Some(acc("agent.testnet")),
             acc("dclv2.ref-dev.testnet"),
-            Policy { allowed_pools: vec![POOL.into()], min_width: 400, max_width: 8_000, max_distance: 400, max_actions: 3, window_secs: 86_400, max_slippage_bps: 100, exit_drop_points: 2_877 },
+            Policy { allowed_pools: vec![POOL.into()], min_width: 400, max_width: 8_000, max_distance: 400, max_actions: 3, window_secs: 86_400, max_slippage_bps: 100, exit_drop_points: 2_877, exit_on_rise: false, rebalance_buffer_points: 0 },
             None,
             None,
         )
@@ -607,6 +731,136 @@ mod tests {
         let _ = v.on_pool_for_exit(false, Ok(Some(pool_view(0))));
     }
 
+    #[test]
+    #[should_panic(expected = "not far enough outside the open range")]
+    fn agent_cannot_churn_a_position_in_range() {
+        let mut v = vault();
+        v.position = Some(PositionRef { lpt_id: "1".into(), pool_id: POOL.into(), left_point: -400, right_point: 400 });
+        let _ = v.on_pool_for_rebalance(req(POOL, -300, 500), Ok(Some(pool_view(100))));
+    }
+
+    #[test]
+    #[should_panic(expected = "not far enough outside the open range")]
+    fn rebalance_waits_for_the_owners_buffer() {
+        let mut v = vault();
+        v.policy.rebalance_buffer_points = 100;
+        v.position = Some(PositionRef { lpt_id: "1".into(), pool_id: POOL.into(), left_point: -400, right_point: 400 });
+        // 50 points above the range: outside, but inside the 100-point buffer.
+        let _ = v.on_pool_for_rebalance(req(POOL, 450, 1250), Ok(Some(pool_view(450))));
+    }
+
+    #[test]
+    fn rebalance_allowed_past_the_buffer() {
+        let mut v = vault();
+        v.policy.rebalance_buffer_points = 100;
+        v.position = Some(PositionRef { lpt_id: "1".into(), pool_id: POOL.into(), left_point: -400, right_point: 400 });
+        let _ = v.on_pool_for_rebalance(req(POOL, 101, 901), Ok(Some(pool_view(501))));
+    }
+
+    #[test]
+    #[should_panic(expected = "Exit rule not met")]
+    fn exit_on_rise_ignores_a_fall() {
+        let mut v = vault();
+        v.policy.exit_on_rise = true;
+        v.position = Some(PositionRef { lpt_id: "1".into(), pool_id: POOL.into(), left_point: -400, right_point: 400 });
+        v.high_point = Some(3_000);
+        v.low_point = Some(0);
+        // The point fell 3000 from its high: for a rise-watching vault that is the owner's token going up.
+        let _ = v.on_pool_for_exit(false, Ok(Some(pool_view(0))));
+    }
+
+    #[test]
+    fn exit_on_rise_fires_after_the_rise() {
+        let mut v = vault();
+        v.policy.exit_on_rise = true;
+        v.position = Some(PositionRef { lpt_id: "1".into(), pool_id: POOL.into(), left_point: -400, right_point: 400 });
+        v.low_point = Some(-3_000);
+        let _ = v.on_pool_for_exit(false, Ok(Some(pool_view(0))));
+    }
+
+    #[test]
+    fn the_vault_tracks_both_marks() {
+        let mut v = vault();
+        v.position = Some(PositionRef { lpt_id: "1".into(), pool_id: POOL.into(), left_point: -400, right_point: 400 });
+        for p in [10, -50, 70, 0] {
+            let _ = v.on_poke(Ok(Some(pool_view(p))));
+        }
+        assert_eq!((v.get_vault().high_point, v.get_vault().low_point), (Some(70), Some(-50)));
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the vault's owner")]
+    fn agent_cannot_set_the_owners_range() {
+        let mut v = vault();
+        as_caller("agent.testnet");
+        let _ = v.set_range(req(POOL, -400, 400));
+    }
+
+    #[test]
+    #[should_panic(expected = "Pool is not in the owner's allowed list")]
+    fn owner_range_stays_in_allowed_pools() {
+        let _ = vault().set_range(req("evil.testnet|wrap.testnet|2000", -400, 400));
+    }
+
+    #[test]
+    fn owner_places_any_range_even_one_sided_and_far() {
+        let mut v = vault();
+        let _ = v.set_range(req(POOL, -9_000, -40));
+        // Wider than the agent's maximum and far below the price: fine for the owner.
+        let _ = v.on_pool_for_owner_range(req(POOL, -20_000, -40), Ok(Some(pool_view(0))));
+        // In range of an open position too (the owner moves it whenever they like).
+        v.position = Some(PositionRef { lpt_id: "1".into(), pool_id: POOL.into(), left_point: -400, right_point: 400 });
+        let _ = v.on_pool_for_owner_range(req(POOL, 40, 9_000), Ok(Some(pool_view(0))));
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the vault's owner")]
+    fn agent_cannot_withdraw() {
+        let mut v = vault();
+        as_caller("agent.testnet");
+        let _ = v.withdraw_idle(acc("usdt.fakes.testnet"), U128(5), U128(0));
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the vault's owner")]
+    fn agent_cannot_close() {
+        let mut v = vault();
+        as_caller("agent.testnet");
+        let _ = v.close_vault();
+    }
+
+    #[test]
+    #[should_panic(expected = "Exit the position first")]
+    fn close_needs_no_position() {
+        let mut v = vault();
+        v.position = Some(PositionRef { lpt_id: "1".into(), pool_id: POOL.into(), left_point: -400, right_point: 400 });
+        let _ = v.close_vault();
+    }
+
+    #[test]
+    fn close_reads_balances_strictly() {
+        // Rhea's list_user_assets and ft_balance_of answers.
+        assert!(holds_nothing(br#"{}"#));
+        assert!(holds_nothing(br#"{"wrap.testnet":"0"}"#));
+        assert!(holds_nothing(br#""0""#));
+        assert!(!holds_nothing(br#"{"wrap.testnet":"5"}"#));
+        assert!(!holds_nothing(br#""1""#));
+        // Anything unreadable counts as holding something, so the vault is not deleted with it.
+        assert!(!holds_nothing(b"oops"));
+        assert!(!holds_nothing(br#"{"wrap.testnet":5}"#));
+    }
+
+    #[test]
+    #[should_panic(expected = "Nothing to withdraw")]
+    fn withdraw_needs_an_amount() {
+        let _ = vault().withdraw_idle(acc("usdt.fakes.testnet"), U128(0), U128(0));
+    }
+
+    #[test]
+    fn pool_tokens_come_from_the_policy() {
+        assert_eq!(vault().pool_tokens(), vec![acc("usdt.fakes.testnet"), acc("wrap.testnet")]);
+    }
+
     const FIXTURE: &str = include_str!("fixtures/oneclick-quote.json");
     const TEST_VAULT: &str = "74890a9ca6436e1da0b9a730a020223756e520c9812b97804b5c4a13be19e6c1";
     const USDC: &str = "17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1";
@@ -615,7 +869,7 @@ mod tests {
     fn bunker_vault(caller: &str) -> (Vault, String, String) {
         let ctx = |who: &str| VMContextBuilder::new().predecessor_account_id(acc(who)).current_account_id(acc(TEST_VAULT)).block_timestamp(1_793_204_164 * 1_000_000_000).build();
         testing_env!(ctx("owner.testnet"));
-        let policy = Policy { allowed_pools: vec![POOL.into()], min_width: 400, max_width: 8_000, max_distance: 400, max_actions: 3, window_secs: 86_400, max_slippage_bps: 100, exit_drop_points: 2_877 };
+        let policy = Policy { allowed_pools: vec![POOL.into()], min_width: 400, max_width: 8_000, max_distance: 400, max_actions: 3, window_secs: 86_400, max_slippage_bps: 100, exit_drop_points: 2_877, exit_on_rise: false, rebalance_buffer_points: 0 };
         let mut v = Vault::new(acc("owner.testnet"), Some(acc("agent.testnet")), acc("dclv2.ref-labs.near"), policy, None, None);
         v.set_exit_zec(UA.into());
         testing_env!(ctx(caller));

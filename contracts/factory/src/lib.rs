@@ -127,6 +127,29 @@ impl Factory {
         }
     }
 
+    /// Inline mode: replaces the code new vaults get. Vaults already created keep the code they run
+    /// (the factory never touches them); the new hash is public in `get_config` and in the event.
+    /// The factory pays only the difference in storage, since the old bytes are freed.
+    pub fn replace_vault_code(&mut self, code: Base64VecU8) {
+        if env::predecessor_account_id() != self.admin {
+            env::panic_str("Only the factory admin replaces the vault code");
+        }
+        if !matches!(self.mode, Mode::Inline) {
+            env::panic_str("Only an inline factory replaces its vault code; a global one needs a new factory");
+        }
+        let old = self.vault_code_hash.unwrap_or_else(|| env::panic_str("No vault code published yet"));
+        let hash: [u8; 32] = env::sha256(&code.0).try_into().unwrap();
+        if hash == old {
+            env::panic_str("This vault code is already the published one");
+        }
+        self.vault_code_hash = Some(hash);
+        env::log_str(&format!(
+            "EVENT_JSON:{}",
+            json!({ "standard": "kinu_guardian_factory", "version": "0.1.0", "event": "vault_code_replaced", "data": [{ "old_hash": b58(&old), "hash": b58(&hash), "bytes": code.0.len() }] })
+        ));
+        self.code.set(Some(code.0));
+    }
+
     /// Creates `<name>.<factory>` running the published vault code, owned by the caller.
     #[payable]
     pub fn create_vault(&mut self, name: String, policy: Value, agent: Option<AccountId>, exit_zec: Option<String>) -> Promise {

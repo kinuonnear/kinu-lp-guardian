@@ -96,8 +96,8 @@ async fn factory_flow(mode: &str) -> testresult::TestResult<()> {
     assert!(!t.call("admin.sandbox", "guardian.sandbox", "publish_vault_code", json!({ "code": b64 }), NearToken::from_near(10)).await, "published once");
 
     // Inline: each vault carries its own copy of the code, so it needs its storage too.
-    let deposit = if mode == "global" { NearToken::from_millinear(500) } else { NearToken::from_near(3) };
     let cfg_min: u128 = t.view("guardian.sandbox", "get_config", json!({})).await["min_deposit"].as_str().unwrap().parse()?;
+    let deposit = NearToken::from_yoctonear(cfg_min + 10u128.pow(22));
     assert!(deposit.as_yoctonear() >= cfg_min, "deposit {deposit} below min {cfg_min}");
     let policy = json!({ "allowed_pools": ["a|b|2000"], "min_width": 400, "max_width": 8000, "max_distance": 400, "max_actions": 10, "window_secs": 86400, "max_slippage_bps": 100, "exit_drop_points": 2877 });
 

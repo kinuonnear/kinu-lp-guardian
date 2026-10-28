@@ -50,7 +50,7 @@ mod run_impl {
     use serde_json::{Value, json};
 
     /// The published vault build this agent serves (cargo-near build of the vault in this repo).
-    pub const VAULT_CODE_HASH: &str = "8hMAmATK8TC2NBGKgVCV2D7edJdvyJSkMfXMkmoAByTJ";
+    pub const VAULT_CODE_HASH: &str = "8SKHf63TeuQALgrTuNZ59uYWLxuuTCN49j1sGoXWJitP";
     pub const DCL: &str = "dclv2.ref-labs.near";
     const GAS: u64 = 300_000_000_000_000;
 
@@ -258,12 +258,50 @@ mod run_impl {
             Action::BunkerExit { token, amount } => Some(bunker_quote(vault, token, *amount, v.exit_zec.as_deref().unwrap_or_default())?),
             _ => None,
         };
+        // Cost guard: move an open position only when a day of fees in the new range pays for the gas.
+        // If the market data is unreachable the move goes ahead (a stuck position earns nothing).
+        let mut guard = Value::Null;
+        if let (Action::Rebalance { left_point, right_point, .. }, Some(old)) = (&action, &v.position) {
+            match day_of_fees(&pool, old, *left_point, *right_point) {
+                Ok((daily, near_usd)) => {
+                    guard = json!({ "fees_per_day_usd": daily, "gas_usd": REBALANCE_GAS_NEAR * near_usd });
+                    if !rebalance_pays(daily, near_usd) {
+                        return Ok(json!({ "ok": true, "agent": me, "point": pool.current_point, "action": "noop", "why": "a day of fees would not pay for the rebalance", "guard": guard }));
+                    }
+                }
+                Err(e) => guard = json!({ "unavailable": e }),
+            }
+        }
         let summary = format!("{action:?}");
         let Some((method, args)) = call_for(&action, quote.as_ref().map(|(s, g)| (s.as_str(), g.as_str()))) else {
             return Ok(json!({ "ok": true, "agent": me, "point": pool.current_point, "action": summary }));
         };
         let tx = send(&me, &pk, vault, method, args)?;
-        Ok(json!({ "ok": true, "agent": me, "point": pool.current_point, "action": summary, "tx": tx }))
+        Ok(json!({ "ok": true, "agent": me, "point": pool.current_point, "action": summary, "tx": tx, "guard": guard }))
+    }
+
+    /// GeckoTerminal JSON (network allowlist: api.geckoterminal.com).
+    fn gecko(path: &str) -> Result<Value, String> {
+        let resp = wasi_http_client::Client::new()
+            .get(&format!("https://api.geckoterminal.com/api/v2/{path}"))
+            .header("accept", "application/json")
+            .send()
+            .map_err(|e| format!("gecko: {e}"))?;
+        serde_json::from_slice(&resp.body().map_err(|e| format!("gecko body: {e}"))?).map_err(|e| e.to_string())
+    }
+
+    /// A day of fees the re-entered range would earn at the pool's 24h volume, and NEAR's USD price.
+    fn day_of_fees(pool: &PoolView, old: &PositionRef, left: i32, right: i32) -> Result<(f64, f64), String> {
+        let liq = view(DCL, "get_liquidity", json!({ "lpt_id": old.lpt_id }))?;
+        let old_l: f64 = liq["amount"].as_str().and_then(|s| s.parse().ok()).ok_or("no position liquidity")?;
+        let new_l = reentry_liquidity(old, old_l, pool.current_point, left, right);
+        let pool_l: f64 = pool.liquidity.parse().unwrap_or(0.0);
+        let id = pool.pool_id.replace('|', ":");
+        let g = gecko(&format!("networks/near/pools/refv2-{id}"))?;
+        let volume: f64 = g["data"]["attributes"]["volume_usd"]["h24"].as_str().and_then(|s| s.parse().ok()).ok_or("no 24h volume")?;
+        let p = gecko("simple/networks/near/token_price/wrap.near")?;
+        let near_usd: f64 = p["data"]["attributes"]["token_prices"]["wrap.near"].as_str().and_then(|s| s.parse().ok()).ok_or("no NEAR price")?;
+        Ok((daily_fee_usd(volume, pool.fee, new_l, pool_l), near_usd))
     }
 }
 

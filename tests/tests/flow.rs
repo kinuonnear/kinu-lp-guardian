@@ -98,11 +98,26 @@ async fn guardian_flow() -> testresult::TestResult<()> {
     let v = t.view("vault.sandbox", "get_vault", json!({})).await;
     assert_eq!(v["position"]["lpt_id"], positions[0]["lpt_id"]);
 
-    // A second rebalance closes the old position and opens a new one-sided range above the price.
-    assert!(t.call("agent.sandbox", "vault.sandbox", "request_rebalance", json!({ "request": { "pool_id": POOL, "left_point": 200, "right_point": 1200 } }), NearToken::from_near(0)).await);
+    // While the price is inside the open range the agent cannot churn it.
+    assert!(!t.call("agent.sandbox", "vault.sandbox", "request_rebalance", json!({ "request": { "pool_id": POOL, "left_point": 200, "right_point": 1200 } }), NearToken::from_near(0)).await, "in range");
+
+    // The price leaves the range (600 below it): now a rebalance closes the old position and opens
+    // a one-sided range just above the price.
+    assert!(t.call("owner.sandbox", "dcl.sandbox", "set_point", json!({ "pool_id": POOL, "point": -1000 }), NearToken::from_near(0)).await);
+    assert!(t.call("agent.sandbox", "vault.sandbox", "request_rebalance", json!({ "request": { "pool_id": POOL, "left_point": -800, "right_point": 200 } }), NearToken::from_near(0)).await);
     let positions = t.view("dcl.sandbox", "list_liquidities", json!({ "account_id": "vault.sandbox" })).await;
     assert_eq!(positions.as_array().unwrap().len(), 1, "{positions}");
-    assert_eq!(positions[0]["left_point"], 200);
+    assert_eq!(positions[0]["left_point"], -800);
+
+    // The owner places their own range, wider than the agent may and lopsided around the price.
+    assert!(!t.call("agent.sandbox", "vault.sandbox", "set_range", json!({ "request": { "pool_id": POOL, "left_point": -6000, "right_point": 400 } }), NearToken::from_near(0)).await, "owner only");
+    assert!(t.call("owner.sandbox", "vault.sandbox", "set_range", json!({ "request": { "pool_id": POOL, "left_point": -6000, "right_point": 400 } }), NearToken::from_near(0)).await);
+    let positions = t.view("dcl.sandbox", "list_liquidities", json!({ "account_id": "vault.sandbox" })).await;
+    assert_eq!(positions.as_array().unwrap().len(), 1, "{positions}");
+    assert_eq!((positions[0]["left_point"].clone(), positions[0]["right_point"].clone()), (json!(-6000), json!(400)));
+    // The agent leaves it alone while the price is inside it.
+    assert!(!t.call("agent.sandbox", "vault.sandbox", "request_rebalance", json!({ "request": { "pool_id": POOL, "left_point": -1400, "right_point": -600 } }), NearToken::from_near(0)).await, "owner range in range");
+    assert!(t.call("owner.sandbox", "dcl.sandbox", "set_point", json!({ "pool_id": POOL, "point": 0 }), NearToken::from_near(0)).await);
 
     // The agent may not exit before the owner's rule is met...
     assert!(!t.call("agent.sandbox", "vault.sandbox", "exit", json!({}), NearToken::from_near(0)).await);
@@ -121,5 +136,38 @@ async fn guardian_flow() -> testresult::TestResult<()> {
     // Revoked agent is refused.
     assert!(t.call("owner.sandbox", "vault.sandbox", "revoke_agent", json!({}), NearToken::from_near(0)).await);
     assert!(!t.call("agent.sandbox", "vault.sandbox", "request_rebalance", json!({ "request": { "pool_id": POOL, "left_point": -400, "right_point": 400 } }), NearToken::from_near(0)).await);
+
+    // Funds never placed sit idle on Rhea: the owner takes them back in one call, and only the owner.
+    let owner_tka = |v: Value| v.as_str().unwrap().parse::<u128>().unwrap();
+    let before = owner_tka(t.view("tka.sandbox", "ft_balance_of", json!({ "account_id": "owner.sandbox" })).await);
+    assert!(t.call("owner.sandbox", "tka.sandbox", "ft_transfer_call", json!({ "receiver_id": "vault.sandbox", "amount": "5000000", "msg": "" }), NearToken::from_yoctonear(1)).await);
+    assert_eq!(t.view("dcl.sandbox", "list_user_assets", json!({ "account_id": "vault.sandbox" })).await["tka.sandbox"], "5000000");
+    assert!(!t.call("owner.sandbox", "vault.sandbox", "close_vault", json!({}), NearToken::from_near(0)).await, "Rhea not empty");
+    // The page reads the amounts first: 5 TKA idle on Rhea, nothing in the vault's wallet.
+    let idle = json!({ "token": "tka.sandbox", "from_rhea": "5000000", "from_wallet": "0" });
+    assert!(!t.call("stranger.sandbox", "vault.sandbox", "withdraw_idle", idle.clone(), NearToken::from_near(0)).await);
+    assert!(t.call("owner.sandbox", "vault.sandbox", "withdraw_idle", idle, NearToken::from_near(0)).await);
+    assert!(t.view("dcl.sandbox", "list_user_assets", json!({ "account_id": "vault.sandbox" })).await.get("tka.sandbox").is_none());
+    let after = owner_tka(t.view("tka.sandbox", "ft_balance_of", json!({ "account_id": "owner.sandbox" })).await);
+    assert_eq!(after, before, "the 5 TKA came back");
+
+    // A token left in the vault's wallet blocks closing (it would be lost); withdraw_idle sends it.
+    assert!(t.call("owner.sandbox", "tkb.sandbox", "ft_transfer", json!({ "receiver_id": "vault.sandbox", "amount": "3000000" }), NearToken::from_yoctonear(1)).await);
+    assert!(!t.call("owner.sandbox", "vault.sandbox", "close_vault", json!({}), NearToken::from_near(0)).await, "wallet not empty");
+    let in_wallet = t.view("tkb.sandbox", "ft_balance_of", json!({ "account_id": "vault.sandbox" })).await;
+    assert!(t.call("owner.sandbox", "vault.sandbox", "withdraw_idle", json!({ "token": "tkb.sandbox", "from_rhea": "0", "from_wallet": in_wallet }), NearToken::from_near(0)).await);
+    assert_eq!(t.view("tkb.sandbox", "ft_balance_of", json!({ "account_id": "vault.sandbox" })).await, "0");
+
+    // Empty: the owner closes it. The 262 kB vault swaps in an empty module and deletes itself, and
+    // its NEAR goes to the owner.
+    assert!(!t.call("stranger.sandbox", "vault.sandbox", "close_vault", json!({}), NearToken::from_near(0)).await);
+    let account = |id: &str| near_api::Account(id.parse().unwrap()).view().fetch_from(&t.net);
+    let vault_near = account("vault.sandbox").await?.data.amount;
+    let owner_near = account("owner.sandbox").await?.data.amount;
+    assert!(t.call("owner.sandbox", "vault.sandbox", "close_vault", json!({}), NearToken::from_near(0)).await);
+    assert!(account("vault.sandbox").await.is_err(), "the vault account is gone");
+    let gained = account("owner.sandbox").await?.data.amount.saturating_sub(owner_near);
+    println!("CLOSE vault held {vault_near}, owner gained {gained}");
+    assert!(gained.as_yoctonear() * 100 > vault_near.as_yoctonear() * 99, "owner got the vault's NEAR back (minus gas)");
     Ok(())
 }
