@@ -62,6 +62,15 @@ mod run_impl {
         serde_json::from_str(&res).map_err(|e| format!("{contract}.{method}: {e}"))
     }
 
+    /// view_account, view_access_key, block and send_tx answer with the whole JSON-RPC response.
+    fn rpc_result(raw: &str) -> Result<Value, String> {
+        let v: Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+        if let Some(e) = v.get("error") {
+            return Err(e.to_string().chars().take(200).collect());
+        }
+        Ok(v.get("result").cloned().unwrap_or(v))
+    }
+
     fn my_key() -> Result<[u8; 32], String> {
         let pk = keys::public_key("agent", None).map_err(|e| format!("public_key: {e}"))?;
         pk.try_into().map_err(|_| "public key is not 32 bytes".to_string())
@@ -73,7 +82,7 @@ mod run_impl {
         if !err.is_empty() {
             return Err(format!("access key: {err} (fund the agent account {me})"));
         }
-        let ak: Value = serde_json::from_str(&ak).map_err(|e| e.to_string())?;
+        let ak = rpc_result(&ak)?;
         let nonce = ak["nonce"].as_u64().ok_or("no nonce")? + 1;
         let block_hash: [u8; 32] = bs58::decode(ak["block_hash"].as_str().ok_or("no block hash")?)
             .into_vec()
@@ -98,7 +107,7 @@ mod run_impl {
         if !err.is_empty() {
             return Err(format!("send_tx: {err}"));
         }
-        let v: Value = serde_json::from_str(&res).unwrap_or(Value::Null);
+        let v = rpc_result(&res)?;
         let failed = v["status"].get("Failure").is_some();
         let hash = v["transaction"]["hash"].as_str().unwrap_or("?").to_string();
         if failed {
@@ -134,7 +143,7 @@ mod run_impl {
         if !err.is_empty() {
             return Err(err);
         }
-        let b: Value = serde_json::from_str(&b).map_err(|e| e.to_string())?;
+        let b = rpc_result(&b)?;
         let ns = b["header"]["timestamp_nanosec"].as_str().and_then(|s| s.parse::<u64>().ok()).ok_or("no block time")?;
         Ok(iso(ns / 1_000_000_000 + 1800))
     }
@@ -207,7 +216,7 @@ mod run_impl {
         if !err.is_empty() {
             return Err(format!("vault account: {err}"));
         }
-        let acct: Value = serde_json::from_str(&acct).map_err(|e| e.to_string())?;
+        let acct = rpc_result(&acct)?;
         if acct["code_hash"] != VAULT_CODE_HASH {
             return Ok(json!({ "ok": true, "agent": me, "action": "noop", "why": "not the published vault build", "code_hash": acct["code_hash"] }));
         }
@@ -220,8 +229,8 @@ mod run_impl {
             wallet.push((t.clone(), b.as_str().and_then(|s| s.parse().ok()).unwrap_or(0u128)));
         }
         let assets = view(DCL, "list_user_assets", json!({ "account_id": vault }))?;
-        let funded = assets.as_object().is_some_and(|m| m.values().any(|a| a.as_str().is_some_and(|s| s != "0")));
-        let action = decide(&World { me: &me, vault: &v, pool: &pool, wallet: &wallet, dcl_funded: funded });
+        let bal = |t: &str| assets[t].as_str().and_then(|s| s.parse::<u128>().ok()).unwrap_or(0);
+        let action = decide(&World { me: &me, vault: &v, pool: &pool, wallet: &wallet, dcl: (bal(&pool.token_x), bal(&pool.token_y)) });
         let quote = match &action {
             Action::BunkerExit { token, amount } => Some(bunker_quote(vault, token, *amount, v.exit_zec.as_deref().unwrap_or_default())?),
             _ => None,

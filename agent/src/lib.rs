@@ -55,8 +55,8 @@ pub struct World<'a> {
     pub pool: &'a PoolView,
     /// The vault's own wallet balances of the pool tokens (funds after an exit).
     pub wallet: &'a [(String, u128)],
-    /// Whether the vault holds anything in its Rhea DCL balance (funded, no position yet).
-    pub dcl_funded: bool,
+    /// The vault's Rhea DCL balances of token X and token Y (funded, no position yet).
+    pub dcl: (u128, u128),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -118,9 +118,20 @@ pub fn decide(w: &World) -> Action {
                     return Action::BunkerExit { token: token.clone(), amount: *amount };
                 }
             }
-            if w.dcl_funded {
+            let (x, y) = w.dcl;
+            if x > 0 && y > 0 {
                 let left = floor_to(cur - wd / 2, d);
                 return Action::Rebalance { pool_id: p.pool_id.clone(), left_point: left, right_point: left + wd };
+            }
+            if x > 0 {
+                // Only token X: a range just above the price uses X alone.
+                let left = floor_to(cur, d) + d;
+                return Action::Rebalance { pool_id: p.pool_id.clone(), left_point: left, right_point: left + wd };
+            }
+            if y > 0 {
+                // Only token Y: just below the price.
+                let right = floor_to(cur, d);
+                return Action::Rebalance { pool_id: p.pool_id.clone(), left_point: right - wd, right_point: right };
             }
             Action::Noop("nothing to manage")
         }
@@ -233,12 +244,22 @@ mod tests {
         PoolView { pool_id: "x|y|100".into(), token_x: "x".into(), token_y: "y".into(), current_point: point, point_delta: 40 }
     }
     fn run(v: &VaultView, point: i32, wallet: &[(String, u128)], funded: bool) -> Action {
-        decide(&World { me: ME, vault: v, pool: &pool(point), wallet, dcl_funded: funded })
+        let funded = if funded { (1, 1) } else { (0, 0) };
+        decide(&World { me: ME, vault: v, pool: &pool(point), wallet, dcl: funded })
     }
 
     #[test]
     fn opens_a_centred_range_when_funded() {
         assert_eq!(run(&vault(None, None), 1000, &[], true), Action::Rebalance { pool_id: "x|y|100".into(), left_point: 920, right_point: 1080 });
+    }
+
+    #[test]
+    fn opens_one_sided_when_funded_with_one_token() {
+        let v = vault(None, None);
+        let only_x = decide(&World { me: ME, vault: &v, pool: &pool(1000), wallet: &[], dcl: (5, 0) });
+        assert_eq!(only_x, Action::Rebalance { pool_id: "x|y|100".into(), left_point: 1040, right_point: 1200 });
+        let only_y = decide(&World { me: ME, vault: &v, pool: &pool(1000), wallet: &[], dcl: (0, 5) });
+        assert_eq!(only_y, Action::Rebalance { pool_id: "x|y|100".into(), left_point: 840, right_point: 1000 });
     }
 
     #[test]
