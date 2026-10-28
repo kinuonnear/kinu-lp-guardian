@@ -6,7 +6,7 @@ use near_sdk::json_types::U128;
 use near_sdk::{env, near, AccountId, Gas, NearToken, PanicOnDefault, Promise, PromiseOrValue};
 
 const GAS_STORAGE: Gas = Gas::from_tgas(10);
-const GAS_FT_CALL: Gas = Gas::from_tgas(80);
+const GAS_FT_CALL: Gas = Gas::from_tgas(180);
 const GAS_ADD: Gas = Gas::from_tgas(150);
 const GAS_REMOVE: Gas = Gas::from_tgas(100);
 const GAS_WITHDRAW: Gas = Gas::from_tgas(60);

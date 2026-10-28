@@ -1,0 +1,18 @@
+[package]
+name = "kinu-guardian-testtoken"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT"
+description = "Testnet-only NEP-141 token for Guardian tests (fresh tokens keep Rhea DCL testnet deposits cheap)."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = { workspace = true }
+near-contract-standards = "5.29"
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ["cfg(near)"]
