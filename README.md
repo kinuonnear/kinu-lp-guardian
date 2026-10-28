@@ -6,18 +6,34 @@ the live price, rate limit) against the owner's policy and the pool it reads its
 gets refused on-chain. The owner can freeze, revoke the agent, and register a **shielded Zcash exit
 address** (unified address with an Orchard receiver) for a "bunker exit".
 
-Status (28 Oct 2026): first slice. Policy checks, rate limit, freeze/revoke, Orchard-only exit address
-validation (ZIP 316: bech32m + F4Jumble), and the rebalance request that reads the pool from Rhea DCL.
-Holding the position, executing rebalances and the exit via NEAR Intents come next.
+Status (28 Oct 2026):
+- The vault holds the Rhea DCL position itself; owner funding goes straight into its DCL balance.
+- Agent rebalance: the vault reads the pool, checks pool / width / distance / rate, closes the old
+  position and opens the new one with minimum amounts it computes itself.
+- Exit: the owner any time; the agent only when the owner's rule is met (price fell `exit_drop_points`
+  below the highest point the vault itself saw, 2877 points = -25%). Exited funds stay in the vault;
+  only the owner sweeps them.
+- Freeze, revoke, Orchard-only Zcash exit address (ZIP 316: bech32m + F4Jumble).
+- Proven: 3 USDC → 0.002023 ZEC through NEAR Intents to a Zodl (formerly Zashi) unified address with
+  Sapling + Orchard receivers only (28 Oct, mainnet).
+- Next: Bunker exit — the vault verifies the 1Click quote signature on-chain (recipient = the owner's
+  Orchard address) before sending to its deposit address; exact in-range minimum amounts.
 
 ## Try it
 
 ```bash
-cargo test                      # 16 unit tests: policy refusals, rate limit, Zcash address rules
-cargo near build non-reproducible-wasm --no-abi --manifest-path contracts/vault/Cargo.toml
+./scripts/test.sh   # builds all contracts, 19 unit tests + 1 end-to-end sandbox test
 ```
+
+The sandbox test (tests/tests/flow.rs) runs the whole story on a local NEAR node: the owner funds the
+vault; a compromised agent tries another pool, an absurd range, a range far from the price, changing the
+exit address, and a stranger tries to act — all refused on-chain; the honest rebalance opens a position
+owned by the vault; the agent's early exit is refused; after a 25% drop the exit goes through; only the
+owner sweeps the funds; a revoked agent is refused. Rhea DCL is replaced by contracts/mockdcl (same
+methods and argument shapes) because the DCL testnet deposit path is broken (see DAY1.md).
 
 - `contracts/vault`  the Guardian vault (`policy.rs` rules, `zcash.rs` exit-address validation)
 - `contracts/probe`  day-1 test: does Rhea DCL treat a contract caller like a user? See DAY1.md
+- `contracts/mockdcl`  test-only Rhea DCL stand-in; `contracts/testtoken` testnet/sandbox NEP-141 token
 
 Built for NEAR HACKATHON (1–14 Nov 2026). License: MIT.

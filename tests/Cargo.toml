@@ -1,0 +1,16 @@
+[package]
+name = "kinu-guardian-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+near-sandbox = "0.3.12"
+near-api = "0.8"
+serde_json = "1"
+tokio = { version = "1.12.0", features = ["full"] }
+testresult = "0.4.1"

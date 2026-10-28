@@ -19,6 +19,9 @@ pub struct Policy {
     pub window_secs: u64,
     /// Slippage the contract uses when it computes minimum amounts itself (basis points).
     pub max_slippage_bps: u32,
+    /// Exit rule: the agent may close the position only after the pool point fell this many points
+    /// below the highest point the vault read itself (2877 points = a 25% drop). 0 = agent may not exit.
+    pub exit_drop_points: u32,
 }
 
 /// A rebalance the agent asks for. Minimum amounts are not taken from the agent: the vault computes
@@ -138,6 +141,7 @@ mod tests {
             max_actions: 3,
             window_secs: 86_400,
             max_slippage_bps: 100,
+            exit_drop_points: 2_877,
         }
     }
     fn req(pool: &str, l: i32, r: i32) -> RebalanceRequest {
