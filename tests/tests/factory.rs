@@ -60,7 +60,16 @@ fn b58(bytes: &[u8]) -> String {
 }
 
 #[tokio::test]
-async fn factory_flow() -> testresult::TestResult<()> {
+async fn factory_flow_global() -> testresult::TestResult<()> {
+    factory_flow("global").await
+}
+
+#[tokio::test]
+async fn factory_flow_inline() -> testresult::TestResult<()> {
+    factory_flow("inline").await
+}
+
+async fn factory_flow(mode: &str) -> testresult::TestResult<()> {
     let sandbox = near_sandbox::Sandbox::start_sandbox().await?;
     let net = NetworkConfig::from_rpc_url("sandbox", sandbox.rpc_addr.parse()?);
     let signer = Signer::from_secret_key(near_sandbox::config::DEFAULT_GENESIS_ACCOUNT_PRIVATE_KEY.parse()?)?;
@@ -71,7 +80,7 @@ async fn factory_flow() -> testresult::TestResult<()> {
     let t = T { net: net.clone(), signer: signer.clone() };
     Contract::deploy("guardian.sandbox".parse()?)
         .use_code(wasm("kinu_guardian_factory"))
-        .with_init_call("new", json!({ "admin": "admin.sandbox", "dcl": "dcl.sandbox" }))?
+        .with_init_call("new", json!({ "admin": "admin.sandbox", "dcl": "dcl.sandbox", "mode": if mode == "global" { "Global" } else { "Inline" } }))?
         .with_signer(signer.clone())
         .send_to(&net)
         .await?
@@ -86,10 +95,14 @@ async fn factory_flow() -> testresult::TestResult<()> {
     assert_eq!(cfg["vault_code_hash"], b58(&Sha256::digest(&code)), "{cfg}");
     assert!(!t.call("admin.sandbox", "guardian.sandbox", "publish_vault_code", json!({ "code": b64 }), NearToken::from_near(10)).await, "published once");
 
+    // Inline: each vault carries its own copy of the code, so it needs its storage too.
+    let deposit = if mode == "global" { NearToken::from_millinear(500) } else { NearToken::from_near(3) };
+    let cfg_min: u128 = t.view("guardian.sandbox", "get_config", json!({})).await["min_deposit"].as_str().unwrap().parse()?;
+    assert!(deposit.as_yoctonear() >= cfg_min, "deposit {deposit} below min {cfg_min}");
     let policy = json!({ "allowed_pools": ["a|b|2000"], "min_width": 400, "max_width": 8000, "max_distance": 400, "max_actions": 10, "window_secs": 86400, "max_slippage_bps": 100, "exit_drop_points": 2877 });
 
     // Alice creates her vault with her Orchard exit address at birth.
-    assert!(t.call("alice.sandbox", "guardian.sandbox", "create_vault", json!({ "name": "alice-lp", "policy": policy, "agent": null, "exit_zec": UA }), NearToken::from_millinear(500)).await);
+    assert!(t.call("alice.sandbox", "guardian.sandbox", "create_vault", json!({ "name": "alice-lp", "policy": policy, "agent": null, "exit_zec": UA }), deposit).await);
     let v = t.view("alice-lp.guardian.sandbox", "get_vault", json!({})).await;
     assert_eq!(v["owner"], "alice.sandbox");
     assert_eq!(v["exit_zec"], UA);
@@ -102,8 +115,8 @@ async fn factory_flow() -> testresult::TestResult<()> {
 
     // A taken name and a transparent exit address both fail; Bob's deposit comes back.
     let before = t.balance("bob.sandbox").await;
-    t.call("bob.sandbox", "guardian.sandbox", "create_vault", json!({ "name": "alice-lp", "policy": policy, "agent": null, "exit_zec": null }), NearToken::from_near(1)).await;
-    t.call("bob.sandbox", "guardian.sandbox", "create_vault", json!({ "name": "bob-lp", "policy": policy, "agent": null, "exit_zec": "t1Q879cLgqaCd7zKRi79wQYuGBenmNX6cKn" }), NearToken::from_near(1)).await;
+    t.call("bob.sandbox", "guardian.sandbox", "create_vault", json!({ "name": "alice-lp", "policy": policy, "agent": null, "exit_zec": null }), deposit).await;
+    t.call("bob.sandbox", "guardian.sandbox", "create_vault", json!({ "name": "bob-lp", "policy": policy, "agent": null, "exit_zec": "t1Q879cLgqaCd7zKRi79wQYuGBenmNX6cKn" }), deposit).await;
     let after = t.balance("bob.sandbox").await;
     assert!(before.saturating_sub(after) < NearToken::from_millinear(100), "deposits refunded: {before} -> {after}");
     assert_eq!(t.view("guardian.sandbox", "get_vaults", json!({ "owner": "bob.sandbox" })).await, json!([]));
