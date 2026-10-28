@@ -15,15 +15,25 @@ use near_sdk::{AccountId, Gas, NearToken, PanicOnDefault, Promise, PromiseError,
 use policy::{Policy, RateWindow, RebalanceRequest, Refusal, check_rebalance};
 use std::collections::HashMap;
 
+// Gas budget (mainnet DCL burns ~6 TGas for remove_liquidity, ~3 for withdraw_asset).
 const GAS_VIEW: Gas = Gas::from_tgas(10);
 const GAS_STORAGE: Gas = Gas::from_tgas(10);
 const GAS_FT_CALL: Gas = Gas::from_tgas(60);
-const GAS_ADD: Gas = Gas::from_tgas(60);
-const GAS_REMOVE: Gas = Gas::from_tgas(40);
+const GAS_ADD: Gas = Gas::from_tgas(40);
+const GAS_REMOVE: Gas = Gas::from_tgas(30);
 const GAS_WITHDRAW: Gas = Gas::from_tgas(30);
 const GAS_TRANSFER: Gas = Gas::from_tgas(10);
-const GAS_CB: Gas = Gas::from_tgas(20);
-const GAS_CB_CHAIN: Gas = Gas::from_tgas(100);
+const GAS_CB: Gas = Gas::from_tgas(10);
+/// on_ready_to_add: add_liquidity + on_added.
+const GAS_CB_ADD: Gas = Gas::from_tgas(70);
+/// on_liquidity_for_rebalance: remove + on_removed + list_user_assets + on_ready_to_add.
+const GAS_CB_REMOVE_ADD: Gas = Gas::from_tgas(140);
+/// on_pool_for_rebalance: get_liquidity + on_liquidity_for_rebalance.
+const GAS_CB_REBALANCE: Gas = Gas::from_tgas(170);
+/// on_liquidity_for_exit: remove + on_removed + 2 withdraws + on_exited.
+const GAS_CB_REMOVE_EXIT: Gas = Gas::from_tgas(130);
+/// on_pool_for_exit: get_liquidity + on_liquidity_for_exit.
+const GAS_CB_EXIT: Gas = Gas::from_tgas(150);
 const ZERO: NearToken = NearToken::from_yoctonear(0);
 const ONE_YOCTO: NearToken = NearToken::from_yoctonear(1);
 
@@ -34,6 +44,13 @@ pub struct PoolView {
     pub token_x: AccountId,
     pub token_y: AccountId,
     pub current_point: i32,
+}
+
+/// The field of Rhea DCL `get_liquidity` the vault needs: the position's liquidity.
+/// remove_liquidity with amount 0 only claims fees, so closing needs this exact amount.
+#[near(serializers = [json])]
+pub struct LiquidityView {
+    pub amount: U128,
 }
 
 #[near(serializers = [borsh, json])]
@@ -197,7 +214,7 @@ impl Vault {
             refuse(Refusal::PoolNotAllowed);
         }
         call(&self.dcl, "get_pool", json!({ "pool_id": request.pool_id }), ZERO, GAS_VIEW)
-            .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB_CHAIN.saturating_mul(2)).on_pool_for_rebalance(request))
+            .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB_REBALANCE).on_pool_for_rebalance(request))
     }
 
     #[private]
@@ -209,14 +226,23 @@ impl Vault {
         check_rebalance(&self.policy, &request, pool.current_point).unwrap_or_else(|r| refuse(r));
         self.note_point(pool.current_point);
         emit("rebalance_approved", json!({ "pool_id": request.pool_id, "left_point": request.left_point, "right_point": request.right_point, "current_point": pool.current_point }));
-        let next = Self::ext(env::current_account_id()).with_static_gas(GAS_CB_CHAIN).on_ready_to_add(request.clone(), pool.clone());
         match self.position.clone() {
-            Some(old) => call(&self.dcl, "remove_liquidity", json!({ "lpt_id": old.lpt_id, "amount": "0", "min_amount_x": "0", "min_amount_y": "0" }), ZERO, GAS_REMOVE)
-                .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB).on_removed())
-                .then(call(&self.dcl, "list_user_assets", json!({ "account_id": env::current_account_id() }), ZERO, GAS_VIEW))
-                .then(next),
-            None => call(&self.dcl, "list_user_assets", json!({ "account_id": env::current_account_id() }), ZERO, GAS_VIEW).then(next),
+            Some(old) => call(&self.dcl, "get_liquidity", json!({ "lpt_id": old.lpt_id }), ZERO, GAS_VIEW)
+                .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB_REMOVE_ADD).on_liquidity_for_rebalance(request, pool)),
+            None => call(&self.dcl, "list_user_assets", json!({ "account_id": env::current_account_id() }), ZERO, GAS_VIEW)
+                .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB_ADD).on_ready_to_add(request, pool)),
         }
+    }
+
+    /// Closes the old position with its full liquidity, then opens the new one.
+    #[private]
+    pub fn on_liquidity_for_rebalance(&mut self, request: RebalanceRequest, pool: PoolView, #[callback_result] liq: Result<Option<LiquidityView>, PromiseError>) -> Promise {
+        let Ok(Some(liq)) = liq else { env::panic_str("Could not read the open position from Rhea DCL") };
+        let old = self.position.clone().unwrap_or_else(|| env::panic_str("No open position"));
+        call(&self.dcl, "remove_liquidity", json!({ "lpt_id": old.lpt_id, "amount": liq.amount, "min_amount_x": "0", "min_amount_y": "0" }), ZERO, GAS_REMOVE)
+            .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB).on_removed())
+            .then(call(&self.dcl, "list_user_assets", json!({ "account_id": env::current_account_id() }), ZERO, GAS_VIEW))
+            .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB_ADD).on_ready_to_add(request, pool))
     }
 
     /// The old position is gone only if remove_liquidity succeeded; otherwise stop here.
@@ -284,7 +310,7 @@ impl Vault {
         }
         let pos = self.position.clone().unwrap_or_else(|| env::panic_str("No open position"));
         call(&self.dcl, "get_pool", json!({ "pool_id": pos.pool_id }), ZERO, GAS_VIEW)
-            .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB_CHAIN.saturating_mul(2)).on_pool_for_exit(by_owner))
+            .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB_EXIT).on_pool_for_exit(by_owner))
     }
 
     #[private]
@@ -297,7 +323,15 @@ impl Vault {
         }
         let pos = self.position.clone().unwrap_or_else(|| env::panic_str("No open position"));
         emit("exit_started", json!({ "by": if by_owner { "owner" } else { "agent" }, "lpt_id": pos.lpt_id, "high_point": high, "current_point": pool.current_point }));
-        call(&self.dcl, "remove_liquidity", json!({ "lpt_id": pos.lpt_id, "amount": "0", "min_amount_x": "0", "min_amount_y": "0" }), ZERO, GAS_REMOVE)
+        call(&self.dcl, "get_liquidity", json!({ "lpt_id": pos.lpt_id }), ZERO, GAS_VIEW)
+            .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB_REMOVE_EXIT).on_liquidity_for_exit(pool))
+    }
+
+    #[private]
+    pub fn on_liquidity_for_exit(&mut self, pool: PoolView, #[callback_result] liq: Result<Option<LiquidityView>, PromiseError>) -> Promise {
+        let Ok(Some(liq)) = liq else { env::panic_str("Could not read the open position from Rhea DCL") };
+        let pos = self.position.clone().unwrap_or_else(|| env::panic_str("No open position"));
+        call(&self.dcl, "remove_liquidity", json!({ "lpt_id": pos.lpt_id, "amount": liq.amount, "min_amount_x": "0", "min_amount_y": "0" }), ZERO, GAS_REMOVE)
             .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB).on_removed())
             .then(call(&self.dcl, "withdraw_asset", json!({ "token_id": pool.token_x }), ZERO, GAS_WITHDRAW))
             .then(call(&self.dcl, "withdraw_asset", json!({ "token_id": pool.token_y }), ZERO, GAS_WITHDRAW))

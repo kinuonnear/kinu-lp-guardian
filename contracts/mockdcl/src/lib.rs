@@ -41,6 +41,8 @@ pub struct Position {
     pub right_point: i32,
     pub amount_x: U128,
     pub amount_y: U128,
+    /// Stand-in for CLMM liquidity: amount_x + amount_y.
+    pub amount: U128,
 }
 
 #[near(contract_state)]
@@ -127,16 +129,29 @@ impl MockDcl {
         self.take(&user, &pool.token_y, use_y);
         self.next_id += 1;
         let lpt_id = format!("{pool_id}#{}", self.next_id);
-        self.positions.insert(lpt_id.clone(), Position { lpt_id: lpt_id.clone(), owner_id: user, pool_id, left_point, right_point, amount_x: U128(use_x), amount_y: U128(use_y) });
+        self.positions.insert(lpt_id.clone(), Position { lpt_id: lpt_id.clone(), owner_id: user, pool_id, left_point, right_point, amount_x: U128(use_x), amount_y: U128(use_y), amount: U128(use_x + use_y) });
         lpt_id
     }
 
+    pub fn get_liquidity(&self, lpt_id: String) -> Option<Position> {
+        self.positions.get(&lpt_id).cloned()
+    }
+
+    /// As in Rhea DCL: amount 0 only claims fees (nothing is removed); the full liquidity closes it.
     pub fn remove_liquidity(&mut self, lpt_id: String, amount: U128, min_amount_x: U128, min_amount_y: U128) -> (U128, U128) {
-        let _ = (amount, min_amount_x, min_amount_y);
         let user = env::predecessor_account_id();
         let p = self.positions.get(&lpt_id).cloned().unwrap_or_else(|| env::panic_str("E207: lpt not exist"));
         if p.owner_id != user {
             env::panic_str("E215: not lpt owner");
+        }
+        if amount.0 == 0 {
+            return (U128(0), U128(0));
+        }
+        if amount.0 != p.amount.0 {
+            env::panic_str("mock: only full removal is modelled");
+        }
+        if p.amount_x.0 < min_amount_x.0 || p.amount_y.0 < min_amount_y.0 {
+            env::panic_str("E204: slippage error");
         }
         let pool = self.pools.get(&p.pool_id).cloned().unwrap();
         self.give(&user, &pool.token_x, p.amount_x.0);

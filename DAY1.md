@@ -26,3 +26,21 @@ Goal: a contract account opens a Rhea DCL position and `list_liquidities` shows 
   CCzPD7sT… now, version 2.3.14, 11,647 pools). Deposits on testnet are broken for everyone, not for contracts.
 - Next: vault integration tests against a mock DCL in near-sandbox (reproducible for judges), and one
   tiny mainnet run of the probe for the demo (needs the owner's yes); ask Rhea about testnet.
+
+## Mainnet run (28 Oct 2026): GO, proven by our own transactions
+
+Test account (implicit, funded by the owner with 4 NEAR + 3 USDC):
+`74890a9ca6436e1da0b9a730a020223756e520c9812b97804b5c4a13be19e6c1`, probe contract deployed on it.
+
+1. register_dcl on `dclv2.ref-labs.near` (0.5 NEAR) and USDC storage: ok.
+2. deposit_to_dcl 3 USDC (`ft_transfer_call` msg `"Deposit"`): tx `D1MbfXDdiPZEvMMCnXB6D1ekms3xDgMAK5Dyc7iT4oHp`, DCL balance 3,000,000.
+3. add_liquidity on `USDC|wrap.near|100`, one-sided range 399213..399413 above the price (399193):
+   tx `948npgZe1nvQMJjPPFrMcN3vJysasKSYJbXL6wAFtLUp`. `list_liquidities` returns lpt `...|100#23856`
+   with **owner_id = the contract**. A contract can hold a Rhea DCL position on mainnet.
+4. Bug found: `remove_liquidity` with `amount: "0"` only claims fees (DCL event `removed_amount: "0"`),
+   so the position stayed intact. Closing needs the position's liquidity from `get_liquidity`. Fixed in
+   the probe and the vault (the vault reads `get_liquidity` before every close); the mock DCL now
+   behaves the same, so the sandbox test would catch it.
+5. remove_liquidity with amount 7024520687189: tx `HJ7MNLfjzVUrRZAiNyPU1d5ohX7sCMFudcR5pWUht8fp`;
+   withdraw_asset: tx `2gbXhLsrmkzeBRRgBKW8JLqKLB9TkHKDKQ2YYtKJFbft`; 2.999999 USDC returned to
+   kinuonnear.near: tx `BFvfGS7VoZY5M7gPS3av41Q3BWAnZwmw42xThLG6Kuwq`.

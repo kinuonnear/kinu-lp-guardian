@@ -65,9 +65,10 @@ impl Probe {
         )
     }
 
-    pub fn remove_liquidity(&mut self, lpt_id: String) -> Promise {
+    /// `amount` is the position's liquidity (get_liquidity). Rhea DCL treats amount 0 as "claim fees only".
+    pub fn remove_liquidity(&mut self, lpt_id: String, amount: U128) -> Promise {
         self.only_owner();
-        call(&self.dcl, "remove_liquidity", near_sdk::serde_json::json!({ "lpt_id": lpt_id, "amount": "0", "min_amount_x": "0", "min_amount_y": "0" }), NearToken::from_yoctonear(0), GAS_REMOVE)
+        call(&self.dcl, "remove_liquidity", near_sdk::serde_json::json!({ "lpt_id": lpt_id, "amount": amount, "min_amount_x": "0", "min_amount_y": "0" }), NearToken::from_yoctonear(0), GAS_REMOVE)
     }
 
     pub fn withdraw_asset(&mut self, token: AccountId) -> Promise {
