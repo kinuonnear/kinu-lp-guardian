@@ -22,3 +22,12 @@ near-sdk = { workspace = true, features = ["unit-testing"] }
 [lints.rust.unexpected_cfgs]
 level = "warn"
 check-cfg = ['cfg(near)']
+
+# NEP-330 reproducible build (cargo near build reproducible-wasm, run by .github/workflows/build.yml):
+# the official cargo-near image with the repo's pinned Rust 1.93.0. The wasm deployed to
+# lp.kinuonnear.near is this build's output, so its code hash can be rebuilt by anyone.
+[package.metadata.near.reproducible_build]
+image = "sourcescan/cargo-near:0.21.1-rust-1.93.0"
+image_digest = "sha256:79b789c81ba19ec30794a6b1046b02dcaf5c055994b22cc7c9af67ab5096b095"
+passed_env = []
+container_build_command = ["cargo", "near", "build", "non-reproducible-wasm", "--locked", "--no-abi"]

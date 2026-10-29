@@ -1,0 +1,48 @@
+# Unit tests, then the reproducible (NEP-330) build of the Guardian contract and the agent wasm.
+# The printed hashes are what runs on mainnet: lp.kinuonnear.near's code hash and the agent's
+# OutLayer wasm hash (anyone can re-run this workflow and compare).
+name: Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests (contract)
+        run: cargo test -p kinu-guardian-shared --lib
+      - name: Install cargo-near 0.21.1
+        run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/near/cargo-near/releases/download/cargo-near-v0.21.1/cargo-near-installer.sh | sh
+      - name: Reproducible build (Docker, sourcescan/cargo-near pinned by digest)
+        run: cargo near build reproducible-wasm --manifest-path contracts/guardian/Cargo.toml --out-dir out 2>&1 | tee build.log
+      - name: Code hash
+        run: |
+          grep -E 'SHA-256 checksum (hex|bs58)' build.log
+          sha256sum out/*.wasm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guardian-contract
+          path: out/*.wasm
+
+  agent:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests (agent)
+        run: cargo test --lib
+      - name: Build for OutLayer (wasm32-wasip2)
+        run: |
+          rustup target add wasm32-wasip2
+          cargo build --release --locked --target wasm32-wasip2
+          sha256sum target/wasm32-wasip2/release/*.wasm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guardian-agent
+          path: agent/target/wasm32-wasip2/release/*.wasm
