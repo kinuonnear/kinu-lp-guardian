@@ -68,3 +68,12 @@ user join → one wNEAR deposit opened lpt `#23895` (398410..399364) → agent t
 `position_closed`, 1 NEAR on the user's ledger) → next tick `Noop("no open position")` → user `cash_out`
 returned 1.01 NEAR; contract Rhea balance `{}`. The first tick failed `NotEnoughBalance`: the agent
 attaches 300 TGas, so its account must keep more than ~0.31 NEAR free (0.5 NEAR now).
+
+## v1.1 contract, new agent build (29 Oct 2026)
+
+Contract upgraded in place to v1.1 (`3M8vEyfN…`), so the agent was rebuilt for that hash: build
+sha256 `cb0522f7371039f98fa8fca7a586eddf82d2a4d7bf2bf9d6663177d5dadbc75c`, uploaded by
+`agent.kinuonnear.near`; pubkey run `DTuZ7fL4xwTRoFNTFSVSTa7dikYWT3gPeYwSHUkiXxPr` → agent account
+`b451b57237474244c9a80664a668f2806cf7ef5f51793f881072eb944bfa1c24`
+(`ed25519:D8tef5fPvgmf4dqfDn1LKDy13KS2mpLMB7kC4AFobcVq`). The previous agent (`feb959d8…`, build
+`d411bd89…`) was retired: 0.487 NEAR back to `kinuonnear.near`.
