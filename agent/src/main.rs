@@ -1,9 +1,9 @@
-//! OutLayer entry point. Input (stdin JSON, untrusted): {"cmd":"pubkey"} or {"cmd":"tick","vault":"<account>"}.
-//! Output (stdout, at most 900 bytes): what the agent read, decided and sent.
+//! OutLayer entry point. Input (stdin JSON, untrusted): {"cmd":"pubkey"}, {"cmd":"tick","users":[..]}
+//! or {"cmd":"retire"}. Output (stdout, at most 900 bytes): what the agent read, decided and sent.
 //!
 //! The agent's NEAR account is the implicit account of its TEE key `agent` (manifest: bind "wasm"):
 //! the keystore derives it from this exact build and the caller, the module never sees it, and a new
-//! build has a new key that the owner must name on the vault again.
+//! build has a new key that users must name as their agent again.
 
 #[cfg(target_arch = "wasm32")]
 mod host {
@@ -49,9 +49,13 @@ mod run_impl {
     use kinu_guardian_agent::*;
     use serde_json::{Value, json};
 
-    /// The published vault build this agent serves (cargo-near build of the vault in this repo).
-    pub const VAULT_CODE_HASH: &str = "8SKHf63TeuQALgrTuNZ59uYWLxuuTCN49j1sGoXWJitP";
+    /// The shared Guardian contract this build serves, and the code it must run (cargo-near build of
+    /// contracts/guardian; scripts/codehash.py). A changed contract needs a new agent build.
+    pub const GUARDIAN: &str = "lp.kinuonnear.near";
+    pub const GUARDIAN_CODE_HASH: &str = "Gm53qinUZY69x2esMm2Yk7UXDxng4Q1LFpJChEg2n611";
     pub const DCL: &str = "dclv2.ref-labs.near";
+    /// Where `retire` returns the agent's gas: KINU's account, which funds the agent.
+    pub const RETIRE_TO: &str = "kinuonnear.near";
     const GAS: u64 = 300_000_000_000_000;
 
     fn view(contract: &str, method: &str, args: Value) -> Result<Value, String> {
@@ -116,96 +120,9 @@ mod run_impl {
         let failed = v["status"].get("Failure").is_some();
         let hash = v["transaction"]["hash"].as_str().unwrap_or("?").to_string();
         if failed {
-            return Err(format!("tx {hash} failed: {}", v["status"]["Failure"].to_string().chars().take(160).collect::<String>()));
+            return Err(format!("tx {hash} failed: {}", v["status"]["Failure"].to_string().chars().take(120).collect::<String>()));
         }
         Ok(hash)
-    }
-
-    /// A live 1Click quote for a Bunker exit, fetched from inside the TEE (network allowlist:
-    /// 1click.chaindefuser.com). The vault checks 1Click's signature itself; this only finds one.
-    fn bunker_quote(vault: &str, token: &str, amount: u128, recipient: &str) -> Result<(String, String), String> {
-        let body = json!({
-            "dry": false, "swapType": "EXACT_INPUT", "slippageTolerance": 100,
-            "originAsset": format!("nep141:{token}"), "depositType": "ORIGIN_CHAIN",
-            "destinationAsset": "nep141:zec.omft.near", "amount": amount.to_string(),
-            "refundTo": vault, "refundType": "ORIGIN_CHAIN", "recipient": recipient,
-            "recipientType": "DESTINATION_CHAIN", "deadline": deadline_in_30_min()?,
-        });
-        let resp = wasi_http_client::Client::new()
-            .post("https://1click.chaindefuser.com/v0/quote")
-            .header("content-type", "application/json")
-            .body(body.to_string().as_bytes())
-            .send()
-            .map_err(|e| format!("1click: {e}"))?;
-        let j: Value = serde_json::from_slice(&resp.body().map_err(|e| format!("1click body: {e}"))?).map_err(|e| e.to_string())?;
-        let signed = signed_message(&j).ok_or("1click: unexpected quote")?;
-        let signature = j["signature"].as_str().ok_or("1click: no signature")?.to_string();
-        Ok((signed, signature))
-    }
-
-    fn deadline_in_30_min() -> Result<String, String> {
-        let (b, err) = rpc::block("final");
-        if !err.is_empty() {
-            return Err(err);
-        }
-        let b = rpc_result(&b)?;
-        let ns = b["header"]["timestamp_nanosec"].as_str().and_then(|s| s.parse::<u64>().ok()).ok_or("no block time")?;
-        Ok(iso(ns / 1_000_000_000 + 1800))
-    }
-
-    fn iso(secs: u64) -> String {
-        let days = (secs / 86_400) as i64;
-        let rem = secs % 86_400;
-        let z = days + 719_468;
-        let era = z.div_euclid(146_097);
-        let doe = z - era * 146_097;
-        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let d = doy - (153 * mp + 2) / 5 + 1;
-        let m = if mp < 10 { mp + 3 } else { mp - 9 };
-        let y = yoe + era * 400 + i64::from(m <= 2);
-        format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.000Z", rem / 3600, rem % 3600 / 60, rem % 60)
-    }
-
-    /// The exact string 1Click signed: the SDK's field lists, absent fields left out, keys sorted
-    /// explicitly (independent of serde_json's map order), compact JSON like JSON.stringify.
-    fn signed_message(j: &Value) -> Option<String> {
-        let r = j.get("quoteRequest")?;
-        let q = j.get("quote")?;
-        let mut m: Vec<(&str, &Value)> = Vec::new();
-        for k in ["dry", "swapType", "slippageTolerance", "originAsset", "depositType", "destinationAsset", "amount", "refundTo", "refundType", "recipient", "recipientType", "deadline"] {
-            if let Some(v) = r.get(k) {
-                m.push((k, v));
-            }
-        }
-        for k in ["quoteWaitingTimeMs", "referral", "virtualChainRecipient", "virtualChainRefundRecipient", "customRecipientMsg"] {
-            if let Some(v) = r.get(k).filter(|v| truthy(v)) {
-                m.push((k, v));
-            }
-        }
-        for k in ["amountIn", "amountInFormatted", "amountInUsd", "minAmountIn", "amountOut", "amountOutFormatted", "amountOutUsd", "minAmountOut"] {
-            if let Some(v) = q.get(k) {
-                m.push((k, v));
-            }
-        }
-        // The quote's deadline replaces the request's, as in the SDK's object spread.
-        for k in ["depositAddress", "depositMemo", "deadline", "timeWhenInactive", "timeEstimate", "refundFee", "withdrawFee"] {
-            // A live quote's own deadline (even when absent) replaces the request's.
-            m.retain(|(name, _)| *name != k);
-            if let Some(v) = q.get(k).filter(|v| truthy(v)) {
-                m.push((k, v));
-            }
-        }
-        let ts = j.get("timestamp")?;
-        m.push(("timestamp", ts));
-        m.sort_by(|a, b| a.0.cmp(b.0));
-        let body: Vec<String> = m.iter().map(|(k, v)| format!("{}:{}", Value::from(*k), v)).collect();
-        Some(format!("{{{}}}", body.join(",")))
-    }
-
-    fn truthy(v: &Value) -> bool {
-        !(v.is_null() || v == &json!(false) || v == &json!(0) || v == &json!(""))
     }
 
     pub fn run(input: &str) -> Result<Value, String> {
@@ -215,23 +132,9 @@ mod run_impl {
         if req["cmd"] == "pubkey" {
             return Ok(json!({ "ok": true, "agent_account": me, "public_key": near_public_key(&pk) }));
         }
-        let vault = req["vault"].as_str().ok_or("input needs {\"cmd\":\"tick\",\"vault\":\"...\"}")?;
-        // Only the published vault build: an attacker's contract named in the input gets nothing.
-        let (acct, err) = rpc::view_account(vault, "final");
-        if !err.is_empty() {
-            return Err(format!("vault account: {err}"));
-        }
-        let acct = rpc_result(&acct)?;
-        // A factory vault runs the published code by reference (NEP-591): its hash is in
-        // global_contract_hash and code_hash stays at the zero sentinel.
-        let runs = acct["global_contract_hash"].as_str().or(acct["code_hash"].as_str()).unwrap_or("");
-        if runs != VAULT_CODE_HASH {
-            return Ok(json!({ "ok": true, "agent": me, "action": "noop", "why": "not the published vault build", "code_hash": runs }));
-        }
-        let v: VaultView = serde_json::from_value(view(vault, "get_vault", json!({}))?).map_err(|e| e.to_string())?;
         if req["cmd"] == "retire" {
-            // Hands the agent's gas back to this vault's owner (read from the published vault, never
-            // from the input) — for a build that is being replaced.
+            // Hands the agent's gas back to KINU (a constant of this build, never from the input),
+            // for a build that is being replaced.
             let (mine, err) = rpc::view_account(&me, "final");
             if !err.is_empty() {
                 return Err(format!("agent account: {err}"));
@@ -241,43 +144,70 @@ mod run_impl {
             if amount <= keep {
                 return Ok(json!({ "ok": true, "agent": me, "action": "retire: nothing to return" }));
             }
-            let tx = send_actions(&me, &pk, &v.owner, vec![NearAction::Transfer(amount - keep)])?;
-            return Ok(json!({ "ok": true, "agent": me, "action": "retire", "to": v.owner, "yocto": (amount - keep).to_string(), "tx": tx }));
+            let tx = send_actions(&me, &pk, RETIRE_TO, vec![NearAction::Transfer(amount - keep)])?;
+            return Ok(json!({ "ok": true, "agent": me, "action": "retire", "to": RETIRE_TO, "yocto": (amount - keep).to_string(), "tx": tx }));
         }
-        let pool_id = v.position.as_ref().map(|p| p.pool_id.clone()).or_else(|| v.policy.allowed_pools.first().cloned()).ok_or("no pool")?;
-        let pool: PoolView = serde_json::from_value(view(DCL, "get_pool", json!({ "pool_id": pool_id }))?).map_err(|e| e.to_string())?;
-        let mut wallet = Vec::new();
-        for t in [&pool.token_x, &pool.token_y] {
-            let b = view(t, "ft_balance_of", json!({ "account_id": vault }))?;
-            wallet.push((t.clone(), b.as_str().and_then(|s| s.parse().ok()).unwrap_or(0u128)));
+        if req["cmd"] != "tick" {
+            return Err("input needs {\"cmd\":\"tick\",\"users\":[...]}, pubkey or retire".into());
         }
-        let assets = view(DCL, "list_user_assets", json!({ "account_id": vault }))?;
-        let bal = |t: &str| assets[t].as_str().and_then(|s| s.parse::<u128>().ok()).unwrap_or(0);
-        let action = decide(&World { me: &me, vault: &v, pool: &pool, wallet: &wallet, dcl: (bal(&pool.token_x), bal(&pool.token_y)) });
-        let quote = match &action {
-            Action::BunkerExit { token, amount } => Some(bunker_quote(vault, token, *amount, v.exit_zec.as_deref().unwrap_or_default())?),
-            _ => None,
+        // Only the published contract: if the Guardian account ever runs other code, the agent stops.
+        let (acct, err) = rpc::view_account(GUARDIAN, "final");
+        if !err.is_empty() {
+            return Err(format!("guardian account: {err}"));
+        }
+        let runs = rpc_result(&acct)?["code_hash"].as_str().unwrap_or("").to_string();
+        if runs != GUARDIAN_CODE_HASH {
+            return Ok(json!({ "ok": true, "agent": me, "action": "noop", "why": "the Guardian account does not run the published code", "code_hash": runs }));
+        }
+        let users = users_from_input(&req);
+        if users.is_empty() {
+            return Err("no valid users in the input".into());
+        }
+        // One pool read per pool, shared by the users in it.
+        let mut pools: Vec<PoolView> = Vec::new();
+        let mut out = Vec::new();
+        for user in &users {
+            out.push(tick_one(&me, &pk, user, &mut pools).unwrap_or_else(|e| json!({ "u": user, "err": e.chars().take(120).collect::<String>() })));
+        }
+        Ok(json!({ "ok": true, "agent": me, "results": out }))
+    }
+
+    fn tick_one(me: &str, pk: &[u8; 32], user: &str, pools: &mut Vec<PoolView>) -> Result<Value, String> {
+        let a = view(GUARDIAN, "get_account", json!({ "user": user }))?;
+        if a.is_null() {
+            return Ok(json!({ "u": user, "a": "noop", "why": "not joined" }));
+        }
+        let account: AccountView = serde_json::from_value(a).map_err(|e| e.to_string())?;
+        let pool_id = account.position.as_ref().map(|p| p.pool_id.clone()).or_else(|| account.policy.allowed_pools.first().cloned()).ok_or("no pool")?;
+        let pool = match pools.iter().find(|p| p.pool_id == pool_id) {
+            Some(p) => p.clone(),
+            None => {
+                let p: PoolView = serde_json::from_value(view(DCL, "get_pool", json!({ "pool_id": pool_id }))?).map_err(|e| e.to_string())?;
+                pools.push(p.clone());
+                p
+            }
         };
-        // Cost guard: move an open position only when a day of fees in the new range pays for the gas.
+        let action = decide(&World { me, account: &account, pool: &pool });
+        // Cost guard: move a position only when a day of fees in the new range pays for the gas.
         // If the market data is unreachable the move goes ahead (a stuck position earns nothing).
         let mut guard = Value::Null;
-        if let (Action::Rebalance { left_point, right_point, .. }, Some(old)) = (&action, &v.position) {
+        if let (Action::Rebalance { left_point, right_point, .. }, Some(old)) = (&action, &account.position) {
             match day_of_fees(&pool, old, *left_point, *right_point) {
                 Ok((daily, near_usd)) => {
-                    guard = json!({ "fees_per_day_usd": daily, "gas_usd": REBALANCE_GAS_NEAR * near_usd });
+                    guard = json!({ "fees_day_usd": (daily * 1e4).round() / 1e4, "gas_usd": (REBALANCE_GAS_NEAR * near_usd * 1e4).round() / 1e4 });
                     if !rebalance_pays(daily, near_usd) {
-                        return Ok(json!({ "ok": true, "agent": me, "point": pool.current_point, "action": "noop", "why": "a day of fees would not pay for the rebalance", "guard": guard }));
+                        return Ok(json!({ "u": user, "p": pool.current_point, "a": "noop", "why": "a day of fees would not pay for the move", "g": guard }));
                     }
                 }
-                Err(e) => guard = json!({ "unavailable": e }),
+                Err(e) => guard = json!({ "unavailable": e.chars().take(60).collect::<String>() }),
             }
         }
         let summary = format!("{action:?}");
-        let Some((method, args)) = call_for(&action, quote.as_ref().map(|(s, g)| (s.as_str(), g.as_str()))) else {
-            return Ok(json!({ "ok": true, "agent": me, "point": pool.current_point, "action": summary }));
+        let Some((method, args)) = call_for(&action, user) else {
+            return Ok(json!({ "u": user, "p": pool.current_point, "a": summary }));
         };
-        let tx = send(&me, &pk, vault, method, args)?;
-        Ok(json!({ "ok": true, "agent": me, "point": pool.current_point, "action": summary, "tx": tx, "guard": guard }))
+        let tx = send(me, pk, GUARDIAN, method, args)?;
+        Ok(json!({ "u": user, "p": pool.current_point, "a": summary, "tx": tx, "g": guard }))
     }
 
     /// GeckoTerminal JSON (network allowlist: api.geckoterminal.com).

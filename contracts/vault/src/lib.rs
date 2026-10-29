@@ -17,27 +17,30 @@ use near_sdk::{AccountId, BorshStorageKey, Gas, NearToken, PanicOnDefault, Promi
 use policy::{Policy, RateWindow, RebalanceRequest, Refusal, check_out_of_range, check_rebalance};
 use std::collections::HashMap;
 
-// Gas budget, measured on mainnet (28-29 Oct): a full remove_liquidity schedules its own work and
-// fails with 30 TGas (KINU's app attaches 150); add_liquidity burns ~5, withdraw_asset ~3.
-// Every chain below fits in one 300 TGas transaction.
+// Gas budget, measured against the real Rhea DCL 2.4.0 wasm (tests/realdcl.rs). Since 2.4.0
+// add_liquidity and remove_liquidity send leftovers / removed tokens out of the DCL by default
+// (an ft_transfer or near_withdraw with its own callback: over 60 TGas). With skip_refund_transfer
+// and skip_unwrap_near they stay on the vault's Rhea balance instead: add 12 TGas, remove 9 TGas
+// burnt (both pass at 30-40 TGas); withdraw_asset needs 40 (10 burnt) and keeps wNEAR as wNEAR.
+// Every chain below fits in one 300 TGas transaction, with margin for the next DCL upgrade.
 const GAS_VIEW: Gas = Gas::from_tgas(10);
 const GAS_STORAGE: Gas = Gas::from_tgas(10);
 const GAS_FT_CALL: Gas = Gas::from_tgas(60);
-const GAS_ADD: Gas = Gas::from_tgas(40);
-const GAS_REMOVE: Gas = Gas::from_tgas(110);
-const GAS_WITHDRAW: Gas = Gas::from_tgas(25);
+const GAS_ADD: Gas = Gas::from_tgas(60);
+const GAS_REMOVE: Gas = Gas::from_tgas(60);
+const GAS_WITHDRAW: Gas = Gas::from_tgas(60);
 const GAS_TRANSFER: Gas = Gas::from_tgas(10);
 const GAS_CB: Gas = Gas::from_tgas(10);
 /// on_ready_to_add: add_liquidity + on_added.
-const GAS_CB_ADD: Gas = Gas::from_tgas(60);
+const GAS_CB_ADD: Gas = Gas::from_tgas(80);
 /// on_liquidity_for_rebalance: remove + on_removed + list_user_assets + on_ready_to_add.
-const GAS_CB_REMOVE_ADD: Gas = Gas::from_tgas(200);
+const GAS_CB_REMOVE_ADD: Gas = Gas::from_tgas(180);
 /// on_pool_for_rebalance: get_liquidity + on_liquidity_for_rebalance.
-const GAS_CB_REBALANCE: Gas = Gas::from_tgas(225);
+const GAS_CB_REBALANCE: Gas = Gas::from_tgas(205);
 /// on_liquidity_for_exit: remove + on_removed + 2 withdraws + on_exited.
-const GAS_CB_REMOVE_EXIT: Gas = Gas::from_tgas(195);
+const GAS_CB_REMOVE_EXIT: Gas = Gas::from_tgas(205);
 /// on_pool_for_exit: get_liquidity + on_liquidity_for_exit.
-const GAS_CB_EXIT: Gas = Gas::from_tgas(220);
+const GAS_CB_EXIT: Gas = Gas::from_tgas(230);
 /// on_close_checked: the empty-code deploy and the account deletion.
 const GAS_CB_CLOSE: Gas = Gas::from_tgas(40);
 /// The smallest valid wasm module. Closing deploys it first: NEAR refuses to delete an account
@@ -126,6 +129,12 @@ fn emit(event: &str, data: Value) {
 
 fn call(to: &AccountId, method: &str, args: Value, deposit: NearToken, gas: Gas) -> Promise {
     Promise::new(to.clone()).function_call(method.to_string(), args.to_string().into_bytes(), deposit, gas)
+}
+
+/// remove_liquidity of a whole position, the removed tokens staying on the vault's Rhea balance
+/// (DCL 2.4.0 otherwise sends them out with a transfer and callback of their own).
+fn remove_args(lpt_id: &str, amount: U128) -> Value {
+    json!({ "lpt_id": lpt_id, "amount": amount, "min_amount_x": "0", "min_amount_y": "0", "skip_refund_transfer": true, "skip_unwrap_near": true })
 }
 
 /// Minimum amounts the vault demands from add_liquidity, computed by the vault (never by the agent).
@@ -356,7 +365,7 @@ impl Vault {
     pub fn on_liquidity_for_rebalance(&mut self, request: RebalanceRequest, pool: PoolView, #[callback_result] liq: Result<Option<LiquidityView>, PromiseError>) -> Promise {
         let Ok(Some(liq)) = liq else { env::panic_str("Could not read the open position from Rhea DCL") };
         let old = self.position.clone().unwrap_or_else(|| env::panic_str("No open position"));
-        call(&self.dcl, "remove_liquidity", json!({ "lpt_id": old.lpt_id, "amount": liq.amount, "min_amount_x": "0", "min_amount_y": "0" }), ZERO, GAS_REMOVE)
+        call(&self.dcl, "remove_liquidity", remove_args(&old.lpt_id, liq.amount), ZERO, GAS_REMOVE)
             .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB).on_removed())
             .then(call(&self.dcl, "list_user_assets", json!({ "account_id": env::current_account_id() }), ZERO, GAS_VIEW))
             .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB_ADD).on_ready_to_add(request, pool))
@@ -385,7 +394,7 @@ impl Vault {
         call(
             &self.dcl,
             "add_liquidity",
-            json!({ "pool_id": request.pool_id, "left_point": request.left_point, "right_point": request.right_point, "amount_x": U128(x), "amount_y": U128(y), "min_amount_x": U128(min_x), "min_amount_y": U128(min_y) }),
+            json!({ "pool_id": request.pool_id, "left_point": request.left_point, "right_point": request.right_point, "amount_x": U128(x), "amount_y": U128(y), "min_amount_x": U128(min_x), "min_amount_y": U128(min_y), "skip_refund_transfer": true, "skip_unwrap_near": true }),
             ZERO,
             GAS_ADD,
         )
@@ -455,10 +464,10 @@ impl Vault {
     pub fn on_liquidity_for_exit(&mut self, pool: PoolView, #[callback_result] liq: Result<Option<LiquidityView>, PromiseError>) -> Promise {
         let Ok(Some(liq)) = liq else { env::panic_str("Could not read the open position from Rhea DCL") };
         let pos = self.position.clone().unwrap_or_else(|| env::panic_str("No open position"));
-        call(&self.dcl, "remove_liquidity", json!({ "lpt_id": pos.lpt_id, "amount": liq.amount, "min_amount_x": "0", "min_amount_y": "0" }), ZERO, GAS_REMOVE)
+        call(&self.dcl, "remove_liquidity", remove_args(&pos.lpt_id, liq.amount), ZERO, GAS_REMOVE)
             .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB).on_removed())
-            .then(call(&self.dcl, "withdraw_asset", json!({ "token_id": pool.token_x }), ZERO, GAS_WITHDRAW))
-            .then(call(&self.dcl, "withdraw_asset", json!({ "token_id": pool.token_y }), ZERO, GAS_WITHDRAW))
+            .then(call(&self.dcl, "withdraw_asset", json!({ "token_id": pool.token_x, "skip_unwrap_near": true }), ZERO, GAS_WITHDRAW))
+            .then(call(&self.dcl, "withdraw_asset", json!({ "token_id": pool.token_y, "skip_unwrap_near": true }), ZERO, GAS_WITHDRAW))
             .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB).on_exited())
     }
 
@@ -526,7 +535,7 @@ impl Vault {
         if from_rhea.0 == 0 {
             return send;
         }
-        call(&self.dcl, "withdraw_asset", json!({ "token_id": token, "amount": from_rhea }), ZERO, GAS_WITHDRAW).then(send)
+        call(&self.dcl, "withdraw_asset", json!({ "token_id": token, "amount": from_rhea, "skip_unwrap_near": true }), ZERO, GAS_WITHDRAW).then(send)
     }
 
     /// Closes the vault for good and returns its NEAR to the owner. Only once nothing is left in it:

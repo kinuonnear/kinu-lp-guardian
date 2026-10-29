@@ -1,10 +1,14 @@
 //! KINU LP Guardian agent: the decision logic and the NEAR transaction encoding, host-free so they
 //! are unit-tested natively. `main.rs` wires them to OutLayer's host functions inside the TEE.
 //!
+//! It serves the shared Guardian contract (one contract, a ledger and a policy per user).
+//!
 //! Trust model: a run's input is never trusted (any contract the caller transacts with can start a
-//! run with input of its own choosing). The agent decides only from chain state it reads itself:
-//! it acts on a vault only if that vault runs the published vault build (code hash) and names this
-//! agent; every action is still checked again by the vault against the owner's policy.
+//! run with input of its own choosing). The input only names users; the agent decides from chain
+//! state it reads itself, on the one Guardian account pinned in this build and only while that
+//! account runs the published code (code hash). It acts for a user only if the user names this
+//! agent, and every action is checked again by the contract against the user's policy. It never
+//! opens a position (the user does) and never moves funds out (only the user can).
 
 use borsh::BorshSerialize;
 use serde::Deserialize;
@@ -33,16 +37,14 @@ pub struct PositionRef {
     pub right_point: i32,
 }
 
+/// One user's record in the shared contract (`get_account`); ledger and owed are not needed here.
 #[derive(Deserialize, Debug, Clone, PartialEq)]
-pub struct VaultView {
-    pub owner: String,
+pub struct AccountView {
     pub agent: Option<String>,
     pub policy: Policy,
     pub frozen: bool,
-    pub exit_zec: Option<String>,
     pub position: Option<PositionRef>,
     pub high_point: Option<i32>,
-    #[serde(default)]
     pub low_point: Option<i32>,
 }
 
@@ -63,12 +65,8 @@ pub struct PoolView {
 /// What the agent reads before deciding (all from the chain).
 pub struct World<'a> {
     pub me: &'a str,
-    pub vault: &'a VaultView,
+    pub account: &'a AccountView,
     pub pool: &'a PoolView,
-    /// The vault's own wallet balances of the pool tokens (funds after an exit).
-    pub wallet: &'a [(String, u128)],
-    /// The vault's Rhea DCL balances of token X and token Y (funded, no position yet).
-    pub dcl: (u128, u128),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -77,7 +75,6 @@ pub enum Action {
     Poke,
     Rebalance { pool_id: String, left_point: i32, right_point: i32 },
     Exit,
-    BunkerExit { token: String, amount: u128 },
 }
 
 /// A one-sided range starts at least this many points away from the price, so a small move between
@@ -96,75 +93,50 @@ fn width(policy: &Policy, delta: i32) -> i32 {
 }
 
 pub fn decide(w: &World) -> Action {
-    let v = w.vault;
+    let v = w.account;
     if v.agent.as_deref() != Some(w.me) {
-        return Action::Noop("this vault does not name this agent");
+        return Action::Noop("this user does not name this agent");
     }
     if v.frozen {
-        return Action::Noop("vault is frozen");
+        return Action::Noop("the user froze the agent");
     }
+    // Idle tokens are the user's to place: the agent only looks after an open position.
+    let Some(pos) = &v.position else { return Action::Noop("no open position") };
     let p = w.pool;
     let d = p.point_delta.max(1);
     let cur = p.current_point;
     let wd = width(&v.policy, d);
-    match &v.position {
-        Some(pos) => {
-            let exit_on = v.policy.exit_drop_points > 0;
-            // How far the price moved against the owner from the best point the vault saw (the
-            // vault checks the same thing again before it lets the agent exit).
-            let moved = if v.policy.exit_on_rise {
-                i64::from(cur) - i64::from(v.low_point.unwrap_or(cur).min(cur))
-            } else {
-                i64::from(v.high_point.unwrap_or(cur).max(cur)) - i64::from(cur)
-            };
-            if exit_on && moved >= i64::from(v.policy.exit_drop_points) {
-                return Action::Exit;
-            }
-            // Re-centre only once the price is outside by more than the owner's buffer, and never
-            // within the one-sided margin: a re-entry sits up to MARGIN + spacing away from the
-            // price on purpose and must not count as "out of range" on the next tick.
-            let threshold = i64::from(v.policy.rebalance_buffer_points).max(i64::from(ONE_SIDED_MARGIN + d));
-            if cur < pos.left_point && i64::from(pos.left_point) - i64::from(cur) > threshold {
-                // Price fell below the range: the position is all token X; re-enter just above the price.
-                let left = floor_to(cur + ONE_SIDED_MARGIN, d) + d;
-                return Action::Rebalance { pool_id: pos.pool_id.clone(), left_point: left, right_point: left + wd };
-            }
-            if cur >= pos.right_point && i64::from(cur) - i64::from(pos.right_point) > threshold {
-                // Price rose above the range: all token Y; re-enter just below the price.
-                let right = floor_to(cur - ONE_SIDED_MARGIN, d);
-                return Action::Rebalance { pool_id: pos.pool_id.clone(), left_point: right - wd, right_point: right };
-            }
-            // Record a new best point for the exit rule; with the rule off a poke would only cost gas.
-            let new_mark = if v.policy.exit_on_rise { v.low_point.is_none_or(|l| cur < l) } else { v.high_point.is_none_or(|h| cur > h) };
-            if exit_on && new_mark {
-                return Action::Poke;
-            }
-            Action::Noop(if cur < pos.left_point || cur >= pos.right_point { "outside the range, within the buffer" } else { "in range" })
-        }
-        None => {
-            if v.exit_zec.is_some() {
-                if let Some((token, amount)) = w.wallet.iter().find(|(_, a)| *a > 0) {
-                    return Action::BunkerExit { token: token.clone(), amount: *amount };
-                }
-            }
-            let (x, y) = w.dcl;
-            if x > 0 && y > 0 {
-                let left = floor_to(cur - wd / 2, d);
-                return Action::Rebalance { pool_id: p.pool_id.clone(), left_point: left, right_point: left + wd };
-            }
-            if x > 0 {
-                // Only token X: a range just above the price uses X alone.
-                let left = floor_to(cur + ONE_SIDED_MARGIN, d) + d;
-                return Action::Rebalance { pool_id: p.pool_id.clone(), left_point: left, right_point: left + wd };
-            }
-            if y > 0 {
-                // Only token Y: just below the price.
-                let right = floor_to(cur - ONE_SIDED_MARGIN, d);
-                return Action::Rebalance { pool_id: p.pool_id.clone(), left_point: right - wd, right_point: right };
-            }
-            Action::Noop("nothing to manage")
-        }
+    let exit_on = v.policy.exit_drop_points > 0;
+    // How far the price moved against the user from the best point seen (the contract checks the
+    // same thing again before it lets the agent exit).
+    let moved = if v.policy.exit_on_rise {
+        i64::from(cur) - i64::from(v.low_point.unwrap_or(cur).min(cur))
+    } else {
+        i64::from(v.high_point.unwrap_or(cur).max(cur)) - i64::from(cur)
+    };
+    if exit_on && moved >= i64::from(v.policy.exit_drop_points) {
+        return Action::Exit;
     }
+    // Re-centre only once the price is outside by more than the user's buffer, and never within
+    // the one-sided margin: a re-entry sits up to MARGIN + spacing away from the price on purpose
+    // and must not count as "out of range" on the next tick.
+    let threshold = i64::from(v.policy.rebalance_buffer_points).max(i64::from(ONE_SIDED_MARGIN + d));
+    if cur < pos.left_point && i64::from(pos.left_point) - i64::from(cur) > threshold {
+        // Price fell below the range: the position is all token X; re-enter just above the price.
+        let left = floor_to(cur + ONE_SIDED_MARGIN, d) + d;
+        return Action::Rebalance { pool_id: pos.pool_id.clone(), left_point: left, right_point: left + wd };
+    }
+    if cur >= pos.right_point && i64::from(cur) - i64::from(pos.right_point) > threshold {
+        // Price rose above the range: all token Y; re-enter just below the price.
+        let right = floor_to(cur - ONE_SIDED_MARGIN, d);
+        return Action::Rebalance { pool_id: pos.pool_id.clone(), left_point: right - wd, right_point: right };
+    }
+    // Record a new best point for the exit rule; with the rule off a poke would only cost gas.
+    let new_mark = if v.policy.exit_on_rise { v.low_point.is_none_or(|l| cur < l) } else { v.high_point.is_none_or(|h| cur > h) };
+    if exit_on && new_mark {
+        return Action::Poke;
+    }
+    Action::Noop(if cur < pos.left_point || cur >= pos.right_point { "outside the range, within the buffer" } else { "in range" })
 }
 
 // ---------------------------------------------------------------- NEAR transactions (borsh, V0)
@@ -282,31 +254,47 @@ pub fn daily_fee_usd(volume_24h_usd: f64, fee_millionths: u32, l: f64, pool_liqu
     volume_24h_usd * f64::from(fee_millionths) / 1e6 * l / (pool_liquidity + l)
 }
 
-/// NEAR one rebalance costs: about 0.02 NEAR of gas at today's price (the agent attaches 300 TGas).
-pub const REBALANCE_GAS_NEAR: f64 = 0.02;
+/// NEAR one rebalance costs: 48.8 TGas burnt on Rhea DCL 2.4.0 (tests/shared.rs) at 0.1 NEAR per
+/// 1000 TGas is 0.0049 NEAR; rounded up for gas-price swings. (300 TGas are attached, the rest refunded.)
+pub const REBALANCE_GAS_NEAR: f64 = 0.006;
 
 /// The cost guard: move the position only when a day of fees in the new range pays for the move.
-/// The vault does not need this (its limits stand either way); it keeps the agent from spending
+/// The contract does not need this (its limits stand either way); it keeps the agent from spending
 /// more on gas than a quiet pool would ever earn back.
 pub fn rebalance_pays(daily_fee_usd: f64, near_usd: f64) -> bool {
     daily_fee_usd >= REBALANCE_GAS_NEAR * near_usd
 }
 
-/// The one call the agent makes per action, as (method, args json).
-pub fn call_for(action: &Action, quote: Option<(&str, &str)>) -> Option<(&'static str, String)> {
+/// The one call on the shared contract the agent makes for a user, as (method, args json).
+pub fn call_for(action: &Action, user: &str) -> Option<(&'static str, String)> {
+    use serde_json::json;
     match action {
         Action::Noop(_) => None,
-        Action::Poke => Some(("poke", "{}".into())),
-        Action::Exit => Some(("exit", "{}".into())),
+        Action::Poke => Some(("poke", json!({ "user": user }).to_string())),
+        Action::Exit => Some(("exit", json!({ "user": user }).to_string())),
         Action::Rebalance { pool_id, left_point, right_point } => Some((
             "request_rebalance",
-            serde_json::json!({ "request": { "pool_id": pool_id, "left_point": left_point, "right_point": right_point } }).to_string(),
+            json!({ "user": user, "request": { "pool_id": pool_id, "left_point": left_point, "right_point": right_point } }).to_string(),
         )),
-        Action::BunkerExit { token, .. } => {
-            let (signed, signature) = quote?;
-            Some(("bunker_exit", serde_json::json!({ "token": token, "signed": signed, "signature": signature }).to_string()))
+    }
+}
+
+/// At most this many users per run (one transaction each, and the output stays under 900 bytes).
+pub const MAX_USERS_PER_RUN: usize = 5;
+
+/// The users a run looks at: well-formed NEAR account ids from the (untrusted) input, deduplicated.
+pub fn users_from_input(input: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for u in input["users"].as_array().into_iter().flatten().filter_map(|v| v.as_str()) {
+        let ok = (2..=64).contains(&u.len()) && u.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-_.".contains(&b));
+        if ok && !out.iter().any(|o| o == u) {
+            out.push(u.to_string());
+        }
+        if out.len() == MAX_USERS_PER_RUN {
+            break;
         }
     }
+    out
 }
 
 #[cfg(test)]
@@ -317,13 +305,11 @@ mod tests {
     fn policy() -> Policy {
         Policy { allowed_pools: vec!["x|y|100".into()], min_width: 150, max_width: 4000, max_distance: 400, exit_drop_points: 2877, exit_on_rise: false, rebalance_buffer_points: 0 }
     }
-    fn vault(position: Option<(i32, i32)>, high: Option<i32>) -> VaultView {
-        VaultView {
-            owner: "owner".into(),
+    fn vault(position: Option<(i32, i32)>, high: Option<i32>) -> AccountView {
+        AccountView {
             agent: Some(ME.into()),
             policy: policy(),
             frozen: false,
-            exit_zec: Some("u1...".into()),
             position: position.map(|(l, r)| PositionRef { lpt_id: "x|y|100#1".into(), pool_id: "x|y|100".into(), left_point: l, right_point: r }),
             high_point: high,
             low_point: None,
@@ -332,23 +318,14 @@ mod tests {
     fn pool(point: i32) -> PoolView {
         PoolView { pool_id: "x|y|100".into(), token_x: "x".into(), token_y: "y".into(), current_point: point, point_delta: 40, fee: 100, liquidity: "0".into() }
     }
-    fn run(v: &VaultView, point: i32, wallet: &[(String, u128)], funded: bool) -> Action {
-        let funded = if funded { (1, 1) } else { (0, 0) };
-        decide(&World { me: ME, vault: v, pool: &pool(point), wallet, dcl: funded })
+    fn run(v: &AccountView, point: i32, _wallet: &[(String, u128)], _funded: bool) -> Action {
+        decide(&World { me: ME, account: v, pool: &pool(point) })
     }
 
     #[test]
-    fn opens_a_centred_range_when_funded() {
-        assert_eq!(run(&vault(None, None), 1000, &[], true), Action::Rebalance { pool_id: "x|y|100".into(), left_point: 920, right_point: 1080 });
-    }
-
-    #[test]
-    fn opens_one_sided_when_funded_with_one_token() {
-        let v = vault(None, None);
-        let only_x = decide(&World { me: ME, vault: &v, pool: &pool(1000), wallet: &[], dcl: (5, 0) });
-        assert_eq!(only_x, Action::Rebalance { pool_id: "x|y|100".into(), left_point: 1040, right_point: 1200 });
-        let only_y = decide(&World { me: ME, vault: &v, pool: &pool(1000), wallet: &[], dcl: (0, 5) });
-        assert_eq!(only_y, Action::Rebalance { pool_id: "x|y|100".into(), left_point: 800, right_point: 960 });
+    fn never_opens_a_position() {
+        // Idle tokens (a deposit without a range, or after an exit) are the user's to place.
+        assert_eq!(run(&vault(None, None), 1000, &[], true), Action::Noop("no open position"));
     }
 
     #[test]
@@ -360,7 +337,7 @@ mod tests {
     }
 
     /// A vault with the exit rule off, so only the rebalance logic speaks.
-    fn rebalance_only(position: (i32, i32)) -> VaultView {
+    fn rebalance_only(position: (i32, i32)) -> AccountView {
         let mut v = vault(Some(position), None);
         v.policy.exit_drop_points = 0;
         v
@@ -434,20 +411,49 @@ mod tests {
     }
 
     #[test]
-    fn pokes_on_a_new_high_and_sends_exited_funds_to_the_bunker() {
+    fn pokes_on_a_new_high() {
         assert_eq!(run(&vault(Some((-100, 100)), Some(0)), 40, &[], false), Action::Poke);
-        let wallet = vec![("x".to_string(), 0u128), ("y".to_string(), 5u128)];
-        assert_eq!(run(&vault(None, None), 0, &wallet, false), Action::BunkerExit { token: "y".into(), amount: 5 });
     }
 
     #[test]
-    fn ignores_vaults_that_do_not_name_it() {
-        let mut v = vault(None, None);
+    fn ignores_users_that_do_not_name_it() {
+        let mut v = vault(Some((-100, 100)), None);
         v.agent = Some("someone-else".into());
-        assert_eq!(run(&v, 0, &[], true), Action::Noop("this vault does not name this agent"));
+        assert_eq!(run(&v, 0, &[], true), Action::Noop("this user does not name this agent"));
         v.agent = Some(ME.into());
         v.frozen = true;
-        assert_eq!(run(&v, 0, &[], true), Action::Noop("vault is frozen"));
+        assert_eq!(run(&v, 0, &[], true), Action::Noop("the user froze the agent"));
+    }
+
+    #[test]
+    fn calls_name_the_user() {
+        let r = Action::Rebalance { pool_id: "x|y|100".into(), left_point: 1, right_point: 2 };
+        let (m, a) = call_for(&r, "alice.near").unwrap();
+        assert_eq!(m, "request_rebalance");
+        let a: serde_json::Value = serde_json::from_str(&a).unwrap();
+        assert_eq!(a["user"], "alice.near");
+        assert_eq!(a["request"]["left_point"], 1);
+        assert_eq!(call_for(&Action::Exit, "bob.near").unwrap(), ("exit", r#"{"user":"bob.near"}"#.to_string()));
+        assert_eq!(call_for(&Action::Noop("x"), "bob.near"), None);
+    }
+
+    #[test]
+    fn reads_the_shared_contracts_get_account() {
+        // The JSON shape `get_account` returns (contracts/guardian), unused fields included.
+        let raw = r#"{"policy":{"allowed_pools":["tkq.near|wrap.near|10000"],"min_width":1400,"max_width":5600,"max_distance":3000,"max_actions":12,"window_secs":86400,"max_slippage_bps":100,"exit_drop_points":2000,"exit_on_rise":false,"rebalance_buffer_points":100},"agent":"aa11","frozen":false,"rate":{"start_secs":0,"used":1},"position":{"lpt_id":"tkq.near|wrap.near|10000#3","pool_id":"tkq.near|wrap.near|10000","left_point":303200,"right_point":304600},"high_point":304800,"low_point":304800,"ledger":[["wrap.near","4228714614"]],"owed":[]}"#;
+        let a: AccountView = serde_json::from_str(raw).unwrap();
+        assert_eq!(a.position.as_ref().unwrap().right_point, 304600);
+        assert_eq!(a.policy.exit_drop_points, 2000);
+        // At 291077 the price fell 13,723 points from the high: the agent exits (the contract agreed in tests/shared.rs).
+        let pool = PoolView { pool_id: "tkq.near|wrap.near|10000".into(), token_x: "tkq.near".into(), token_y: "wrap.near".into(), current_point: 291_077, point_delta: 200, fee: 10000, liquidity: "0".into() };
+        assert_eq!(decide(&World { me: ME, account: &a, pool: &pool }), Action::Exit);
+    }
+
+    #[test]
+    fn users_from_input_are_checked_and_capped() {
+        let input = serde_json::json!({ "users": ["alice.near", "alice.near", "Bad.Near", "x", 7, "b.near", "c.near", "d.near", "e.near", "f.near"] });
+        assert_eq!(users_from_input(&input), vec!["alice.near", "b.near", "c.near", "d.near", "e.near"]);
+        assert!(users_from_input(&serde_json::json!({})).is_empty());
     }
 
     #[test]

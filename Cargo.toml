@@ -1,5 +1,5 @@
 [workspace]
-members = ["contracts/vault", "contracts/probe", "contracts/testtoken", "contracts/mockdcl", "contracts/factory", "tests"]
+members = ["contracts/vault", "contracts/probe", "contracts/testtoken", "contracts/mockdcl", "contracts/factory", "contracts/cleanup", "contracts/guardian", "tests"]
 resolver = "3"
 
 [workspace.dependencies]

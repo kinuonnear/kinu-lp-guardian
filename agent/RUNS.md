@@ -46,3 +46,13 @@ exit address = the owner's Zodl (formerly Zashi) unified address (Sapling + Orch
 6. NEAR Intents SUCCESS: **0.00202477 ZEC** delivered on Zcash, tx
    `42a02880183611ef3154e1dfe3eb720e4b0965f6f364523633d6c8bdfee4b1ba`, into the shielded pool.
 7. **Agent retire** returned its gas to the owner (0.309 NEAR).
+
+## Shared contract build (29 Oct 2026, not uploaded yet)
+
+After the per-user vaults were retired, the agent serves the shared contract `contracts/guardian`:
+pinned account `lp.kinuonnear.near` running code `Gm53qinU…` (else noop), input
+`{"cmd":"tick","users":[..]}` (at most 5, one transaction each), calls `request_rebalance(user, ..)`,
+`exit(user)` (only by the user's exit rule) and `poke(user)`; it never opens a position and never
+moves funds out. Bunker / 1Click removed (manifest allows only api.geckoterminal.com). Cost guard
+uses 0.006 NEAR per move (48.8 TGas measured on DCL 2.4.0). `retire` returns gas to `kinuonnear.near`.
+Local build sha256 `d411bd89…ad28`. It must be rebuilt if the contract hash changes.

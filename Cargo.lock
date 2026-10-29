@@ -1742,6 +1742,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kinu-guardian-cleanup"
+version = "0.1.0"
+dependencies = [
+ "near-sdk",
+]
+
+[[package]]
 name = "kinu-guardian-factory"
 version = "0.1.0"
 dependencies = [
@@ -1757,6 +1764,13 @@ dependencies = [
 
 [[package]]
 name = "kinu-guardian-probe"
+version = "0.1.0"
+dependencies = [
+ "near-sdk",
+]
+
+[[package]]
+name = "kinu-guardian-shared"
 version = "0.1.0"
 dependencies = [
  "near-sdk",
