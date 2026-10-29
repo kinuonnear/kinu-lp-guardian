@@ -52,7 +52,7 @@ mod run_impl {
     /// The shared Guardian contract this build serves, and the code it must run (cargo-near build of
     /// contracts/guardian; scripts/codehash.py). A changed contract needs a new agent build.
     pub const GUARDIAN: &str = "lp.kinuonnear.near";
-    pub const GUARDIAN_CODE_HASH: &str = "Gm53qinUZY69x2esMm2Yk7UXDxng4Q1LFpJChEg2n611";
+    pub const GUARDIAN_CODE_HASH: &str = "3M8vEyfNDVxHQTNUwafhSmPsG6FfRBy5eqnHQLG1iYot";
     pub const DCL: &str = "dclv2.ref-labs.near";
     /// Where `retire` returns the agent's gas: KINU's account, which funds the agent.
     pub const RETIRE_TO: &str = "kinuonnear.near";

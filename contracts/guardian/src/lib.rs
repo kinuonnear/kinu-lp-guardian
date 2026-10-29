@@ -14,8 +14,13 @@
 //!   · the user's way out (`withdraw`) needs only Rhea's `withdraw_asset`; no agent, no policy;
 //!     a payout the user's wallet refuses stays owed to them in this contract (`claim`);
 //!   · `cash_out` is the one-approval way out: close, pay every token, optionally leave;
-//!   · nobody administers funds: the contract has no owner. Anyone may pay its Rhea / token
-//!     storage; only a user touches their own ledger.
+//!   · every callback that follows a step on Rhea gets a static gas floor paying for the whole rest
+//!     of its chain: a transaction has enough gas from the start or fails before Rhea is touched
+//!     (v1.1; v1.0 once ran out after an add on mainnet and left the position off the user's record);
+//!   · nobody else touches a user's ledger. Anyone may pay the contract's Rhea / token storage.
+//!     During beta the contract account keeps its own key (KINU): it can upgrade the code, and
+//!     `recover_position` / `recover_credit` let it put a stranded position or leftover onto a
+//!     user's record (public events).
 
 mod policy;
 
@@ -27,15 +32,48 @@ use near_sdk::{AccountId, BorshStorageKey, Gas, GasWeight, NearToken, PanicOnDef
 use std::collections::HashMap;
 pub use policy::{Policy, RateWindow, RebalanceRequest, Refusal, check_out_of_range, check_rebalance};
 
-// Gas: views get a static budget; Rhea actions a static floor (measured against the real DCL 2.4.0
-// in tests/realdcl.rs) plus weight 1 of the unused gas; callbacks a floor plus weight 2, since the
-// rest of the chain runs inside them. A wallet's 300 TGas thus reaches every step.
-const GAS_VIEW: Gas = Gas::from_tgas(10);
-const GAS_DCL: Gas = Gas::from_tgas(60);
-const GAS_FT_CALL: Gas = Gas::from_tgas(80);
-const GAS_TRANSFER: Gas = Gas::from_tgas(10);
-/// A callback's static floor; it also takes twice the unused-gas share of the action before it.
-const GAS_CB: Gas = Gas::from_tgas(15);
+// Gas (v1.1). Every callback that follows a step on Rhea gets a static floor that pays for the WHOLE
+// rest of its chain (built below from the end of each chain back to its start), so a transaction
+// either has enough gas from the start or fails before Rhea is touched (a token transfer then comes
+// back whole). Unused gas is still shared out on top (actions weight 1, callbacks weight 2), so a
+// Rhea upgrade that needs more gas gets it from what the wallet attaches. Action budgets are what
+// the real DCL 2.4.0 needs plus margin (tests/realdcl.rs); a Rhea action that runs short fails on
+// its own and its callback, which has its own floor, puts the tokens back.
+const T_OWN: u64 = 15; // one callback's own work
+const T_VIEW: u64 = 10;
+const T_ADD: u64 = 50; // add_liquidity passes at 40 TGas, burns ~12
+const T_REMOVE: u64 = 40; // remove_liquidity passes at 30, burns ~9
+const T_WITHDRAW: u64 = 50; // withdraw_asset passes at 40, burns ~10
+const T_FT_CALL: u64 = 60; // a token into Rhea: ft_transfer_call → ft_on_transfer → resolve
+const T_TRANSFER: u64 = 10;
+const CB_OWN: u64 = T_OWN; // a callback that schedules nothing more
+const CB_ADDED: u64 = T_VIEW + CB_OWN + T_OWN; // reads the balance, then on_measured
+const CB_SNAP_ADD: u64 = T_ADD + CB_ADDED + T_OWN;
+const SNAPSHOT: u64 = T_VIEW + CB_SNAP_ADD; // what snapshot_then_add schedules
+const CB_REMOVED_ADD: u64 = SNAPSHOT + T_OWN;
+const CB_LIQ_MOVE: u64 = T_REMOVE + CB_REMOVED_ADD + T_OWN;
+const CB_POOL_NEW: u64 = SNAPSHOT + T_OWN; // on_pool_for_move with no position yet
+const CB_POOL_HELD: u64 = T_VIEW + CB_LIQ_MOVE + T_OWN; // on_pool_for_move moving a position
+const CB_FORWARDED_OPEN: u64 = T_VIEW + CB_POOL_NEW + T_OWN; // a deposit that opens
+const CB_LIQ_EXIT: u64 = T_REMOVE + CB_OWN + T_OWN;
+const CB_POOL_EXIT: u64 = T_VIEW + CB_LIQ_EXIT + T_OWN;
+const CB_WITHDRAWN: u64 = T_TRANSFER + CB_OWN + T_OWN;
+/// What cash out's pay_next schedules with `n` payouts left, this one included.
+const fn pay_floor(n: u64) -> u64 {
+    if n == 0 { 0 } else { T_WITHDRAW + cash_withdrawn_floor(n) }
+}
+const fn cash_withdrawn_floor(n: u64) -> u64 {
+    T_TRANSFER + cash_paid_floor(n - 1) + T_OWN
+}
+const fn cash_paid_floor(left: u64) -> u64 {
+    T_OWN + pay_floor(left)
+}
+const CB_CASH_CLOSED: u64 = T_OWN + pay_floor(2);
+const CB_LIQ_CASH: u64 = T_REMOVE + CB_CASH_CLOSED + T_OWN;
+const fn tg(t: u64) -> Gas {
+    Gas::from_tgas(t)
+}
+pub const VERSION: &str = "1.1.0";
 const ZERO: NearToken = NearToken::from_yoctonear(0);
 const ONE_YOCTO: NearToken = NearToken::from_yoctonear(1);
 /// A user's record; returned by `leave`.
@@ -54,6 +92,15 @@ pub struct PoolView {
 #[near(serializers = [json])]
 pub struct LiquidityView {
     pub amount: U128,
+}
+
+/// Rhea's get_liquidity, the fields recovery checks.
+#[near(serializers = [json])]
+pub struct RheaPosition {
+    pub owner_id: AccountId,
+    pub pool_id: String,
+    pub left_point: i32,
+    pub right_point: i32,
 }
 
 #[near(serializers = [borsh, json])]
@@ -131,7 +178,7 @@ fn call_fixed(to: &AccountId, method: &str, args: Value, deposit: NearToken, gas
 
 /// A view of another contract: a static budget only (nothing to forward).
 fn view(to: &AccountId, method: &str, args: Value) -> Promise {
-    Promise::new(to.clone()).function_call(method.to_string(), args.to_string().into_bytes(), ZERO, GAS_VIEW)
+    Promise::new(to.clone()).function_call(method.to_string(), args.to_string().into_bytes(), ZERO, tg(T_VIEW))
 }
 
 fn now_secs() -> u64 {
@@ -260,13 +307,13 @@ impl Guardian {
     /// Rhea DCL storage for this contract (0.5 NEAR registers it; more NEAR adds position slots).
     #[payable]
     pub fn register_dcl(&mut self) -> Promise {
-        call(&self.dcl, "storage_deposit", json!({ "account_id": env::current_account_id(), "registration_only": false }), env::attached_deposit(), GAS_VIEW)
+        call(&self.dcl, "storage_deposit", json!({ "account_id": env::current_account_id(), "registration_only": false }), env::attached_deposit(), tg(T_VIEW))
     }
 
     /// Registers this contract on a token (so Rhea can pay it out).
     #[payable]
     pub fn register_token(&mut self, token: AccountId) -> Promise {
-        call(&token, "storage_deposit", json!({ "account_id": env::current_account_id(), "registration_only": true }), env::attached_deposit(), GAS_VIEW)
+        call(&token, "storage_deposit", json!({ "account_id": env::current_account_id(), "registration_only": true }), env::attached_deposit(), tg(T_VIEW))
     }
 
     // ---------- the user ----------
@@ -348,6 +395,11 @@ impl Guardian {
             if o.left_point >= o.right_point {
                 refuse(Refusal::BadRange);
             }
+            // Moving a position inside a deposit's chain would need more gas than a token transfer
+            // passes on: deposit first, then `open` (the page sends both in one wallet request).
+            if acct.position.is_some() {
+                env::panic_str("You have a position: deposit without a range, then move it with open");
+            }
         }
         if self.is_busy() {
             emit("busy", json!({ "user": sender_id, "token": token, "amount": amount }));
@@ -355,8 +407,8 @@ impl Guardian {
         }
         self.lock();
         PromiseOrValue::Promise(
-            call(&token, "ft_transfer_call", json!({ "receiver_id": self.dcl, "amount": amount, "msg": "\"Deposit\"" }), ONE_YOCTO, GAS_FT_CALL)
-                .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB).with_unused_gas_weight(2).on_forwarded(sender_id, token, amount, open)),
+            call(&token, "ft_transfer_call", json!({ "receiver_id": self.dcl, "amount": amount, "msg": "\"Deposit\"" }), ONE_YOCTO, tg(T_FT_CALL))
+                .then(Self::ext(env::current_account_id()).with_static_gas(tg(if open.is_some() { CB_FORWARDED_OPEN } else { CB_OWN })).with_unused_gas_weight(2).on_forwarded(sender_id, token, amount, open)),
         )
     }
 
@@ -437,7 +489,7 @@ impl Guardian {
         }
         let pos = acct.position.unwrap_or_else(|| env::panic_str("No open position"));
         view(&self.dcl, "get_pool", json!({ "pool_id": pos.pool_id }))
-            .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB).on_poked(user))
+            .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_OWN)).on_poked(user))
     }
 
     #[private]
@@ -455,8 +507,9 @@ impl Guardian {
 
     /// Reads the pool; the checks and the move follow in the callback. The caller holds the lock.
     fn begin_move(&mut self, user: AccountId, request: RebalanceRequest, by_agent: bool) -> Promise {
+        let held = self.account(&user).position.is_some();
         view(&self.dcl, "get_pool", json!({ "pool_id": request.pool_id }))
-            .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB).with_unused_gas_weight(2).on_pool_for_move(user, request, by_agent))
+            .then(Self::ext(env::current_account_id()).with_static_gas(tg(if held { CB_POOL_HELD } else { CB_POOL_NEW })).with_unused_gas_weight(2).on_pool_for_move(user, request, by_agent))
     }
 
     #[private]
@@ -482,7 +535,7 @@ impl Guardian {
         match acct.position {
             Some(old) => PromiseOrValue::Promise(
                 view(&self.dcl, "get_liquidity", json!({ "lpt_id": old.lpt_id }))
-                    .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB).with_unused_gas_weight(2).on_liquidity_for_move(user, request, pool)),
+                    .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_LIQ_MOVE)).with_unused_gas_weight(2).on_liquidity_for_move(user, request, pool)),
             ),
             None => self.snapshot_then_add(user, request, pool),
         }
@@ -494,8 +547,8 @@ impl Guardian {
         let Ok(Some(liq)) = liq else { return self.bail(&user, "Could not read the open position from Rhea DCL") };
         let Some(old) = self.account(&user).position else { return self.bail(&user, "No open position") };
         PromiseOrValue::Promise(
-            call(&self.dcl, "remove_liquidity", remove_args(&old.lpt_id, liq.amount), ZERO, GAS_DCL)
-                .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB).with_unused_gas_weight(2).on_removed_then_add(user, request, pool)),
+            call(&self.dcl, "remove_liquidity", remove_args(&old.lpt_id, liq.amount), ZERO, tg(T_REMOVE))
+                .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_REMOVED_ADD)).with_unused_gas_weight(2).on_removed_then_add(user, request, pool)),
         )
     }
 
@@ -515,7 +568,7 @@ impl Guardian {
         }
         PromiseOrValue::Promise(
             view(&self.dcl, "list_user_assets", json!({ "account_id": env::current_account_id() }))
-                .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB).with_unused_gas_weight(2).on_snapshot_then_add(user, request, pool)),
+                .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_SNAP_ADD)).with_unused_gas_weight(2).on_snapshot_then_add(user, request, pool)),
         )
     }
 
@@ -538,9 +591,9 @@ impl Guardian {
                 "add_liquidity",
                 json!({ "pool_id": request.pool_id, "left_point": request.left_point, "right_point": request.right_point, "amount_x": U128(x), "amount_y": U128(y), "min_amount_x": U128(min_x), "min_amount_y": U128(min_y), "skip_refund_transfer": true, "skip_unwrap_near": true }),
                 ZERO,
-                GAS_DCL,
+                tg(T_ADD),
             )
-            .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB).with_unused_gas_weight(2).on_added(user, request, pool, [U128(x), U128(y), U128(before_x), U128(before_y)])),
+            .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_ADDED)).with_unused_gas_weight(2).on_added(user, request, pool, [U128(x), U128(y), U128(before_x), U128(before_y)])),
         )
     }
 
@@ -562,7 +615,7 @@ impl Guardian {
         emit("position_opened", json!({ "user": user, "lpt_id": lpt_id, "left_point": request.left_point, "right_point": request.right_point }));
         PromiseOrValue::Promise(
             view(&self.dcl, "list_user_assets", json!({ "account_id": env::current_account_id() }))
-                .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB).with_unused_gas_weight(2).on_measured(user, pool, lent_before)),
+                .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_OWN)).with_unused_gas_weight(2).on_measured(user, pool, lent_before)),
         )
     }
 
@@ -609,7 +662,7 @@ impl Guardian {
         self.assert_free();
         self.lock();
         view(&self.dcl, "get_pool", json!({ "pool_id": pos.pool_id }))
-            .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB).with_unused_gas_weight(2).on_pool_for_exit(user, by_user))
+            .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_POOL_EXIT)).with_unused_gas_weight(2).on_pool_for_exit(user, by_user))
     }
 
     #[private]
@@ -629,7 +682,7 @@ impl Guardian {
         emit("exit_started", json!({ "user": user, "by": if by_user { "user" } else { "agent" }, "lpt_id": pos.lpt_id, "current_point": cur }));
         PromiseOrValue::Promise(
             view(&self.dcl, "get_liquidity", json!({ "lpt_id": pos.lpt_id }))
-                .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB).with_unused_gas_weight(2).on_liquidity_for_exit(user, pool)),
+                .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_LIQ_EXIT)).with_unused_gas_weight(2).on_liquidity_for_exit(user, pool)),
         )
     }
 
@@ -638,8 +691,8 @@ impl Guardian {
         let Ok(Some(liq)) = liq else { return self.bail(&user, "Could not read the open position from Rhea DCL") };
         let Some(pos) = self.account(&user).position else { return self.bail(&user, "No open position") };
         PromiseOrValue::Promise(
-            call(&self.dcl, "remove_liquidity", remove_args(&pos.lpt_id, liq.amount), ZERO, GAS_DCL)
-                .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB).with_unused_gas_weight(2).on_exited(user, pool)),
+            call(&self.dcl, "remove_liquidity", remove_args(&pos.lpt_id, liq.amount), ZERO, tg(T_REMOVE))
+                .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_OWN)).with_unused_gas_weight(2).on_exited(user, pool)),
         )
     }
 
@@ -670,8 +723,8 @@ impl Guardian {
         let wnear = token == self.wnear;
         emit("withdraw_started", json!({ "user": user, "token": token, "amount": U128(amount) }));
         // wNEAR: Rhea unwraps and sends NEAR to this contract; other tokens: it transfers them here.
-        call(&self.dcl, "withdraw_asset", json!({ "token_id": token, "amount": U128(amount), "skip_unwrap_near": !wnear }), ZERO, GAS_DCL)
-            .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB).with_unused_gas_weight(2).on_withdrawn(user, token, U128(amount), wnear))
+        call(&self.dcl, "withdraw_asset", json!({ "token_id": token, "amount": U128(amount), "skip_unwrap_near": !wnear }), ZERO, tg(T_WITHDRAW))
+            .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_WITHDRAWN)).with_unused_gas_weight(2).on_withdrawn(user, token, U128(amount), wnear))
     }
 
     #[private]
@@ -690,8 +743,8 @@ impl Guardian {
             return PromiseOrValue::Promise(Promise::new(user).transfer(NearToken::from_yoctonear(amount.0)));
         }
         PromiseOrValue::Promise(
-            call(&token, "ft_transfer", json!({ "receiver_id": user, "amount": amount }), ONE_YOCTO, GAS_TRANSFER)
-                .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB).with_unused_gas_weight(2).on_paid(user, token, amount)),
+            call(&token, "ft_transfer", json!({ "receiver_id": user, "amount": amount }), ONE_YOCTO, tg(T_TRANSFER))
+                .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_OWN)).with_unused_gas_weight(2).on_paid(user, token, amount)),
         )
     }
 
@@ -717,8 +770,8 @@ impl Guardian {
         }
         acct.owed.retain(|(t, _)| *t != token);
         self.accounts.insert(user.clone(), acct);
-        call(&token, "ft_transfer", json!({ "receiver_id": user, "amount": U128(amount) }), ONE_YOCTO, GAS_TRANSFER)
-            .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB).with_unused_gas_weight(2).on_claimed(user, token, U128(amount)))
+        call(&token, "ft_transfer", json!({ "receiver_id": user, "amount": U128(amount) }), ONE_YOCTO, tg(T_TRANSFER))
+            .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_OWN)).with_unused_gas_weight(2).on_claimed(user, token, U128(amount)))
     }
 
     #[private]
@@ -748,7 +801,7 @@ impl Guardian {
         let Some(pos) = acct.position else { return self.pay_next(user, leave) };
         PromiseOrValue::Promise(
             view(&self.dcl, "get_liquidity", json!({ "lpt_id": pos.lpt_id }))
-                .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB).with_unused_gas_weight(1).on_liquidity_for_cash_out(user, leave)),
+                .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_LIQ_CASH)).with_unused_gas_weight(1).on_liquidity_for_cash_out(user, leave)),
         )
     }
 
@@ -757,8 +810,8 @@ impl Guardian {
         let Ok(Some(liq)) = liq else { return self.bail(&user, "Could not read the open position from Rhea DCL") };
         let Some(pos) = self.account(&user).position else { return self.bail(&user, "No open position") };
         PromiseOrValue::Promise(
-            call_fixed(&self.dcl, "remove_liquidity", remove_args(&pos.lpt_id, liq.amount), ZERO, GAS_DCL)
-                .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB).with_unused_gas_weight(1).on_cash_out_closed(user, leave)),
+            call_fixed(&self.dcl, "remove_liquidity", remove_args(&pos.lpt_id, liq.amount), ZERO, tg(T_REMOVE))
+                .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_CASH_CLOSED)).with_unused_gas_weight(1).on_cash_out_closed(user, leave)),
         )
     }
 
@@ -786,9 +839,12 @@ impl Guardian {
             let _ = Promise::new(user.clone()).transfer(NearToken::from_yoctonear(amount.0));
             return self.pay_next(user, leave);
         }
+        let acct = self.account(&user);
+        let (x, y) = acct.pool_tokens();
+        let left = [x, y].iter().filter(|t| acct.held(t) > 0).count() as u64;
         PromiseOrValue::Promise(
-            call_fixed(&token, "ft_transfer", json!({ "receiver_id": user, "amount": amount }), ONE_YOCTO, GAS_TRANSFER)
-                .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB).with_unused_gas_weight(1).on_cash_out_paid(user, token, amount, leave)),
+            call_fixed(&token, "ft_transfer", json!({ "receiver_id": user, "amount": amount }), ONE_YOCTO, tg(T_TRANSFER))
+                .then(Self::ext(env::current_account_id()).with_static_gas(tg(cash_paid_floor(left))).with_unused_gas_weight(1).on_cash_out_paid(user, token, amount, leave)),
         )
     }
 
@@ -798,6 +854,56 @@ impl Guardian {
         self.pay_next(user, leave)
     }
 
+    // ---------- recovery: only the contract account itself (its key is KINU's during beta) ----------
+
+    /// Puts a position this contract owns on Rhea onto a user's record, e.g. after a chain ran out of
+    /// gas between the add and the record (v1.0). Rhea says who owns it and where it sits; it must be
+    /// this contract's, in the user's pool, and the user must have no position. A public event.
+    pub fn recover_position(&mut self, user: AccountId, lpt_id: String) -> Promise {
+        self.assert_self();
+        if self.account(&user).position.is_some() {
+            env::panic_str("The user already has a position");
+        }
+        view(&self.dcl, "get_liquidity", json!({ "lpt_id": lpt_id })).then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_OWN)).on_recover_checked(user, lpt_id))
+    }
+
+    #[private]
+    pub fn on_recover_checked(&mut self, user: AccountId, lpt_id: String, #[callback_result] found: Result<Option<RheaPosition>, PromiseError>) -> bool {
+        let Ok(Some(l)) = found else {
+            emit("recover_refused", json!({ "user": user, "lpt_id": lpt_id, "why": "Rhea has no such position" }));
+            return false;
+        };
+        let Some(mut acct) = self.accounts.get(&user).cloned() else { return false };
+        if l.owner_id != env::current_account_id() || l.pool_id != acct.pool_id() || acct.position.is_some() {
+            emit("recover_refused", json!({ "user": user, "lpt_id": lpt_id, "why": "not this contract's, not the user's pool, or the user has a position" }));
+            return false;
+        }
+        acct.position = Some(PositionRef { lpt_id: lpt_id.clone(), pool_id: l.pool_id, left_point: l.left_point, right_point: l.right_point });
+        self.accounts.insert(user.clone(), acct);
+        emit("recovered_position", json!({ "user": user, "lpt_id": lpt_id, "left_point": l.left_point, "right_point": l.right_point }));
+        true
+    }
+
+    /// Credits a user with tokens on this contract's Rhea balance that no record holds (an add's
+    /// leftover a chain could not measure). Only the contract account itself; a public event.
+    pub fn recover_credit(&mut self, user: AccountId, token: AccountId, amount: U128) {
+        self.assert_self();
+        let mut acct = self.account(&user);
+        let (x, y) = acct.pool_tokens();
+        if token != x && token != y {
+            env::panic_str("This token is not in the user's pool");
+        }
+        acct.credit(&token, amount.0);
+        self.accounts.insert(user.clone(), acct);
+        emit("recovered_credit", json!({ "user": user, "token": token, "amount": amount }));
+    }
+
+    fn assert_self(&self) {
+        if env::predecessor_account_id() != env::current_account_id() {
+            env::panic_str("Only the contract account itself can recover");
+        }
+    }
+
     // ---------- views ----------
 
     pub fn get_account(&self, user: AccountId) -> Option<Account> {
@@ -805,7 +911,7 @@ impl Guardian {
     }
 
     pub fn get_config(&self) -> Value {
-        json!({ "dcl": self.dcl, "wnear": self.wnear, "join_deposit": JOIN_DEPOSIT, "busy": self.is_busy() })
+        json!({ "version": VERSION, "dcl": self.dcl, "wnear": self.wnear, "join_deposit": JOIN_DEPOSIT, "busy": self.is_busy() })
     }
 
     // ---------- helpers ----------
@@ -867,13 +973,15 @@ impl Guardian {
             }
             return PromiseOrValue::Value(true);
         };
+        let (x, y) = acct.pool_tokens();
+        let n = [x, y].iter().filter(|t| acct.held(t) > 0).count() as u64;
         acct.debit(&token, amount);
         self.accounts.insert(user.clone(), acct);
         let wnear = token == self.wnear;
         emit("withdraw_started", json!({ "user": user, "token": token, "amount": U128(amount) }));
         PromiseOrValue::Promise(
-            call_fixed(&self.dcl, "withdraw_asset", json!({ "token_id": token, "amount": U128(amount), "skip_unwrap_near": !wnear }), ZERO, GAS_DCL)
-                .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CB).with_unused_gas_weight(1).on_cash_out_withdrawn(user, token, U128(amount), leave)),
+            call_fixed(&self.dcl, "withdraw_asset", json!({ "token_id": token, "amount": U128(amount), "skip_unwrap_near": !wnear }), ZERO, tg(T_WITHDRAW))
+                .then(Self::ext(env::current_account_id()).with_static_gas(tg(cash_withdrawn_floor(n))).with_unused_gas_weight(1).on_cash_out_withdrawn(user, token, U128(amount), leave)),
         )
     }
 
@@ -1140,6 +1248,55 @@ mod tests {
         assert!(g.on_poked(acc("alice.testnet"), pool(-30)));
         let a = g.get_account(acc("alice.testnet")).unwrap();
         assert_eq!((a.high_point, a.low_point), (Some(50), Some(-30)));
+    }
+
+    #[test]
+    fn gas_floors_cover_each_chain_within_300_tgas() {
+        // Each entry point: what it schedules, plus its own work, must fit a wallet's 300 TGas
+        // (a token transfer passes ~270 of it on to ft_on_transfer).
+        let deposit_open = T_FT_CALL + CB_FORWARDED_OPEN + T_OWN;
+        let agent_move = T_VIEW + CB_POOL_HELD + T_OWN;
+        let cash_out = T_VIEW + CB_LIQ_CASH + T_OWN;
+        let exit = T_VIEW + CB_POOL_EXIT + T_OWN;
+        let withdraw = T_WITHDRAW + CB_WITHDRAWN + T_OWN;
+        println!("deposit+open {deposit_open}, move {agent_move}, cash_out {cash_out}, exit {exit}, withdraw {withdraw}");
+        assert!(deposit_open <= 265 && agent_move <= 290 && cash_out <= 290 && exit <= 290 && withdraw <= 290);
+        // The chain behind an add always has its measurement step paid for.
+        assert!(CB_ADDED >= T_VIEW + CB_OWN && CB_SNAP_ADD >= T_ADD + CB_ADDED);
+    }
+
+    #[test]
+    #[should_panic(expected = "deposit without a range, then move it with open")]
+    fn a_deposit_never_moves_an_open_position() {
+        let mut g = joined();
+        let mut a = g.get_account(acc("alice.testnet")).unwrap();
+        a.position = Some(PositionRef { lpt_id: "1".into(), pool_id: POOL.into(), left_point: -1400, right_point: 1400 });
+        g.accounts.insert(acc("alice.testnet"), a);
+        ctx("tkq.testnet", ZERO);
+        let _ = g.ft_on_transfer(acc("alice.testnet"), U128(5), r#"{"left_point":0,"right_point":1400}"#.into());
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the contract account itself")]
+    fn only_the_contract_itself_recovers_credit() {
+        let mut g = joined();
+        ctx("alice.testnet", ZERO);
+        g.recover_credit(acc("alice.testnet"), acc("tkq.testnet"), U128(5));
+    }
+
+    #[test]
+    fn the_contract_itself_recovers_a_position_and_credit() {
+        let mut g = joined();
+        ctx("guardian.testnet", ZERO);
+        g.recover_credit(acc("alice.testnet"), acc("tkq.testnet"), U128(5));
+        assert_eq!(held(&g, "alice.testnet", "tkq.testnet"), 5);
+        let _ = g.recover_position(acc("alice.testnet"), "tkq.testnet|wrap.testnet|10000#9".into());
+        let found = RheaPosition { owner_id: acc("guardian.testnet"), pool_id: POOL.into(), left_point: -1400, right_point: 1400 };
+        assert!(g.on_recover_checked(acc("alice.testnet"), "tkq.testnet|wrap.testnet|10000#9".into(), Ok(Some(found))));
+        assert_eq!(g.get_account(acc("alice.testnet")).unwrap().position.unwrap().left_point, -1400);
+        // Someone else's position, or a second one, is refused.
+        let theirs = RheaPosition { owner_id: acc("bob.testnet"), pool_id: POOL.into(), left_point: 0, right_point: 1400 };
+        assert!(!g.on_recover_checked(acc("alice.testnet"), "x#1".into(), Ok(Some(theirs))));
     }
 
     #[test]

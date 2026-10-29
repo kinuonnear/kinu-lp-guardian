@@ -1783,6 +1783,7 @@ dependencies = [
  "base64 0.22.1",
  "near-api",
  "near-sandbox",
+ "reqwest",
  "serde_json",
  "sha2 0.10.9",
  "testresult",
