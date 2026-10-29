@@ -53,8 +53,8 @@ mod run_impl {
     /// The shared Guardian contract this build serves, and the code it must run (cargo-near build of
     /// contracts/guardian; scripts/codehash.py). A changed contract needs a new agent build.
     pub const GUARDIAN: &str = "lp.kinuonnear.near";
-    // v1.3: the reproducible CI build of efc29a8 (NEP-330 metadata inside), deployed from that CI artifact.
-    pub const GUARDIAN_CODE_HASH: &str = "Aze3rnhGNT58KY1p5KKgFpC2uXzvQW44HazfK5SYrL3G";
+    // v1.4: the reproducible CI build of 135adb6 (Build #5, NEP-330 metadata inside), deployed from that CI artifact.
+    pub const GUARDIAN_CODE_HASH: &str = "7JzW6wgqKxoDsYxCXjYgu4oqPDxXXf2nPV9bGEhY5yqi";
     pub const DCL: &str = "dclv2.ref-labs.near";
     /// Where `retire` returns the agent's gas: KINU's account, which funds the agent.
     pub const RETIRE_TO: &str = "kinuonnear.near";
