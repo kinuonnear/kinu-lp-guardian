@@ -433,36 +433,58 @@ impl Guardian {
 
     // ---------- admin: proposed by the owner, run by anyone after the delay ----------
 
-    /// Stages new code (the raw wasm is this call's whole input, not JSON). Anyone may stage; the
-    /// attached NEAR pays the code's storage and is returned when it is deployed or replaced. Code
-    /// that a pending upgrade names cannot be replaced.
+    /// Stages new code (the raw wasm is this call's whole input, not JSON). Anyone may stage into an
+    /// empty slot; staged code is replaced only by whoever staged it or by the owner, and never
+    /// while a pending upgrade names it. The attached NEAR must pay the WHOLE code's storage (not a
+    /// difference: a replacement must never be paid for by the contract's own balance) and is
+    /// returned when the code is deployed, replaced or cleared.
     #[payable]
     pub fn stage_code(&mut self) {
         let code = env::input().unwrap_or_else(|| env::panic_str("Send the wasm as the call's input"));
         if code.len() < 1_000 {
             env::panic_str("That is not a contract");
         }
+        let caller = env::predecessor_account_id();
         if let Some(old) = &self.staged {
-            if self.pending.values().any(|p| p.action == AdminAction::Upgrade { code_hash: old.code_hash.clone() }) {
+            if self.upgrade_pending_for(&old.code_hash) {
                 env::panic_str("The staged code has a pending upgrade; cancel it first");
             }
+            if caller != old.by && caller != self.owner {
+                env::panic_str("Code is already staged: only its stager or the owner can replace it");
+            }
         }
-        let before = env::storage_usage();
+        // The code itself plus its record in the state, with margin.
+        let needed = (code.len() as u128 + 300) * env::storage_byte_cost().as_yoctonear();
+        if env::attached_deposit().as_yoctonear() < needed {
+            env::panic_str("Attach enough NEAR for the whole code's storage (about 1 NEAR per 100 kB)");
+        }
         let previous = self.staged.take();
         env::storage_remove(STAGED_CODE);
         env::storage_write(STAGED_CODE, &code);
         let code_hash = near_sdk::bs58::encode(env::sha256(&code)).into_string();
-        let staged = Staged { code_hash: code_hash.clone(), bytes: code.len() as u64, by: env::predecessor_account_id(), deposit: env::attached_deposit() };
-        self.staged = Some(staged);
-        // What the new code adds to storage, measured after the state above is written back.
-        let added = u128::from(env::storage_usage().saturating_sub(before)) + 200;
-        if env::attached_deposit().as_yoctonear() < added * env::storage_byte_cost().as_yoctonear() {
-            env::panic_str("Attach enough NEAR for the code's storage (about 1 NEAR per 100 kB)");
-        }
+        self.staged = Some(Staged { code_hash: code_hash.clone(), bytes: code.len() as u64, by: caller.clone(), deposit: env::attached_deposit() });
         if let Some(p) = previous {
             Promise::new(p.by).transfer(p.deposit).detach();
         }
-        emit("code_staged", json!({ "code_hash": code_hash, "bytes": code.len(), "by": env::predecessor_account_id() }));
+        emit("code_staged", json!({ "code_hash": code_hash, "bytes": code.len(), "by": caller }));
+    }
+
+    /// The owner removes staged code no pending upgrade names (e.g. junk someone staged to block
+    /// the slot); the stager gets the deposit back. At once: it moves no user funds.
+    pub fn clear_staged(&mut self) {
+        self.assert_owner();
+        let hash = self.staged.as_ref().map(|s| s.code_hash.clone()).unwrap_or_else(|| env::panic_str("Nothing is staged"));
+        if self.upgrade_pending_for(&hash) {
+            env::panic_str("The staged code has a pending upgrade; cancel it first");
+        }
+        let staged = self.staged.take().unwrap_or_else(|| env::panic_str("Nothing is staged"));
+        env::storage_remove(STAGED_CODE);
+        Promise::new(staged.by.clone()).transfer(staged.deposit).detach();
+        emit("code_cleared", json!({ "code_hash": staged.code_hash, "by": staged.by }));
+    }
+
+    fn upgrade_pending_for(&self, code_hash: &str) -> bool {
+        self.pending.values().any(|p| matches!(&p.action, AdminAction::Upgrade { code_hash: h } if h == code_hash))
     }
 
     /// The owner proposes an admin action. It becomes runnable ADMIN_DELAY_SECS later.
@@ -494,6 +516,17 @@ impl Guardian {
         let p = self.pending.get(&id).cloned().unwrap_or_else(|| env::panic_str("No such proposal"));
         if now_secs() < p.ready_at_secs {
             env::panic_str("Too early: the delay has not passed");
+        }
+        // Every check before any change.
+        if let AdminAction::Upgrade { code_hash } = &p.action {
+            if self.staged.as_ref().map(|s| &s.code_hash) != Some(code_hash) {
+                env::panic_str("The staged code is not the proposed one");
+            }
+        }
+        if let AdminAction::RecoverPosition { user, .. } = &p.action {
+            if self.account(user).position.is_some() {
+                env::panic_str("The user already has a position");
+            }
         }
         self.pending.remove(&id);
         emit("admin_executed", json!({ "id": id, "action": p.action }));
@@ -695,7 +728,7 @@ impl Guardian {
     /// The user's agent asks for a new range; checked against the user's policy on-chain.
     pub fn request_rebalance(&mut self, user: AccountId, request: RebalanceRequest) -> Promise {
         self.assert_running();
-        let mut acct = self.account(&user);
+        let acct = self.account(&user);
         if acct.frozen {
             refuse(Refusal::Frozen);
         }
@@ -714,9 +747,9 @@ impl Guardian {
             env::panic_str("No open position: only the user opens one");
         }
         self.assert_free();
-        let policy = acct.policy.clone();
-        acct.rate.take(&policy, now_secs()).unwrap_or_else(|r| refuse(r));
-        self.accounts.insert(user.clone(), acct);
+        // Only checked here; an action is counted once it passes every check (on_pool_for_move), so
+        // a compromised agent cannot use up the user's daily actions with requests that are refused.
+        acct.rate.clone().take(&acct.policy, now_secs()).unwrap_or_else(|r| refuse(r));
         self.lock();
         self.begin_move(user, request, true)
     }
@@ -788,6 +821,12 @@ impl Guardian {
                 && acct.position.as_ref().is_none_or(|open| check_out_of_range(&acct.policy, open.left_point, open.right_point, then).is_ok());
             if !confirmed {
                 return self.bail(&user, Refusal::NotConfirmed.message());
+            }
+            // Approved: now it counts against the user's actions per window (checked again here,
+            // the lock keeps anything else from counting in between).
+            let policy = acct.policy.clone();
+            if let Err(r) = acct.rate.take(&policy, now_secs()) {
+                return self.bail(&user, r.message());
             }
             // A fresh read is needed before the next action.
             self.seen.remove(&user);
@@ -1792,5 +1831,78 @@ mod tests {
         g.set_paused(false);
         ctx("bob.testnet", JOIN_DEPOSIT);
         g.join(policy(), None);
+    }
+
+    #[test]
+    fn refused_agent_requests_do_not_use_up_the_users_actions() {
+        let mut g = joined();
+        with_position(&mut g);
+        let req = RebalanceRequest { pool_id: POOL.into(), left_point: 2_000, right_point: 4_000 };
+        // Refused in the callback (no earlier price, then a pushed one): nothing counted.
+        at("guardian.testnet", 10_000);
+        let _ = g.on_pool_for_move(acc("alice.testnet"), req.clone(), true, pool_at(3_000));
+        g.seen.insert(acc("alice.testnet"), Seen { point: 100, at_secs: 9_700 });
+        let _ = g.on_pool_for_move(acc("alice.testnet"), req.clone(), true, pool_at(3_000));
+        assert_eq!(g.get_account(acc("alice.testnet")).unwrap().rate.used, 0);
+        // Approved: counted once.
+        g.seen.insert(acc("alice.testnet"), Seen { point: 2_900, at_secs: 9_700 });
+        assert!(matches!(g.on_pool_for_move(acc("alice.testnet"), req, true, pool_at(3_000)), PromiseOrValue::Promise(_)));
+        assert_eq!(g.get_account(acc("alice.testnet")).unwrap().rate.used, 1);
+    }
+
+    #[test]
+    fn a_full_window_refuses_at_the_door_and_in_the_callback() {
+        let mut g = joined();
+        with_position(&mut g);
+        let mut a = g.get_account(acc("alice.testnet")).unwrap();
+        a.rate = RateWindow { start_secs: 10_000, used: a.policy.max_actions };
+        g.accounts.insert(acc("alice.testnet"), a);
+        at("agent.testnet", 10_000);
+        let req = RebalanceRequest { pool_id: POOL.into(), left_point: 2_000, right_point: 4_000 };
+        assert!(panics(|| drop(g.request_rebalance(acc("alice.testnet"), req.clone()))));
+        g.seen.insert(acc("alice.testnet"), Seen { point: 2_900, at_secs: 9_700 });
+        at("guardian.testnet", 10_000);
+        assert!(matches!(g.on_pool_for_move(acc("alice.testnet"), req, true, pool_at(3_000)), PromiseOrValue::Value(false)));
+        assert!(refused_why().contains("Too many agent actions"));
+    }
+
+    fn stage(g: &mut Guardian, who: &str, code: &[u8], deposit: NearToken) {
+        let mut c = VMContextBuilder::new().predecessor_account_id(acc(who)).current_account_id(acc("guardian.testnet")).attached_deposit(deposit).build();
+        c.input = std::rc::Rc::from(code.to_vec());
+        testing_env!(c);
+        g.stage_code();
+    }
+
+    #[test]
+    fn staged_code_is_paid_in_full_and_only_its_stager_or_the_owner_replaces_it() {
+        let mut g = joined();
+        let code = vec![7u8; 50_000];
+        let full = NearToken::from_yoctonear((50_000 + 300) * 10u128.pow(19));
+        // Less than the whole code's storage: refused.
+        assert!(panics(|| stage(&mut g, "kinu.testnet", &code, NearToken::from_near(0))));
+        stage(&mut g, "kinu.testnet", &code, full);
+        assert_eq!(g.staged.as_ref().unwrap().by, acc("kinu.testnet"));
+        // A stranger cannot swap it, even paying in full.
+        let other = vec![9u8; 50_000];
+        assert!(panics(|| stage(&mut g, "mallory.testnet", &other, full)));
+        // A replacement by its stager pays in full again (never from the contract's balance).
+        assert!(panics(|| stage(&mut g, "kinu.testnet", &other, NearToken::from_near(0))));
+        stage(&mut g, "kinu.testnet", &other, full);
+        // The owner clears it at once (no pending upgrade names it); a stranger cannot.
+        ctx("mallory.testnet", ZERO);
+        assert!(panics(|| g.clear_staged()));
+        ctx("dao.testnet", ZERO);
+        g.clear_staged();
+        assert!(g.staged.is_none());
+        // Staged and proposed: locked for everyone, the owner's clear included, until cancelled.
+        stage(&mut g, "kinu.testnet", &code, full);
+        let hash = g.staged.as_ref().unwrap().code_hash.clone();
+        at("dao.testnet", 0);
+        let id = g.propose(AdminAction::Upgrade { code_hash: hash });
+        assert!(panics(|| stage(&mut g, "kinu.testnet", &other, full)));
+        at("dao.testnet", 0);
+        assert!(panics(|| g.clear_staged()));
+        g.cancel(id);
+        g.clear_staged();
     }
 }
