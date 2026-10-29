@@ -47,7 +47,7 @@ exit address = the owner's Zodl (formerly Zashi) unified address (Sapling + Orch
    `42a02880183611ef3154e1dfe3eb720e4b0965f6f364523633d6c8bdfee4b1ba`, into the shielded pool.
 7. **Agent retire** returned its gas to the owner (0.309 NEAR).
 
-## Shared contract build (29 Oct 2026, not uploaded yet)
+## Shared contract build (29 Oct 2026)
 
 After the per-user vaults were retired, the agent serves the shared contract `contracts/guardian`:
 pinned account `lp.kinuonnear.near` running code `Gm53qinU…` (else noop), input
@@ -55,4 +55,16 @@ pinned account `lp.kinuonnear.near` running code `Gm53qinU…` (else noop), inpu
 `exit(user)` (only by the user's exit rule) and `poke(user)`; it never opens a position and never
 moves funds out. Bunker / 1Click removed (manifest allows only api.geckoterminal.com). Cost guard
 uses 0.006 NEAR per move (48.8 TGas measured on DCL 2.4.0). `retire` returns gas to `kinuonnear.near`.
-Local build sha256 `d411bd89…ad28`. It must be rebuilt if the contract hash changes.
+Build sha256 `d411bd89…ad28` (518,727 B), uploaded by the caller `agent.kinuonnear.near` to
+`https://main.fastfs.io/agent.kinuonnear.near/outlayer.near/<sha256>.wasm`. Pubkey run
+`DDSCB52jA6tv8PEkxdMftKyfEXRBaVpcWWTMHQmaYB5y` (≈0.002 NEAR): agent account
+`feb959d818bae114c9bafa0e13aa279ed75695ac98941a40be10b952c058b6ba`
+(`ed25519:J9LUsavSPs22MqEBeaNyJC2VDLiyx9tZPPiUZF5uaDah`). It must be rebuilt if the contract hash changes.
+
+Mainnet cycle on `lp.kinuonnear.near`, 29 Oct 2026 (test user `cbe69e77…ccfc54`, 1 NEAR, USDC/NEAR 0.01%):
+user join → one wNEAR deposit opened lpt `#23895` (398410..399364) → agent tick **Poke**, tx
+`ABzHKj4auevM3ziPhwkmBuRBePXpHdYaek9SwugSMAMz` (`point_noted`) → user set `exit_on_rise` → agent tick
+**Exit** by the user's rule, tx `J4YwcBcdzgope46MxwjrrndWZyg6VBKZuv6zN8WjXtTG` (`exit_started` by agent,
+`position_closed`, 1 NEAR on the user's ledger) → next tick `Noop("no open position")` → user `cash_out`
+returned 1.01 NEAR; contract Rhea balance `{}`. The first tick failed `NotEnoughBalance`: the agent
+attaches 300 TGas, so its account must keep more than ~0.31 NEAR free (0.5 NEAR now).
