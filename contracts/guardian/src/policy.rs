@@ -56,6 +56,32 @@ pub enum Refusal {
     RateLimited,
     BadPolicy,
     NotOutOfRange,
+    NoRecentPrice,
+    NotConfirmed,
+}
+
+/// v1.3: an agent action needs a price the contract read itself (`poke`) at least this long before
+/// (so one block's pushed price is not enough) ...
+pub const SEEN_MIN_AGE_SECS: u64 = 180;
+/// ... and not older than this (so the confirmation is still about the same market).
+pub const SEEN_MAX_AGE_SECS: u64 = 3_600;
+
+/// Checks the age of the earlier price an agent action leans on.
+pub fn check_seen_age(seen_at_secs: Option<u64>, now_secs: u64) -> Result<(), Refusal> {
+    match seen_at_secs {
+        Some(at) if now_secs >= at.saturating_add(SEEN_MIN_AGE_SECS) && now_secs <= at.saturating_add(SEEN_MAX_AGE_SECS) => Ok(()),
+        _ => Err(Refusal::NoRecentPrice),
+    }
+}
+
+/// How far (points) the price at `point` sits against the user from the best point recorded: below
+/// the high, or above the low with `exit_on_rise`.
+pub fn moved_against(policy: &Policy, high_point: Option<i32>, low_point: Option<i32>, point: i32) -> i64 {
+    if policy.exit_on_rise {
+        i64::from(point) - i64::from(low_point.unwrap_or(point).min(point))
+    } else {
+        i64::from(high_point.unwrap_or(point).max(point)) - i64::from(point)
+    }
 }
 
 impl Refusal {
@@ -71,6 +97,8 @@ impl Refusal {
             Self::RateLimited => "Too many agent actions in this window",
             Self::BadPolicy => "Policy is inconsistent",
             Self::NotOutOfRange => "Price is not far enough outside the open range for a rebalance",
+            Self::NoRecentPrice => "The agent needs a price the contract read 3 to 60 minutes earlier (poke first)",
+            Self::NotConfirmed => "The rule was not met at the earlier price: one moment's price is not enough",
         }
     }
 }
@@ -226,6 +254,28 @@ mod tests {
         .unwrap();
         assert!(!p.exit_on_rise);
         assert_eq!(p.rebalance_buffer_points, 0);
+    }
+
+    #[test]
+    fn an_earlier_price_must_be_3_to_60_minutes_old() {
+        assert_eq!(check_seen_age(None, 10_000), Err(Refusal::NoRecentPrice));
+        assert_eq!(check_seen_age(Some(10_000), 10_000), Err(Refusal::NoRecentPrice), "same moment");
+        assert_eq!(check_seen_age(Some(10_000), 10_000 + SEEN_MIN_AGE_SECS - 1), Err(Refusal::NoRecentPrice));
+        assert_eq!(check_seen_age(Some(10_000), 10_000 + SEEN_MIN_AGE_SECS), Ok(()));
+        assert_eq!(check_seen_age(Some(10_000), 10_000 + SEEN_MAX_AGE_SECS), Ok(()));
+        assert_eq!(check_seen_age(Some(10_000), 10_000 + SEEN_MAX_AGE_SECS + 1), Err(Refusal::NoRecentPrice), "too old");
+    }
+
+    #[test]
+    fn moved_against_counts_from_the_best_point() {
+        let mut p = policy();
+        // Fell 3_000 points from a high of 1_000.
+        assert_eq!(moved_against(&p, Some(1_000), Some(-5_000), -2_000), 3_000);
+        // Above the high: nothing against the user.
+        assert_eq!(moved_against(&p, Some(1_000), None, 1_500), 0);
+        p.exit_on_rise = true;
+        assert_eq!(moved_against(&p, Some(1_000), Some(-500), 2_500), 3_000);
+        assert_eq!(moved_against(&p, None, None, 7), 0);
     }
 
     #[test]

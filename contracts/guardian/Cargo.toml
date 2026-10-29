@@ -9,6 +9,10 @@ license = "MIT"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Sandbox tests only: a 10-minute admin delay instead of 48 hours (never deployed; get_config shows it).
+short-delay = []
+
 [dependencies]
 near-sdk = { workspace = true }
 

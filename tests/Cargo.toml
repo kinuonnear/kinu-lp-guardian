@@ -17,3 +17,9 @@ sha2 = "0.10"
 tokio = { version = "1.12.0", features = ["full"] }
 testresult = "0.4.1"
 reqwest = { version = "0.12", features = ["json"] }
+# agent_key.rs: the agent's own transaction encoding, signed like the TEE signs it.
+kinu-guardian-agent = { path = "../agent" }
+ed25519-dalek = "2"
+borsh = "1"
+bs58 = "0.5"
+hex = "0.4"

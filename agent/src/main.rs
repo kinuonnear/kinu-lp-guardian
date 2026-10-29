@@ -133,6 +133,13 @@ mod run_impl {
         if req["cmd"] == "pubkey" {
             return Ok(json!({ "ok": true, "agent_account": me, "public_key": near_public_key(&pk) }));
         }
+        if req["cmd"] == "restrict_key" {
+            // Turns this agent's full-access key into a function-call key for the Guardian contract
+            // only (poke, request_rebalance, exit). Run once, when the build is final: afterwards
+            // `retire` cannot move NEAR any more, so the account keeps its small gas balance.
+            let tx = send_actions(&me, &pk, &me, restrict_key_actions(pk, GUARDIAN))?;
+            return Ok(json!({ "ok": true, "agent": me, "action": "restrict_key", "receiver": GUARDIAN, "methods": AGENT_METHODS, "tx": tx }));
+        }
         if req["cmd"] == "retire" {
             // Hands the agent's gas back to KINU (a constant of this build, never from the input),
             // for a build that is being replaced.
@@ -194,7 +201,15 @@ mod run_impl {
                 p
             }
         };
-        let action = decide(&World { me, account: &account, pool: &pool });
+        // Contract v1.3: an action needs the rule already met at the price the contract read at the
+        // last poke, 3–60 minutes ago (the chain's own clock, not the TEE's).
+        let seen: Option<SeenView> = serde_json::from_value(view(GUARDIAN, "get_seen", json!({ "user": user }))?).unwrap_or(None);
+        let (blk, err) = rpc::block("final");
+        if !err.is_empty() {
+            return Err(format!("block: {err}"));
+        }
+        let now_secs = rpc_result(&blk)?["header"]["timestamp"].as_u64().ok_or("no block time")? / 1_000_000_000;
+        let action = decide_confirmed(&World { me, account: &account, pool: &pool }, seen.as_ref(), now_secs);
         // Cost guard: move a position only when a day of fees in the new range pays for the gas.
         // If the market data is unreachable the move goes ahead (a stuck position earns nothing).
         let mut guard = Value::Null;

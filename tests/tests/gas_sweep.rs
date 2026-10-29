@@ -131,7 +131,8 @@ async fn gas_sweep_and_recovery() -> testresult::TestResult<()> {
 
     // Two Guardians: v1.0 as first deployed on mainnet, and the current code (v1.1 gas floors and on).
     for (g, code) in [("g10.sandbox", fixture("shared-v1.0.wasm")), ("g11.sandbox", built("kinu_guardian_shared"))] {
-        deploy(g, code, json!({ "dcl": "dcl.sandbox", "wnear": WRAP })).await;
+        // v1.3 takes an owner; older versions ignore the extra field.
+        deploy(g, code, json!({ "dcl": "dcl.sandbox", "wnear": WRAP, "owner": "owner.sandbox" })).await;
         assert_eq!(t.call("owner.sandbox", g, "register_dcl", json!({}), NearToken::from_near(2), 50).await, "ok");
         for tok in [TKQ, WRAP] {
             assert_eq!(t.call("owner.sandbox", g, "register_token", json!({ "token": tok }), NearToken::from_millinear(125), 30).await, "ok");

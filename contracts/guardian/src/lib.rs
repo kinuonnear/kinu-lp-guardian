@@ -20,19 +20,27 @@
 //!   · every user is listed on-chain (`get_users`, v1.2), so the agent's scheduler finds them all
 //!     without an indexer;
 //!   · nobody else touches a user's ledger. Anyone may pay the contract's Rhea / token storage.
-//!     During beta the contract account keeps its own key (KINU): it can upgrade the code, and
-//!     `recover_position` / `recover_credit` let it put a stranded position or leftover onto a
-//!     user's record (public events).
+//!
+//! v1.3 (hackathon, Nov 2026):
+//!   · no key holds the users' funds: every admin power (a code upgrade, recovering a stranded
+//!     position or leftover, a new owner) is proposed by the owner (a Sputnik DAO), published as an
+//!     event, and can run only after ADMIN_DELAY_SECS; anyone may run it then. Users see it coming
+//!     and can cash out first. The contract account's own key is deleted once v1.3 is deployed.
+//!   · new code is staged first (anyone, paying its storage); the owner proposes its sha256, so the
+//!     hash a user checks against the public build is the code that runs.
+//!   · the agent cannot act on one moment's price: a re-centre or an exit needs the rule already met
+//!     at a price this contract read itself (`poke`) 3 to 60 minutes earlier, so a price pushed by a
+//!     large swap for one block is not enough.
 
 mod policy;
 
 use near_sdk::json_types::U128;
 use near_sdk::serde::{Deserialize, Serialize};
 use near_sdk::serde_json::{Value, json};
-use near_sdk::store::{IterableSet, LookupMap};
+use near_sdk::store::{IterableMap, IterableSet, LookupMap};
 use near_sdk::{AccountId, BorshStorageKey, Gas, GasWeight, NearToken, PanicOnDefault, Promise, PromiseError, PromiseOrValue, env, near};
 use std::collections::HashMap;
-pub use policy::{Policy, RateWindow, RebalanceRequest, Refusal, check_out_of_range, check_rebalance};
+pub use policy::{Policy, RateWindow, RebalanceRequest, Refusal, SEEN_MAX_AGE_SECS, SEEN_MIN_AGE_SECS, check_out_of_range, check_rebalance, check_seen_age, moved_against};
 
 // Gas (v1.1). Every callback that follows a step on Rhea gets a static floor that pays for the WHOLE
 // rest of its chain (built below from the end of each chain back to its start), so a transaction
@@ -75,7 +83,19 @@ const CB_LIQ_CASH: u64 = T_REMOVE + CB_CASH_CLOSED + T_OWN;
 const fn tg(t: u64) -> Gas {
     Gas::from_tgas(t)
 }
-pub const VERSION: &str = "1.2.0";
+pub const VERSION: &str = "1.3.0";
+/// How long an admin action waits after it is proposed (v1.3): long enough for every user to see
+/// the event and cash out.
+#[cfg(not(feature = "short-delay"))]
+pub const ADMIN_DELAY_SECS: u64 = 48 * 3_600;
+/// The sandbox test build only (feature short-delay): skipping 48 hours of blocks takes the sandbox
+/// over an hour. Everything else is the same code; this build is never deployed.
+#[cfg(feature = "short-delay")]
+pub const ADMIN_DELAY_SECS: u64 = 600;
+/// Raw storage key of staged code (kept out of the state struct so normal calls never load it).
+const STAGED_CODE: &[u8] = b"staged_code";
+/// Gas for the new code's `migrate`, run in the same receipt as its deploy.
+const T_MIGRATE: u64 = 50;
 const ZERO: NearToken = NearToken::from_yoctonear(0);
 const ONE_YOCTO: NearToken = NearToken::from_yoctonear(1);
 /// A user's record; returned by `leave`.
@@ -140,11 +160,55 @@ pub struct OpenMsg {
     pub right_point: i32,
 }
 
+/// A price this contract read itself for a user's pool (v1.3): what the agent's next action is
+/// checked against.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Seen {
+    pub point: i32,
+    pub at_secs: u64,
+}
+
+/// What the owner can do, each only after ADMIN_DELAY_SECS (v1.3).
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq)]
+pub enum AdminAction {
+    /// Deploy the staged code; `code_hash` is its sha256, base58 (as `near` CLI and explorers show).
+    Upgrade { code_hash: String },
+    /// Put a position this contract owns on Rhea onto a user's record (e.g. a chain that ran out of
+    /// gas between the add and the record).
+    RecoverPosition { user: AccountId, lpt_id: String },
+    /// Credit a user with tokens on this contract's Rhea balance that no record holds.
+    RecoverCredit { user: AccountId, token: AccountId, amount: U128 },
+    /// Hand the owner role to another account (e.g. a new DAO).
+    SetOwner { owner: AccountId },
+}
+
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pending {
+    pub action: AdminAction,
+    pub proposed_at_secs: u64,
+    pub ready_at_secs: u64,
+}
+
+/// Code waiting to be proposed and deployed: who staged it pays its storage and gets that back.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Staged {
+    pub code_hash: String,
+    pub bytes: u64,
+    pub by: AccountId,
+    pub deposit: NearToken,
+}
+
 #[derive(BorshStorageKey)]
 #[near]
 enum Key {
     Accounts,
     Users,
+    Pending,
+    Seen,
 }
 
 #[near(contract_state)]
@@ -159,15 +223,27 @@ pub struct Guardian {
     busy_until: u64,
     /// Every account with a record (v1.2): joins add, leaving removes.
     users: IterableSet<AccountId>,
+    /// v1.3: proposes admin actions (a Sputnik DAO); it cannot run them before the delay.
+    owner: AccountId,
+    pending: IterableMap<u32, Pending>,
+    next_pending: u32,
+    staged: Option<Staged>,
+    /// v1.3: the last price `poke` read for each user's pool.
+    seen: LookupMap<AccountId, Seen>,
+    /// v1.3: emergency pause by the owner, at once (no delay): no joins, deposits, new ranges or agent
+    /// re-centres. Every way out stays open: exit (the user's, or the agent's by the user's rule),
+    /// withdraw, cash_out, claim, leave.
+    paused: bool,
 }
 
-/// The state as v1.1 stored it, read once by `migrate`.
+/// The state as v1.2 stored it, read once by `migrate`.
 #[near(serializers = [borsh])]
-struct GuardianV11 {
+struct GuardianV12 {
     dcl: AccountId,
     wnear: AccountId,
     accounts: LookupMap<AccountId, Account>,
     busy_until: u64,
+    users: IterableSet<AccountId>,
 }
 
 fn refuse(r: Refusal) -> ! {
@@ -312,30 +388,155 @@ impl Account {
 #[near]
 impl Guardian {
     #[init]
-    pub fn new(dcl: AccountId, wnear: AccountId) -> Self {
-        Self { dcl, wnear, accounts: LookupMap::new(Key::Accounts), busy_until: 0, users: IterableSet::new(Key::Users) }
+    pub fn new(dcl: AccountId, wnear: AccountId, owner: AccountId) -> Self {
+        Self {
+            dcl,
+            wnear,
+            accounts: LookupMap::new(Key::Accounts),
+            busy_until: 0,
+            users: IterableSet::new(Key::Users),
+            owner,
+            pending: IterableMap::new(Key::Pending),
+            next_pending: 0,
+            staged: None,
+            seen: LookupMap::new(Key::Seen),
+            paused: false,
+        }
     }
 
-    /// v1.1 → v1.2: the same records, plus an empty user list (fill it with `index_users`). Called
-    /// in the deploy transaction of the new code, by the contract account itself.
+    /// Runs in the same receipt as a deploy of this code (if it panics, the deploy is undone too).
+    /// From v1.2: the same records, plus the owner, an empty admin queue and no prices seen yet; run
+    /// by the contract account (the last time its own key is used; it is deleted right after).
+    /// From v1.3 (a redeploy through `execute`): the state as it is. Private either way.
     #[private]
     #[init(ignore_state)]
-    pub fn migrate() -> Self {
-        let old: GuardianV11 = env::state_read().unwrap_or_else(|| env::panic_str("No v1.1 state to migrate"));
-        Self { dcl: old.dcl, wnear: old.wnear, accounts: old.accounts, busy_until: old.busy_until, users: IterableSet::new(Key::Users) }
+    pub fn migrate(owner: AccountId) -> Self {
+        let raw = env::storage_read(b"STATE").unwrap_or_else(|| env::panic_str("No state to migrate"));
+        if let Ok(current) = near_sdk::borsh::from_slice::<Guardian>(&raw) {
+            return current;
+        }
+        let old: GuardianV12 = near_sdk::borsh::from_slice(&raw).unwrap_or_else(|_| env::panic_str("State is neither v1.2 nor v1.3"));
+        Self {
+            dcl: old.dcl,
+            wnear: old.wnear,
+            accounts: old.accounts,
+            busy_until: old.busy_until,
+            users: old.users,
+            owner,
+            pending: IterableMap::new(Key::Pending),
+            next_pending: 0,
+            staged: None,
+            seen: LookupMap::new(Key::Seen),
+            paused: false,
+        }
     }
 
-    /// Lists accounts that have a record but are not listed yet (records made before v1.2). Only
-    /// the contract account itself; names without a record are skipped. Returns how many it added.
-    pub fn index_users(&mut self, users: Vec<AccountId>) -> u32 {
-        self.assert_self();
-        let mut added = 0;
-        for u in users {
-            if self.accounts.contains_key(&u) && self.users.insert(u) {
-                added += 1;
+    // ---------- admin: proposed by the owner, run by anyone after the delay ----------
+
+    /// Stages new code (the raw wasm is this call's whole input, not JSON). Anyone may stage; the
+    /// attached NEAR pays the code's storage and is returned when it is deployed or replaced. Code
+    /// that a pending upgrade names cannot be replaced.
+    #[payable]
+    pub fn stage_code(&mut self) {
+        let code = env::input().unwrap_or_else(|| env::panic_str("Send the wasm as the call's input"));
+        if code.len() < 1_000 {
+            env::panic_str("That is not a contract");
+        }
+        if let Some(old) = &self.staged {
+            if self.pending.values().any(|p| p.action == AdminAction::Upgrade { code_hash: old.code_hash.clone() }) {
+                env::panic_str("The staged code has a pending upgrade; cancel it first");
             }
         }
-        added
+        let before = env::storage_usage();
+        let previous = self.staged.take();
+        env::storage_remove(STAGED_CODE);
+        env::storage_write(STAGED_CODE, &code);
+        let code_hash = near_sdk::bs58::encode(env::sha256(&code)).into_string();
+        let staged = Staged { code_hash: code_hash.clone(), bytes: code.len() as u64, by: env::predecessor_account_id(), deposit: env::attached_deposit() };
+        self.staged = Some(staged);
+        // What the new code adds to storage, measured after the state above is written back.
+        let added = u128::from(env::storage_usage().saturating_sub(before)) + 200;
+        if env::attached_deposit().as_yoctonear() < added * env::storage_byte_cost().as_yoctonear() {
+            env::panic_str("Attach enough NEAR for the code's storage (about 1 NEAR per 100 kB)");
+        }
+        if let Some(p) = previous {
+            Promise::new(p.by).transfer(p.deposit).detach();
+        }
+        emit("code_staged", json!({ "code_hash": code_hash, "bytes": code.len(), "by": env::predecessor_account_id() }));
+    }
+
+    /// The owner proposes an admin action. It becomes runnable ADMIN_DELAY_SECS later.
+    pub fn propose(&mut self, action: AdminAction) -> u32 {
+        self.assert_owner();
+        if let AdminAction::Upgrade { code_hash } = &action {
+            if self.staged.as_ref().map(|s| &s.code_hash) != Some(code_hash) {
+                env::panic_str("Stage that code first: its hash must match the staged code");
+            }
+        }
+        let id = self.next_pending;
+        self.next_pending += 1;
+        let now = now_secs();
+        let pending = Pending { action: action.clone(), proposed_at_secs: now, ready_at_secs: now + ADMIN_DELAY_SECS };
+        self.pending.insert(id, pending.clone());
+        emit("admin_proposed", json!({ "id": id, "action": action, "ready_at_secs": pending.ready_at_secs }));
+        id
+    }
+
+    /// The owner withdraws a proposal before it runs.
+    pub fn cancel(&mut self, id: u32) {
+        self.assert_owner();
+        let p = self.pending.remove(&id).unwrap_or_else(|| env::panic_str("No such proposal"));
+        emit("admin_cancelled", json!({ "id": id, "action": p.action }));
+    }
+
+    /// Anyone runs a proposal whose delay has passed.
+    pub fn execute(&mut self, id: u32) -> PromiseOrValue<bool> {
+        let p = self.pending.get(&id).cloned().unwrap_or_else(|| env::panic_str("No such proposal"));
+        if now_secs() < p.ready_at_secs {
+            env::panic_str("Too early: the delay has not passed");
+        }
+        self.pending.remove(&id);
+        emit("admin_executed", json!({ "id": id, "action": p.action }));
+        match p.action {
+            AdminAction::Upgrade { code_hash } => {
+                let staged = self.staged.take().unwrap_or_else(|| env::panic_str("No staged code"));
+                if staged.code_hash != code_hash {
+                    env::panic_str("The staged code is not the proposed one");
+                }
+                let code = env::storage_read(STAGED_CODE).unwrap_or_else(|| env::panic_str("No staged code"));
+                env::storage_remove(STAGED_CODE);
+                Promise::new(staged.by).transfer(staged.deposit).detach();
+                // The new code's `migrate` takes the owner, so a version that drops or renames it
+                // must say so in its own migrate.
+                PromiseOrValue::Promise(
+                    Promise::new(env::current_account_id())
+                        .deploy_contract(code)
+                        .function_call("migrate".to_string(), json!({ "owner": self.owner }).to_string().into_bytes(), ZERO, tg(T_MIGRATE)),
+                )
+            }
+            AdminAction::RecoverPosition { user, lpt_id } => {
+                if self.account(&user).position.is_some() {
+                    env::panic_str("The user already has a position");
+                }
+                PromiseOrValue::Promise(view(&self.dcl, "get_liquidity", json!({ "lpt_id": lpt_id })).then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_OWN)).on_recover_checked(user, lpt_id)))
+            }
+            AdminAction::RecoverCredit { user, token, amount } => {
+                let mut acct = self.account(&user);
+                let (x, y) = acct.pool_tokens();
+                if token != x && token != y {
+                    env::panic_str("This token is not in the user's pool");
+                }
+                acct.credit(&token, amount.0);
+                self.accounts.insert(user.clone(), acct);
+                emit("recovered_credit", json!({ "user": user, "token": token, "amount": amount }));
+                PromiseOrValue::Value(true)
+            }
+            AdminAction::SetOwner { owner } => {
+                emit("owner_changed", json!({ "from": self.owner, "to": owner }));
+                self.owner = owner;
+                PromiseOrValue::Value(true)
+            }
+        }
     }
 
     // ---------- storage anyone may pay (the contract's own Rhea and token registrations) ----------
@@ -357,6 +558,7 @@ impl Guardian {
     /// Joins with a policy (one Rhea pool). JOIN_DEPOSIT pays the record; `leave` returns it.
     #[payable]
     pub fn join(&mut self, policy: Policy, agent: Option<AccountId>) {
+        self.assert_running();
         let user = env::predecessor_account_id();
         if self.accounts.contains_key(&user) {
             env::panic_str("Already joined: use set_policy");
@@ -386,6 +588,7 @@ impl Guardian {
         self.assert_free();
         self.accounts.remove(&user);
         self.users.remove(&user);
+        self.seen.remove(&user);
         emit("left", json!({ "user": user }));
         Promise::new(user).transfer(JOIN_DEPOSIT)
     }
@@ -439,6 +642,11 @@ impl Guardian {
                 env::panic_str("You have a position: deposit without a range, then move it with open");
             }
         }
+        // Paused: the whole transfer goes back to the sender at once.
+        if self.paused {
+            emit("paused_refund", json!({ "user": sender_id, "token": token, "amount": amount }));
+            return PromiseOrValue::Value(amount);
+        }
         if self.is_busy() {
             emit("busy", json!({ "user": sender_id, "token": token, "amount": amount }));
             return PromiseOrValue::Value(amount);
@@ -473,6 +681,7 @@ impl Guardian {
 
     /// The user places (or moves) their position: any range in their pool.
     pub fn open(&mut self, left_point: i32, right_point: i32) -> Promise {
+        self.assert_running();
         let user = env::predecessor_account_id();
         let pool_id = self.account(&user).pool_id().to_string();
         if left_point >= right_point {
@@ -485,6 +694,7 @@ impl Guardian {
 
     /// The user's agent asks for a new range; checked against the user's policy on-chain.
     pub fn request_rebalance(&mut self, user: AccountId, request: RebalanceRequest) -> Promise {
+        self.assert_running();
         let mut acct = self.account(&user);
         if acct.frozen {
             refuse(Refusal::Frozen);
@@ -539,7 +749,8 @@ impl Guardian {
         }
         acct.note_point(pool.current_point);
         emit("point_noted", json!({ "user": user, "current_point": pool.current_point, "high_point": acct.high_point, "low_point": acct.low_point }));
-        self.accounts.insert(user, acct);
+        self.accounts.insert(user.clone(), acct);
+        self.seen.insert(user, Seen { point: pool.current_point, at_secs: now_secs() });
         true
     }
 
@@ -566,6 +777,20 @@ impl Guardian {
                     return self.bail(&user, r.message());
                 }
             }
+            // v1.3: the same checks must already have passed at a price read 3–60 minutes earlier,
+            // so one block's pushed price cannot move the user.
+            let seen = self.seen.get(&user).cloned();
+            if let Err(r) = check_seen_age(seen.as_ref().map(|s| s.at_secs), now_secs()) {
+                return self.bail(&user, r.message());
+            }
+            let then = seen.map(|s| s.point).unwrap_or(pool.current_point);
+            let confirmed = check_rebalance(&acct.policy, &request, then).is_ok()
+                && acct.position.as_ref().is_none_or(|open| check_out_of_range(&acct.policy, open.left_point, open.right_point, then).is_ok());
+            if !confirmed {
+                return self.bail(&user, Refusal::NotConfirmed.message());
+            }
+            // A fresh read is needed before the next action.
+            self.seen.remove(&user);
         }
         acct.note_point(pool.current_point);
         self.accounts.insert(user.clone(), acct.clone());
@@ -708,13 +933,20 @@ impl Guardian {
         let Ok(Some(pool)) = pool else { return self.bail(&user, "Could not read the pool from Rhea DCL") };
         let acct = self.account(&user);
         let cur = pool.current_point;
-        let moved = if acct.policy.exit_on_rise {
-            i64::from(cur) - i64::from(acct.low_point.unwrap_or(cur).min(cur))
-        } else {
-            i64::from(acct.high_point.unwrap_or(cur).max(cur)) - i64::from(cur)
-        };
-        if !by_user && moved < i64::from(acct.policy.exit_drop_points) {
-            return self.bail(&user, "Exit rule not met: the price has not moved far enough against the user");
+        if !by_user {
+            if moved_against(&acct.policy, acct.high_point, acct.low_point, cur) < i64::from(acct.policy.exit_drop_points) {
+                return self.bail(&user, "Exit rule not met: the price has not moved far enough against the user");
+            }
+            // v1.3: the rule must already have been met at a price read 3–60 minutes earlier.
+            let seen = self.seen.get(&user).cloned();
+            if let Err(r) = check_seen_age(seen.as_ref().map(|s| s.at_secs), now_secs()) {
+                return self.bail(&user, r.message());
+            }
+            let then = seen.map(|s| s.point).unwrap_or(cur);
+            if moved_against(&acct.policy, acct.high_point, acct.low_point, then) < i64::from(acct.policy.exit_drop_points) {
+                return self.bail(&user, Refusal::NotConfirmed.message());
+            }
+            self.seen.remove(&user);
         }
         let Some(pos) = acct.position else { return self.bail(&user, "No open position") };
         emit("exit_started", json!({ "user": user, "by": if by_user { "user" } else { "agent" }, "lpt_id": pos.lpt_id, "current_point": cur }));
@@ -892,19 +1124,10 @@ impl Guardian {
         self.pay_next(user, leave)
     }
 
-    // ---------- recovery: only the contract account itself (its key is KINU's during beta) ----------
+    // ---------- recovery: an admin action (owner proposes, delay, anyone runs) ----------
 
-    /// Puts a position this contract owns on Rhea onto a user's record, e.g. after a chain ran out of
-    /// gas between the add and the record (v1.0). Rhea says who owns it and where it sits; it must be
-    /// this contract's, in the user's pool, and the user must have no position. A public event.
-    pub fn recover_position(&mut self, user: AccountId, lpt_id: String) -> Promise {
-        self.assert_self();
-        if self.account(&user).position.is_some() {
-            env::panic_str("The user already has a position");
-        }
-        view(&self.dcl, "get_liquidity", json!({ "lpt_id": lpt_id })).then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_OWN)).on_recover_checked(user, lpt_id))
-    }
-
+    /// The end of `AdminAction::RecoverPosition`: Rhea says who owns the position and where it sits;
+    /// it must be this contract's, in the user's pool, and the user must have no position.
     #[private]
     pub fn on_recover_checked(&mut self, user: AccountId, lpt_id: String, #[callback_result] found: Result<Option<RheaPosition>, PromiseError>) -> bool {
         let Ok(Some(l)) = found else {
@@ -922,23 +1145,25 @@ impl Guardian {
         true
     }
 
-    /// Credits a user with tokens on this contract's Rhea balance that no record holds (an add's
-    /// leftover a chain could not measure). Only the contract account itself; a public event.
-    pub fn recover_credit(&mut self, user: AccountId, token: AccountId, amount: U128) {
-        self.assert_self();
-        let mut acct = self.account(&user);
-        let (x, y) = acct.pool_tokens();
-        if token != x && token != y {
-            env::panic_str("This token is not in the user's pool");
+    /// Emergency pause: the owner stops new risk at once (see `paused`); resuming is at once too.
+    /// It only takes powers away and never moves funds, so it needs no delay.
+    pub fn set_paused(&mut self, paused: bool) {
+        self.assert_owner();
+        if self.paused != paused {
+            self.paused = paused;
+            emit(if paused { "paused" } else { "resumed" }, json!({ "by": env::predecessor_account_id() }));
         }
-        acct.credit(&token, amount.0);
-        self.accounts.insert(user.clone(), acct);
-        emit("recovered_credit", json!({ "user": user, "token": token, "amount": amount }));
     }
 
-    fn assert_self(&self) {
-        if env::predecessor_account_id() != env::current_account_id() {
-            env::panic_str("Only the contract account itself can recover");
+    fn assert_running(&self) {
+        if self.paused {
+            env::panic_str("Guardian is paused: nothing new can start; every way out still works");
+        }
+    }
+
+    fn assert_owner(&self) {
+        if env::predecessor_account_id() != self.owner {
+            env::panic_str("Only the owner can propose, cancel or pause");
         }
     }
 
@@ -958,7 +1183,30 @@ impl Guardian {
     }
 
     pub fn get_config(&self) -> Value {
-        json!({ "version": VERSION, "dcl": self.dcl, "wnear": self.wnear, "join_deposit": JOIN_DEPOSIT, "busy": self.is_busy(), "users": self.users.len() })
+        json!({
+            "version": VERSION,
+            "dcl": self.dcl,
+            "wnear": self.wnear,
+            "join_deposit": JOIN_DEPOSIT,
+            "busy": self.is_busy(),
+            "users": self.users.len(),
+            "owner": self.owner,
+            "admin_delay_secs": ADMIN_DELAY_SECS,
+            "pending": self.pending.len(),
+            "staged": self.staged,
+            "seen_age_secs": [SEEN_MIN_AGE_SECS, SEEN_MAX_AGE_SECS],
+            "paused": self.paused
+        })
+    }
+
+    /// Admin actions waiting out (or past) their delay, by id.
+    pub fn get_pending(&self) -> Vec<(u32, Pending)> {
+        self.pending.iter().map(|(id, p)| (*id, p.clone())).collect()
+    }
+
+    /// The last price `poke` read for a user's pool.
+    pub fn get_seen(&self, user: AccountId) -> Option<Seen> {
+        self.seen.get(&user).cloned()
     }
 
     // ---------- helpers ----------
@@ -1016,6 +1264,7 @@ impl Guardian {
             if leave && acct.position.is_none() && acct.owed.is_empty() {
                 self.accounts.remove(&user);
                 self.users.remove(&user);
+                self.seen.remove(&user);
                 emit("left", json!({ "user": user }));
                 return PromiseOrValue::Promise(Promise::new(user).transfer(JOIN_DEPOSIT));
             }
@@ -1064,8 +1313,14 @@ mod tests {
     fn policy() -> Policy {
         Policy { allowed_pools: vec![POOL.into()], min_width: 1400, max_width: 5600, max_distance: 3000, max_actions: 12, window_secs: 86_400, max_slippage_bps: 100, exit_drop_points: 0, exit_on_rise: false, rebalance_buffer_points: 100 }
     }
+    fn fresh() -> Guardian {
+        Guardian::new(acc("dcl.testnet"), acc("wrap.testnet"), acc("dao.testnet"))
+    }
+    fn at(who: &str, secs: u64) {
+        testing_env!(VMContextBuilder::new().predecessor_account_id(acc(who)).current_account_id(acc("guardian.testnet")).block_timestamp(secs * 1_000_000_000).build());
+    }
     fn joined() -> Guardian {
-        let mut g = Guardian::new(acc("dcl.testnet"), acc("wrap.testnet"));
+        let mut g = fresh();
         ctx("alice.testnet", JOIN_DEPOSIT);
         g.join(policy(), Some(acc("agent.testnet")));
         g
@@ -1077,7 +1332,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Attach the join deposit")]
     fn join_needs_the_deposit() {
-        let mut g = Guardian::new(acc("dcl.testnet"), acc("wrap.testnet"));
+        let mut g = fresh();
         ctx("alice.testnet", ZERO);
         g.join(policy(), None);
     }
@@ -1085,7 +1340,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "exactly one pool")]
     fn join_needs_one_pool() {
-        let mut g = Guardian::new(acc("dcl.testnet"), acc("wrap.testnet"));
+        let mut g = fresh();
         ctx("alice.testnet", JOIN_DEPOSIT);
         let mut p = policy();
         p.allowed_pools.push("a|b|100".into());
@@ -1325,20 +1580,123 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Only the contract account itself")]
-    fn only_the_contract_itself_recovers_credit() {
+    #[should_panic(expected = "Only the owner can propose")]
+    fn only_the_owner_proposes() {
         let mut g = joined();
-        ctx("alice.testnet", ZERO);
-        g.recover_credit(acc("alice.testnet"), acc("tkq.testnet"), U128(5));
+        ctx("guardian.testnet", ZERO);
+        g.propose(AdminAction::RecoverCredit { user: acc("alice.testnet"), token: acc("tkq.testnet"), amount: U128(5) });
     }
 
     #[test]
-    fn the_contract_itself_recovers_a_position_and_credit() {
+    fn admin_actions_wait_out_the_delay_then_anyone_runs_them() {
+        let mut g = joined();
+        at("dao.testnet", 1_000);
+        let id = g.propose(AdminAction::RecoverCredit { user: acc("alice.testnet"), token: acc("tkq.testnet"), amount: U128(5) });
+        assert_eq!(g.get_pending()[0].1.ready_at_secs, 1_000 + ADMIN_DELAY_SECS);
+        // A minute before the delay: refused, for anyone, the owner included.
+        at("dao.testnet", 1_000 + ADMIN_DELAY_SECS - 60);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.execute(id))).is_err());
+        assert_eq!(held(&g, "alice.testnet", "tkq.testnet"), 0);
+        // After it: anyone.
+        at("stranger.testnet", 1_000 + ADMIN_DELAY_SECS);
+        assert!(matches!(g.execute(id), PromiseOrValue::Value(true)));
+        assert_eq!(held(&g, "alice.testnet", "tkq.testnet"), 5);
+        assert!(g.get_pending().is_empty(), "runs once");
+    }
+
+    #[test]
+    fn the_owner_can_cancel_and_hand_over() {
+        let mut g = joined();
+        at("dao.testnet", 0);
+        let id = g.propose(AdminAction::SetOwner { owner: acc("newdao.testnet") });
+        g.cancel(id);
+        assert!(g.get_pending().is_empty());
+        let id = g.propose(AdminAction::SetOwner { owner: acc("newdao.testnet") });
+        at("anyone.testnet", ADMIN_DELAY_SECS);
+        let _ = g.execute(id);
+        assert_eq!(g.get_config()["owner"], "newdao.testnet");
+    }
+
+    #[test]
+    #[should_panic(expected = "Stage that code first")]
+    fn an_upgrade_needs_the_staged_code() {
+        let mut g = joined();
+        at("dao.testnet", 0);
+        g.propose(AdminAction::Upgrade { code_hash: "11111111111111111111111111111111".into() });
+    }
+
+    fn with_position(g: &mut Guardian) {
+        let mut a = g.get_account(acc("alice.testnet")).unwrap();
+        a.position = Some(PositionRef { lpt_id: "1".into(), pool_id: POOL.into(), left_point: -1400, right_point: 1400 });
+        a.policy.exit_drop_points = 2_000;
+        a.high_point = Some(0);
+        a.low_point = Some(0);
+        g.accounts.insert(acc("alice.testnet"), a);
+    }
+    fn pool_at(p: i32) -> Result<Option<PoolView>, PromiseError> {
+        Ok(Some(PoolView { token_x: acc("tkq.testnet"), token_y: acc("wrap.testnet"), current_point: p }))
+    }
+    fn refused_why() -> String {
+        near_sdk::test_utils::get_logs().into_iter().filter(|l| l.contains("\"refused\"")).collect()
+    }
+
+    #[test]
+    fn the_agent_cannot_move_on_one_moments_price() {
+        let mut g = joined();
+        with_position(&mut g);
+        let req = RebalanceRequest { pool_id: POOL.into(), left_point: 2_000, right_point: 4_000 };
+        // No earlier price: refused.
+        at("guardian.testnet", 10_000);
+        assert!(matches!(g.on_pool_for_move(acc("alice.testnet"), req.clone(), true, pool_at(3_000)), PromiseOrValue::Value(false)));
+        assert!(refused_why().contains("3 to 60 minutes"));
+        // An earlier price only a minute old: refused.
+        g.seen.insert(acc("alice.testnet"), Seen { point: 3_000, at_secs: 9_940 });
+        at("guardian.testnet", 10_000);
+        assert!(matches!(g.on_pool_for_move(acc("alice.testnet"), req.clone(), true, pool_at(3_000)), PromiseOrValue::Value(false)));
+        // Five minutes old, but the price was still inside the range then (a one-block push now).
+        g.seen.insert(acc("alice.testnet"), Seen { point: 100, at_secs: 9_700 });
+        at("guardian.testnet", 10_000);
+        assert!(matches!(g.on_pool_for_move(acc("alice.testnet"), req.clone(), true, pool_at(3_000)), PromiseOrValue::Value(false)));
+        assert!(refused_why().contains("one moment's price"));
+        // Five minutes old and already outside then: the move goes ahead, and needs a fresh read next.
+        g.seen.insert(acc("alice.testnet"), Seen { point: 2_900, at_secs: 9_700 });
+        at("guardian.testnet", 10_000);
+        assert!(matches!(g.on_pool_for_move(acc("alice.testnet"), req, true, pool_at(3_000)), PromiseOrValue::Promise(_)));
+        assert!(g.get_seen(acc("alice.testnet")).is_none());
+    }
+
+    #[test]
+    fn the_agent_exit_needs_the_rule_met_earlier_too() {
+        let mut g = joined();
+        with_position(&mut g);
+        // Now 2_500 below the high (rule: 2_000), but 3 minutes ago only 500 below: refused.
+        g.seen.insert(acc("alice.testnet"), Seen { point: -500, at_secs: 9_800 });
+        at("guardian.testnet", 10_000);
+        assert!(matches!(g.on_pool_for_exit(acc("alice.testnet"), false, pool_at(-2_500)), PromiseOrValue::Value(false)));
+        // Already 2_100 below then: the exit goes ahead.
+        g.seen.insert(acc("alice.testnet"), Seen { point: -2_100, at_secs: 9_800 });
+        at("guardian.testnet", 10_000);
+        assert!(matches!(g.on_pool_for_exit(acc("alice.testnet"), false, pool_at(-2_500)), PromiseOrValue::Promise(_)));
+        // The user's own exit never needs it.
+        let mut g = joined();
+        with_position(&mut g);
+        at("guardian.testnet", 10_000);
+        assert!(matches!(g.on_pool_for_exit(acc("alice.testnet"), true, pool_at(0)), PromiseOrValue::Promise(_)));
+    }
+
+    #[test]
+    fn a_poke_records_the_price_for_the_agent() {
+        let mut g = joined();
+        with_position(&mut g);
+        at("guardian.testnet", 5_000);
+        assert!(g.on_poked(acc("alice.testnet"), pool_at(42)));
+        assert_eq!(g.get_seen(acc("alice.testnet")), Some(Seen { point: 42, at_secs: 5_000 }));
+    }
+
+    #[test]
+    fn a_recovered_position_must_be_this_contracts() {
         let mut g = joined();
         ctx("guardian.testnet", ZERO);
-        g.recover_credit(acc("alice.testnet"), acc("tkq.testnet"), U128(5));
-        assert_eq!(held(&g, "alice.testnet", "tkq.testnet"), 5);
-        let _ = g.recover_position(acc("alice.testnet"), "tkq.testnet|wrap.testnet|10000#9".into());
         let found = RheaPosition { owner_id: acc("guardian.testnet"), pool_id: POOL.into(), left_point: -1400, right_point: 1400 };
         assert!(g.on_recover_checked(acc("alice.testnet"), "tkq.testnet|wrap.testnet|10000#9".into(), Ok(Some(found))));
         assert_eq!(g.get_account(acc("alice.testnet")).unwrap().position.unwrap().left_point, -1400);
@@ -1361,17 +1719,6 @@ mod tests {
         ctx("bob.testnet", ZERO);
         let _ = g.cash_out(true);
         assert_eq!(g.get_user_count(), 0);
-    }
-
-    #[test]
-    fn index_users_lists_only_existing_records_and_only_by_itself() {
-        let mut g = joined();
-        ctx("guardian.testnet", ZERO);
-        g.users.remove(&acc("alice.testnet"));
-        assert_eq!(g.index_users(vec![acc("alice.testnet"), acc("nobody.testnet"), acc("alice.testnet")]), 1);
-        assert_eq!(g.get_users(None, None), vec![acc("alice.testnet")]);
-        ctx("alice.testnet", ZERO);
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.index_users(vec![]))).is_err());
     }
 
     #[test]
@@ -1399,5 +1746,51 @@ mod tests {
         assert!(g.is_busy());
         testing_env!(VMContextBuilder::new().predecessor_account_id(acc("alice.testnet")).current_account_id(acc("guardian.testnet")).block_timestamp((BUSY_SECS + 1) * 1_000_000_000).build());
         assert!(!g.is_busy());
+    }
+
+    fn panics(f: impl FnOnce()) -> bool {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err()
+    }
+
+    #[test]
+    fn only_the_owner_pauses() {
+        let mut g = joined();
+        ctx("alice.testnet", ZERO);
+        assert!(panics(|| g.set_paused(true)));
+        ctx("dao.testnet", ZERO);
+        g.set_paused(true);
+        assert_eq!(g.get_config()["paused"], true);
+    }
+
+    #[test]
+    fn a_pause_stops_new_risk_at_once_and_every_way_out_still_works() {
+        let mut g = joined();
+        with_position(&mut g);
+        ctx("guardian.testnet", ZERO);
+        g.on_forwarded(acc("alice.testnet"), acc("tkq.testnet"), U128(5), None, Ok(U128(5)));
+        ctx("dao.testnet", ZERO);
+        g.set_paused(true);
+        // Nothing new: no join, no range, no agent re-centre; a deposit comes back whole.
+        ctx("bob.testnet", JOIN_DEPOSIT);
+        assert!(panics(|| g.join(policy(), None)));
+        ctx("alice.testnet", ZERO);
+        assert!(panics(|| drop(g.open(-1400, 1400))));
+        ctx("agent.testnet", ZERO);
+        assert!(panics(|| drop(g.request_rebalance(acc("alice.testnet"), RebalanceRequest { pool_id: POOL.into(), left_point: 2_000, right_point: 4_000 }))));
+        ctx("tkq.testnet", ZERO);
+        assert!(matches!(g.ft_on_transfer(acc("alice.testnet"), U128(7), String::new()), PromiseOrValue::Value(U128(7))));
+        // Every way out: the user's exit, a withdraw, a poke for the exit rule.
+        ctx("alice.testnet", ZERO);
+        let _ = g.exit(acc("alice.testnet"));
+        g.unlock();
+        let _ = g.withdraw(acc("tkq.testnet"), None);
+        g.unlock();
+        ctx("agent.testnet", ZERO);
+        let _ = g.poke(acc("alice.testnet"));
+        // Resumed: joins work again.
+        ctx("dao.testnet", ZERO);
+        g.set_paused(false);
+        ctx("bob.testnet", JOIN_DEPOSIT);
+        g.join(policy(), None);
     }
 }

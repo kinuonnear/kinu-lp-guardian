@@ -88,6 +88,22 @@ fn ok(label: &str, r: String) {
     println!("{label:<42} {r}");
     assert!(r.starts_with("ok ("), "{label}: {r}");
 }
+
+/// The latest final block's time, seconds.
+async fn chain_secs(rpc: &str) -> u64 {
+    let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "block", "params": { "finality": "final" } });
+    let b: Value = reqwest::Client::new().post(rpc).json(&body).send().await.unwrap().json().await.unwrap();
+    b["result"]["header"]["timestamp"].as_u64().unwrap() / 1_000_000_000
+}
+
+/// Moves the sandbox clock forward by at least `secs` (blocks are skipped, not waited for).
+async fn wait_secs(sandbox: &near_sandbox::Sandbox, _t: &T, secs: u64) {
+    let start = chain_secs(&sandbox.rpc_addr).await;
+    while chain_secs(&sandbox.rpc_addr).await < start + secs {
+        sandbox.fast_forward(200).await.unwrap();
+    }
+    println!("{:<42} +{} s", "(sandbox clock)", chain_secs(&sandbox.rpc_addr).await - start);
+}
 fn fails(label: &str, r: String, with: &str) {
     println!("{label:<42} {r}");
     assert!(r.contains(with), "{label}: expected '{with}', got {r}");
@@ -132,7 +148,7 @@ async fn shared_guardian_on_real_dcl() -> testresult::TestResult<()> {
     ok("lp wide liquidity", t.call("lp.sandbox", "dcl.sandbox", "add_liquidity", json!({ "pool_id": POOL, "left_point": 284800, "right_point": 324800, "amount_x": "2000000000000", "amount_y": "20000000000000000000000000", "min_amount_x": "0", "min_amount_y": "0" }), zero).await);
 
     // The shared Guardian: KINU deploys it and pays its Rhea / token storage once.
-    deploy(G, built("kinu_guardian_shared"), json!({ "dcl": "dcl.sandbox", "wnear": WRAP })).await;
+    deploy(G, built("kinu_guardian_shared"), json!({ "dcl": "dcl.sandbox", "wnear": WRAP, "owner": "owner.sandbox" })).await;
     ok("register_dcl (KINU, once)", t.call("owner.sandbox", G, "register_dcl", json!({}), NearToken::from_millinear(500)).await);
     ok("register_token TKQ (once)", t.call("owner.sandbox", G, "register_token", json!({ "token": TKQ }), NearToken::from_millinear(125)).await);
     ok("register_token wNEAR (once)", t.call("owner.sandbox", G, "register_token", json!({ "token": WRAP }), NearToken::from_millinear(125)).await);
@@ -190,7 +206,14 @@ async fn shared_guardian_on_real_dcl() -> testresult::TestResult<()> {
     // The agent re-enters Alice one-sided just above the price; Bob's ledger and position are untouched.
     let bob_before = t.ledger("bob.sandbox").await;
     let left = (point + 20).div_euclid(200) * 200 + 200;
-    ok("agent rebalances alice", t.call("agent.sandbox", G, "request_rebalance", json!({ "user": "alice.sandbox", "request": { "pool_id": POOL, "left_point": left, "right_point": left + 1400 } }), zero).await);
+    let move_alice = json!({ "user": "alice.sandbox", "request": { "pool_id": POOL, "left_point": left, "right_point": left + 1400 } });
+    // v1.3: not on one moment's price. No earlier read: refused; read just now: refused; read more
+    // than 3 minutes ago with the price already outside then: allowed.
+    fails("agent cannot move on a price never read", t.call("agent.sandbox", G, "request_rebalance", move_alice.clone(), zero).await, "3 to 60 minutes");
+    ok("agent pokes alice (the contract reads the price)", t.call("agent.sandbox", G, "poke", json!({ "user": "alice.sandbox" }), zero).await);
+    fails("agent cannot move on a price read just now", t.call("agent.sandbox", G, "request_rebalance", move_alice.clone(), zero).await, "3 to 60 minutes");
+    wait_secs(&sandbox, &t, 200).await;
+    ok("agent rebalances alice", t.call("agent.sandbox", G, "request_rebalance", move_alice, zero).await);
     let (apos, aled) = t.ledger("alice.sandbox").await;
     println!("alice after rebalance: position {:?} ledger {:?}", apos.as_ref().map(|p| (p["left_point"].clone(), p["right_point"].clone())), aled);
     assert_eq!(apos.as_ref().map(|p| p["left_point"].as_i64().unwrap()), Some(left));
@@ -245,6 +268,9 @@ async fn shared_guardian_on_real_dcl() -> testresult::TestResult<()> {
     let mut bob_policy = policy.clone();
     bob_policy["exit_drop_points"] = json!(2000);
     ok("bob sets an exit rule", t.call("bob.sandbox", G, "set_policy", json!({ "policy": bob_policy }), zero).await);
+    fails("agent cannot exit bob on a price never read", t.call("agent.sandbox", G, "exit", json!({ "user": "bob.sandbox" }), zero).await, "3 to 60 minutes");
+    ok("agent pokes bob", t.call("agent.sandbox", G, "poke", json!({ "user": "bob.sandbox" }), zero).await);
+    wait_secs(&sandbox, &t, 200).await;
     ok("agent exits bob by his rule", t.call("agent.sandbox", G, "exit", json!({ "user": "bob.sandbox" }), zero).await);
     assert!(t.ledger("bob.sandbox").await.0.is_none(), "bob's position closed by the agent");
     fails("agent cannot re-open after an exit", t.call("agent.sandbox", G, "request_rebalance", json!({ "user": "bob.sandbox", "request": { "pool_id": POOL, "left_point": 290000, "right_point": 291400 } }), zero).await, "only the user opens one");

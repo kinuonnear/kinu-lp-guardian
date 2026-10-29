@@ -77,6 +77,57 @@ pub enum Action {
     Exit,
 }
 
+/// The price the Guardian contract read itself at the last poke (`get_seen`, contract v1.3).
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct SeenView {
+    pub point: i32,
+    pub at_secs: u64,
+}
+
+/// Contract v1.3 accepts an agent re-centre or exit only when the rule was already met at a price
+/// it read 3 to 60 minutes before (so one block's pushed price is not enough).
+pub const SEEN_MIN_AGE_SECS: u64 = 180;
+pub const SEEN_MAX_AGE_SECS: u64 = 3_600;
+
+fn moved_against(v: &AccountView, point: i32) -> i64 {
+    if v.policy.exit_on_rise {
+        i64::from(point) - i64::from(v.low_point.unwrap_or(point).min(point))
+    } else {
+        i64::from(v.high_point.unwrap_or(point).max(point)) - i64::from(point)
+    }
+}
+
+/// Whether `action` was already due at the earlier price `then`, as the contract checks it.
+fn confirmed_at(v: &AccountView, action: &Action, then: i32) -> bool {
+    match action {
+        Action::Exit => v.policy.exit_drop_points > 0 && moved_against(v, then) >= i64::from(v.policy.exit_drop_points),
+        Action::Rebalance { left_point, right_point, .. } => {
+            let Some(pos) = &v.position else { return false };
+            let t = i64::from(then);
+            let outside = if t < i64::from(pos.left_point) { i64::from(pos.left_point) - t } else if t >= i64::from(pos.right_point) { t - i64::from(pos.right_point) } else { 0 };
+            let distance = if t < i64::from(*left_point) { i64::from(*left_point) - t } else if t > i64::from(*right_point) { t - i64::from(*right_point) } else { 0 };
+            outside > 0 && outside > i64::from(v.policy.rebalance_buffer_points) && distance <= i64::from(v.policy.max_distance)
+        }
+        _ => true,
+    }
+}
+
+/// `decide`, then contract v1.3's confirmation: an action goes out only if it was due at the price the
+/// contract read 3–60 minutes ago; otherwise the agent pokes (the contract reads the price now) and
+/// acts on a later tick if the rule still holds.
+pub fn decide_confirmed(w: &World, seen: Option<&SeenView>, now_secs: u64) -> Action {
+    let action = decide(w);
+    if !matches!(action, Action::Exit | Action::Rebalance { .. }) {
+        return action;
+    }
+    let age = seen.map(|s| now_secs.saturating_sub(s.at_secs));
+    match (seen, age) {
+        (Some(s), Some(a)) if (SEEN_MIN_AGE_SECS..=SEEN_MAX_AGE_SECS).contains(&a) && confirmed_at(w.account, &action, s.point) => action,
+        (Some(_), Some(a)) if a < SEEN_MIN_AGE_SECS => Action::Noop("rule met; waiting for the confirmation window"),
+        _ => Action::Poke,
+    }
+}
+
 /// A one-sided range starts at least this many points away from the price, so a small move between
 /// reading the pool and the transaction landing cannot put the price inside it (Rhea then wants both tokens).
 pub const ONE_SIDED_MARGIN: i32 = 20;
@@ -158,6 +209,10 @@ pub struct FunctionCall {
 pub enum NearAction {
     FunctionCall(FunctionCall),
     Transfer(u128),
+    /// AddKey with a function-call permission: `receiver_id` only, these methods only, no deposit
+    /// possible, gas from the account's balance (no allowance cap, so the key never runs dry).
+    AddFunctionCallKey { public_key: [u8; 32], receiver_id: String, method_names: Vec<String> },
+    DeleteKey([u8; 32]),
 }
 
 impl BorshSerialize for NearAction {
@@ -171,8 +226,34 @@ impl BorshSerialize for NearAction {
                 3u8.serialize(w)?; // Transfer 3
                 amount.serialize(w)
             }
+            NearAction::AddFunctionCallKey { public_key, receiver_id, method_names } => {
+                5u8.serialize(w)?; // Stake 4, AddKey 5
+                PublicKey::Ed25519(*public_key).serialize(w)?;
+                0u64.serialize(w)?; // AccessKey.nonce (the chain sets its own)
+                0u8.serialize(w)?; // AccessKeyPermission::FunctionCall (FullAccess is 1)
+                Option::<u128>::None.serialize(w)?; // allowance
+                receiver_id.serialize(w)?;
+                method_names.serialize(w)
+            }
+            NearAction::DeleteKey(public_key) => {
+                6u8.serialize(w)?; // DeleteKey 6
+                PublicKey::Ed25519(*public_key).serialize(w)
+            }
         }
     }
+}
+
+/// The only methods the agent's key may call after `restrict_key`, on the Guardian contract only.
+pub const AGENT_METHODS: [&str; 3] = ["poke", "request_rebalance", "exit"];
+
+/// One transaction that turns the agent's own full-access key into a function-call key: delete it,
+/// add the same public key back limited to the Guardian contract and AGENT_METHODS. After it the key
+/// cannot send NEAR, deploy, add keys or call anything else, even if it leaked from the TEE.
+pub fn restrict_key_actions(public_key: [u8; 32], guardian: &str) -> Vec<NearAction> {
+    vec![
+        NearAction::DeleteKey(public_key),
+        NearAction::AddFunctionCallKey { public_key, receiver_id: guardian.to_string(), method_names: AGENT_METHODS.iter().map(|m| m.to_string()).collect() },
+    ]
 }
 
 #[derive(BorshSerialize)]
@@ -313,6 +394,28 @@ pub fn users_from_input(input: &serde_json::Value) -> Vec<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn restrict_key_encodes_as_near_actions() {
+        let pk = [7u8; 32];
+        let actions = restrict_key_actions(pk, "lp.kinuonnear.near");
+        let del = borsh::to_vec(&actions[0]).unwrap();
+        assert_eq!(del[0], 6, "DeleteKey");
+        assert_eq!(&del[1..], &[[0u8].as_slice(), &pk].concat()[..], "ed25519 key");
+        let add = borsh::to_vec(&actions[1]).unwrap();
+        assert_eq!(add[0], 5, "AddKey");
+        assert_eq!(add[1], 0, "ed25519");
+        assert_eq!(&add[2..34], &pk);
+        assert_eq!(&add[34..42], &[0u8; 8], "nonce");
+        assert_eq!(add[42], 0, "FunctionCall permission");
+        assert_eq!(add[43], 0, "no allowance cap");
+        // receiver (u32 length + bytes), then 3 method names.
+        assert_eq!(&add[44..48], &(18u32).to_le_bytes());
+        assert_eq!(&add[48..66], b"lp.kinuonnear.near");
+        assert_eq!(&add[66..70], &(3u32).to_le_bytes());
+        assert!(add.windows(17).any(|w| w == b"request_rebalance"));
+        assert!(!add.windows(8).any(|w| w == b"withdraw"));
+    }
+
     const ME: &str = "aa11";
     fn policy() -> Policy {
         Policy { allowed_pools: vec!["x|y|100".into()], min_width: 150, max_width: 4000, max_distance: 400, exit_drop_points: 2877, exit_on_rise: false, rebalance_buffer_points: 0 }
@@ -332,6 +435,31 @@ mod tests {
     }
     fn run(v: &AccountView, point: i32, _wallet: &[(String, u128)], _funded: bool) -> Action {
         decide(&World { me: ME, account: v, pool: &pool(point) })
+    }
+
+    fn confirmed(v: &AccountView, point: i32, seen: Option<(i32, u64)>, now: u64) -> Action {
+        let s = seen.map(|(point, at_secs)| SeenView { point, at_secs });
+        decide_confirmed(&World { me: ME, account: v, pool: &pool(point) }, s.as_ref(), now)
+    }
+
+    #[test]
+    fn acts_only_on_a_rule_already_met_minutes_earlier() {
+        // Below the range by 100: a re-centre is due now.
+        let v = vault(Some((-100, 100)), None);
+        assert!(matches!(run(&v, -200, &[], true), Action::Rebalance { .. }));
+        // Never read: poke first.
+        assert_eq!(confirmed(&v, -200, None, 10_000), Action::Poke);
+        // Read a minute ago: wait for the window.
+        assert_eq!(confirmed(&v, -200, Some((-200, 9_940)), 10_000), Action::Noop("rule met; waiting for the confirmation window"));
+        // Read 5 minutes ago while still in range (today's price may be a one-block push): read again.
+        assert_eq!(confirmed(&v, -200, Some((0, 9_700)), 10_000), Action::Poke);
+        // Read 5 minutes ago already outside: act.
+        assert!(matches!(confirmed(&v, -200, Some((-190, 9_700)), 10_000), Action::Rebalance { .. }));
+        // Read over an hour ago: read again.
+        assert_eq!(confirmed(&v, -200, Some((-200, 6_000)), 10_000), Action::Poke);
+        // Nothing due: pokes and no-ops pass through untouched.
+        assert_eq!(confirmed(&vault(Some((-100, 100)), Some(10)), 0, None, 10_000), Action::Noop("in range"));
+        assert_eq!(confirmed(&vault(Some((-100, 100)), Some(10)), 40, None, 10_000), Action::Poke, "a new high is still recorded");
     }
 
     #[test]
