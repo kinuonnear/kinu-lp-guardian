@@ -17,6 +17,8 @@
 //!   · every callback that follows a step on Rhea gets a static gas floor paying for the whole rest
 //!     of its chain: a transaction has enough gas from the start or fails before Rhea is touched
 //!     (v1.1; v1.0 once ran out after an add on mainnet and left the position off the user's record);
+//!   · every user is listed on-chain (`get_users`, v1.2), so the agent's scheduler finds them all
+//!     without an indexer;
 //!   · nobody else touches a user's ledger. Anyone may pay the contract's Rhea / token storage.
 //!     During beta the contract account keeps its own key (KINU): it can upgrade the code, and
 //!     `recover_position` / `recover_credit` let it put a stranded position or leftover onto a
@@ -27,7 +29,7 @@ mod policy;
 use near_sdk::json_types::U128;
 use near_sdk::serde::{Deserialize, Serialize};
 use near_sdk::serde_json::{Value, json};
-use near_sdk::store::LookupMap;
+use near_sdk::store::{IterableSet, LookupMap};
 use near_sdk::{AccountId, BorshStorageKey, Gas, GasWeight, NearToken, PanicOnDefault, Promise, PromiseError, PromiseOrValue, env, near};
 use std::collections::HashMap;
 pub use policy::{Policy, RateWindow, RebalanceRequest, Refusal, check_out_of_range, check_rebalance};
@@ -73,7 +75,7 @@ const CB_LIQ_CASH: u64 = T_REMOVE + CB_CASH_CLOSED + T_OWN;
 const fn tg(t: u64) -> Gas {
     Gas::from_tgas(t)
 }
-pub const VERSION: &str = "1.1.0";
+pub const VERSION: &str = "1.2.0";
 const ZERO: NearToken = NearToken::from_yoctonear(0);
 const ONE_YOCTO: NearToken = NearToken::from_yoctonear(1);
 /// A user's record; returned by `leave`.
@@ -142,6 +144,7 @@ pub struct OpenMsg {
 #[near]
 enum Key {
     Accounts,
+    Users,
 }
 
 #[near(contract_state)]
@@ -153,6 +156,17 @@ pub struct Guardian {
     accounts: LookupMap<AccountId, Account>,
     /// While a step that changes Rhea balances runs (seconds); others wait. Released by every end
     /// of a chain, or by time if a chain ran out of gas.
+    busy_until: u64,
+    /// Every account with a record (v1.2): joins add, leaving removes.
+    users: IterableSet<AccountId>,
+}
+
+/// The state as v1.1 stored it, read once by `migrate`.
+#[near(serializers = [borsh])]
+struct GuardianV11 {
+    dcl: AccountId,
+    wnear: AccountId,
+    accounts: LookupMap<AccountId, Account>,
     busy_until: u64,
 }
 
@@ -299,7 +313,29 @@ impl Account {
 impl Guardian {
     #[init]
     pub fn new(dcl: AccountId, wnear: AccountId) -> Self {
-        Self { dcl, wnear, accounts: LookupMap::new(Key::Accounts), busy_until: 0 }
+        Self { dcl, wnear, accounts: LookupMap::new(Key::Accounts), busy_until: 0, users: IterableSet::new(Key::Users) }
+    }
+
+    /// v1.1 → v1.2: the same records, plus an empty user list (fill it with `index_users`). Called
+    /// in the deploy transaction of the new code, by the contract account itself.
+    #[private]
+    #[init(ignore_state)]
+    pub fn migrate() -> Self {
+        let old: GuardianV11 = env::state_read().unwrap_or_else(|| env::panic_str("No v1.1 state to migrate"));
+        Self { dcl: old.dcl, wnear: old.wnear, accounts: old.accounts, busy_until: old.busy_until, users: IterableSet::new(Key::Users) }
+    }
+
+    /// Lists accounts that have a record but are not listed yet (records made before v1.2). Only
+    /// the contract account itself; names without a record are skipped. Returns how many it added.
+    pub fn index_users(&mut self, users: Vec<AccountId>) -> u32 {
+        self.assert_self();
+        let mut added = 0;
+        for u in users {
+            if self.accounts.contains_key(&u) && self.users.insert(u) {
+                added += 1;
+            }
+        }
+        added
     }
 
     // ---------- storage anyone may pay (the contract's own Rhea and token registrations) ----------
@@ -335,6 +371,7 @@ impl Guardian {
         let acct = Account { policy, agent, frozen: false, rate: RateWindow::default(), position: None, high_point: None, low_point: None, ledger: Vec::new(), owed: Vec::new() };
         acct.pool_tokens();
         self.accounts.insert(user.clone(), acct);
+        self.users.insert(user.clone());
         emit("joined", json!({ "user": user }));
     }
 
@@ -348,6 +385,7 @@ impl Guardian {
         // A step in flight could still credit this account.
         self.assert_free();
         self.accounts.remove(&user);
+        self.users.remove(&user);
         emit("left", json!({ "user": user }));
         Promise::new(user).transfer(JOIN_DEPOSIT)
     }
@@ -906,12 +944,21 @@ impl Guardian {
 
     // ---------- views ----------
 
+    /// Accounts with a record, `limit` (at most 100) from `from_index`.
+    pub fn get_users(&self, from_index: Option<u32>, limit: Option<u32>) -> Vec<AccountId> {
+        self.users.iter().skip(from_index.unwrap_or(0) as usize).take(limit.unwrap_or(100).min(100) as usize).cloned().collect()
+    }
+
+    pub fn get_user_count(&self) -> u32 {
+        self.users.len()
+    }
+
     pub fn get_account(&self, user: AccountId) -> Option<Account> {
         self.accounts.get(&user).cloned()
     }
 
     pub fn get_config(&self) -> Value {
-        json!({ "version": VERSION, "dcl": self.dcl, "wnear": self.wnear, "join_deposit": JOIN_DEPOSIT, "busy": self.is_busy() })
+        json!({ "version": VERSION, "dcl": self.dcl, "wnear": self.wnear, "join_deposit": JOIN_DEPOSIT, "busy": self.is_busy(), "users": self.users.len() })
     }
 
     // ---------- helpers ----------
@@ -968,6 +1015,7 @@ impl Guardian {
             emit("cash_out_done", json!({ "user": user }));
             if leave && acct.position.is_none() && acct.owed.is_empty() {
                 self.accounts.remove(&user);
+                self.users.remove(&user);
                 emit("left", json!({ "user": user }));
                 return PromiseOrValue::Promise(Promise::new(user).transfer(JOIN_DEPOSIT));
             }
@@ -1297,6 +1345,33 @@ mod tests {
         // Someone else's position, or a second one, is refused.
         let theirs = RheaPosition { owner_id: acc("bob.testnet"), pool_id: POOL.into(), left_point: 0, right_point: 1400 };
         assert!(!g.on_recover_checked(acc("alice.testnet"), "x#1".into(), Ok(Some(theirs))));
+    }
+
+    #[test]
+    fn users_are_listed_while_they_have_a_record() {
+        let mut g = joined();
+        ctx("bob.testnet", JOIN_DEPOSIT);
+        g.join(policy(), None);
+        assert_eq!(g.get_user_count(), 2);
+        assert_eq!(g.get_users(Some(1), Some(5)), vec![acc("bob.testnet")]);
+        ctx("alice.testnet", ZERO);
+        let _ = g.leave();
+        assert_eq!(g.get_users(None, None), vec![acc("bob.testnet")]);
+        // cash_out(leave) with nothing held leaves too.
+        ctx("bob.testnet", ZERO);
+        let _ = g.cash_out(true);
+        assert_eq!(g.get_user_count(), 0);
+    }
+
+    #[test]
+    fn index_users_lists_only_existing_records_and_only_by_itself() {
+        let mut g = joined();
+        ctx("guardian.testnet", ZERO);
+        g.users.remove(&acc("alice.testnet"));
+        assert_eq!(g.index_users(vec![acc("alice.testnet"), acc("nobody.testnet"), acc("alice.testnet")]), 1);
+        assert_eq!(g.get_users(None, None), vec![acc("alice.testnet")]);
+        ctx("alice.testnet", ZERO);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.index_users(vec![]))).is_err());
     }
 
     #[test]

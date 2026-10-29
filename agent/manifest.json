@@ -3,6 +3,6 @@
   "operations": ["pubkey", "tick", "retire"],
   "capabilities": { "network": ["api.geckoterminal.com"] },
   "signing_keys": [
-    { "path": "agent", "type": "ed25519", "bind": "wasm" }
+    { "path": "agent", "type": "ed25519" }
   ]
 }

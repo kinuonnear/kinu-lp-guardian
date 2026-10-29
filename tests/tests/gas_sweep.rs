@@ -129,7 +129,7 @@ async fn gas_sweep_and_recovery() -> testresult::TestResult<()> {
     }
     assert_eq!(t.call("lp.sandbox", "dcl.sandbox", "add_liquidity", json!({ "pool_id": POOL, "left_point": 284800, "right_point": 324800, "amount_x": "2000000000000", "amount_y": "20000000000000000000000000", "min_amount_x": "0", "min_amount_y": "0" }), zero, 300).await, "ok");
 
-    // Two Guardians: v1.0 as deployed on mainnet, v1.1.
+    // Two Guardians: v1.0 as first deployed on mainnet, and the current code (v1.1 gas floors and on).
     for (g, code) in [("g10.sandbox", fixture("shared-v1.0.wasm")), ("g11.sandbox", built("kinu_guardian_shared"))] {
         deploy(g, code, json!({ "dcl": "dcl.sandbox", "wnear": WRAP })).await;
         assert_eq!(t.call("owner.sandbox", g, "register_dcl", json!({}), NearToken::from_near(2), 50).await, "ok");
@@ -185,7 +185,8 @@ async fn gas_sweep_and_recovery() -> testresult::TestResult<()> {
 
     // Recovery on v1.0 (if it stranded one, as on mainnet): upgrade in place, record, cash out.
     if let Some((user, lpt)) = stranded.first().cloned() {
-        let ok = Contract::deploy("g10.sandbox".parse()?).use_code(built("kinu_guardian_shared")).without_init_call().with_signer(signer.clone()).send_to(&net).await?.is_success();
+        // As on mainnet: v1.0 → v1.1 (same state layout, no migration).
+        let ok = Contract::deploy("g10.sandbox".parse()?).use_code(fixture("shared-v1.1.wasm")).without_init_call().with_signer(signer.clone()).send_to(&net).await?.is_success();
         assert!(ok, "upgrade in place");
         assert_eq!(t.view("g10.sandbox", "get_config", json!({})).await["version"], "1.1.0");
         let users_a: Vec<String> = steps_a.iter().map(|p| format!("a{p}.sandbox")).collect();

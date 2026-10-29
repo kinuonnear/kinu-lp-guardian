@@ -1,9 +1,10 @@
 //! OutLayer entry point. Input (stdin JSON, untrusted): {"cmd":"pubkey"}, {"cmd":"tick","users":[..]}
 //! or {"cmd":"retire"}. Output (stdout, at most 900 bytes): what the agent read, decided and sent.
 //!
-//! The agent's NEAR account is the implicit account of its TEE key `agent` (manifest: bind "wasm"):
-//! the keystore derives it from this exact build and the caller, the module never sees it, and a new
-//! build has a new key that users must name as their agent again.
+//! The agent's NEAR account is the implicit account of its TEE key `agent`, bound to the OutLayer
+//! project `agent.kinuonnear.near/kinu-guardian` and its caller (the payment key's owner over HTTPS,
+//! the signer on chain): the keystore derives it, the module never sees it, and a new version of the
+//! project keeps it, so users name the agent once.
 
 #[cfg(target_arch = "wasm32")]
 mod host {
@@ -52,11 +53,10 @@ mod run_impl {
     /// The shared Guardian contract this build serves, and the code it must run (cargo-near build of
     /// contracts/guardian; scripts/codehash.py). A changed contract needs a new agent build.
     pub const GUARDIAN: &str = "lp.kinuonnear.near";
-    pub const GUARDIAN_CODE_HASH: &str = "3M8vEyfNDVxHQTNUwafhSmPsG6FfRBy5eqnHQLG1iYot";
+    pub const GUARDIAN_CODE_HASH: &str = "FHzvPc81VkWzorotfnq6ft4JGuCnjh5Z87U5uFV5GyrP";
     pub const DCL: &str = "dclv2.ref-labs.near";
     /// Where `retire` returns the agent's gas: KINU's account, which funds the agent.
     pub const RETIRE_TO: &str = "kinuonnear.near";
-    const GAS: u64 = 300_000_000_000_000;
 
     fn view(contract: &str, method: &str, args: Value) -> Result<Value, String> {
         let (res, err) = rpc::view(contract, method, &args.to_string(), "final");
@@ -80,9 +80,10 @@ mod run_impl {
         pk.try_into().map_err(|_| "public key is not 32 bytes".to_string())
     }
 
-    /// Builds, signs (in the TEE) and sends one function call from the agent's implicit account.
+    /// Builds, signs (in the TEE) and sends one function call from the agent's implicit account,
+    /// with the gas that call's whole chain needs (gas_for).
     fn send(me: &str, pk: &[u8; 32], receiver: &str, method: &str, args: String) -> Result<String, String> {
-        let call = NearAction::FunctionCall(FunctionCall { method_name: method.to_string(), args: args.into_bytes(), gas: GAS, deposit: 0 });
+        let call = NearAction::FunctionCall(FunctionCall { method_name: method.to_string(), args: args.into_bytes(), gas: gas_for(method), deposit: 0 });
         send_actions(me, pk, receiver, vec![call])
     }
 
@@ -159,9 +160,15 @@ mod run_impl {
         if runs != GUARDIAN_CODE_HASH {
             return Ok(json!({ "ok": true, "agent": me, "action": "noop", "why": "the Guardian account does not run the published code", "code_hash": runs }));
         }
-        let users = users_from_input(&req);
+        // The scheduler names the users it found something to do for; without names the agent reads
+        // the contract's own list (v1.2) and looks at the first ones.
+        let mut users = users_from_input(&req);
         if users.is_empty() {
-            return Err("no valid users in the input".into());
+            let listed = view(GUARDIAN, "get_users", json!({ "from_index": 0, "limit": MAX_USERS_PER_RUN }))?;
+            users = users_from_input(&json!({ "users": listed }));
+        }
+        if users.is_empty() {
+            return Ok(json!({ "ok": true, "agent": me, "action": "noop", "why": "no users" }));
         }
         // One pool read per pool, shared by the users in it.
         let mut pools: Vec<PoolView> = Vec::new();

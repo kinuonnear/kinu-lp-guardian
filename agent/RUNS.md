@@ -77,3 +77,20 @@ sha256 `cb0522f7371039f98fa8fca7a586eddf82d2a4d7bf2bf9d6663177d5dadbc75c`, uploa
 `b451b57237474244c9a80664a668f2806cf7ef5f51793f881072eb944bfa1c24`
 (`ed25519:D8tef5fPvgmf4dqfDn1LKDy13KS2mpLMB7kC4AFobcVq`). The previous agent (`feb959d8…`, build
 `d411bd89…`) was retired: 0.487 NEAR back to `kinuonnear.near`.
+
+## v1.2 contract, agent as an OutLayer project (29 Oct 2026)
+
+Contract upgraded in place to v1.2 (`FHzvPc81…`, `migrate` in the deploy transaction): an on-chain user
+list (`get_users`) for the scheduler. The agent's key is now bound to the project
+`agent.kinuonnear.near/kinu-guardian` (manifest without `bind: "wasm"`), so later versions keep the
+agent account; version 1 = build `0541dd9d47cb31908df5182a9d90001b92a25ff5b39d7e8b1385ff321196d7ef`
+(pins v1.2; gas per call: poke 50 / exit 150 / move 300 TGas). Agent account
+`a18c4ac6d011b41a394570c843aa48a47539312e36004c56650cb00cbf7ac810` (pubkey run
+`AsBf7y1CE1NG5iXFZinQT4PVrA6dhpiWDQRCKfdktAEa`), funded 0.5 NEAR; agent `b451b572…` retired (0.49 NEAR
+back, tx `9jFRbzkPVxvZFfXzmRPdvwAe6MUJUf1619F2DPXHL9dh`).
+
+Runs go through the project (the key is project-bound; a direct wasm run no longer gets it):
+`outlayer run agent.kinuonnear.near/kinu-guardian '{"cmd":"tick"}'`. KINU's scheduler
+(`api/guardian-cron.js`, Vercel Cron every 5 min) calls the same project over OutLayer's HTTPS API with
+a payment key owned by `agent.kinuonnear.near`, limited to this project and $0.02 per call; over HTTPS
+the key's owner is the caller, so it is the same agent account.

@@ -282,6 +282,18 @@ pub fn call_for(action: &Action, user: &str) -> Option<(&'static str, String)> {
 /// At most this many users per run (one transaction each, and the output stays under 900 bytes).
 pub const MAX_USERS_PER_RUN: usize = 5;
 
+/// Gas the agent attaches per call: what the contract's chain for it reserves (v1.1 floors: move
+/// 235, exit 120, poke ~30 TGas) plus margin. A wallet must hold about a tenth of a NEAR per 100 TGas
+/// attached at signing (refunded), so the small calls no longer need the 0.3 NEAR a move does.
+pub fn gas_for(method: &str) -> u64 {
+    const T: u64 = 1_000_000_000_000;
+    match method {
+        "poke" => 50 * T,
+        "exit" => 150 * T,
+        _ => 300 * T,
+    }
+}
+
 /// The users a run looks at: well-formed NEAR account ids from the (untrusted) input, deduplicated.
 pub fn users_from_input(input: &serde_json::Value) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -447,6 +459,13 @@ mod tests {
         // At 291077 the price fell 13,723 points from the high: the agent exits (the contract agreed in tests/shared.rs).
         let pool = PoolView { pool_id: "tkq.near|wrap.near|10000".into(), token_x: "tkq.near".into(), token_y: "wrap.near".into(), current_point: 291_077, point_delta: 200, fee: 10000, liquidity: "0".into() };
         assert_eq!(decide(&World { me: ME, account: &a, pool: &pool }), Action::Exit);
+    }
+
+    #[test]
+    fn each_call_gets_its_chains_gas() {
+        assert_eq!(gas_for("request_rebalance"), 300_000_000_000_000);
+        assert_eq!(gas_for("exit"), 150_000_000_000_000);
+        assert_eq!(gas_for("poke"), 50_000_000_000_000);
     }
 
     #[test]
