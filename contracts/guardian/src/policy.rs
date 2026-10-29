@@ -84,10 +84,19 @@ pub fn moved_against(policy: &Policy, high_point: Option<i32>, low_point: Option
     }
 }
 
-/// v1.4 take profit: whether the price at `point` has reached the user's `target` point, in the
-/// user's favour: risen to it, or (with `exit_on_rise`, where the user's token is token Y) fallen to it.
-pub fn take_profit_met(policy: &Policy, target: i32, point: i32) -> bool {
-    if policy.exit_on_rise { point <= target } else { point >= target }
+/// v1.4 take profit, set by the user only: close when the pool point reaches point, upward
+/// (above: the price rose to it) or downward (the user's token is token Y, so its price rising is
+/// the point falling). The direction is stored with the target, never taken from another rule.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TakeProfit {
+    pub point: i32,
+    pub above: bool,
+}
+
+/// Whether the price at point has reached the user's take-profit target.
+pub fn take_profit_met(tp: &TakeProfit, point: i32) -> bool {
+    if tp.above { point >= tp.point } else { point <= tp.point }
 }
 
 impl Refusal {
@@ -274,15 +283,15 @@ mod tests {
 
     #[test]
     fn take_profit_is_reached_in_the_users_favour() {
-        let mut p = policy();
-        assert!(!take_profit_met(&p, 5_000, 4_999));
-        assert!(take_profit_met(&p, 5_000, 5_000));
-        assert!(take_profit_met(&p, 5_000, 6_000));
-        // The user's token is token Y: profit is the point falling.
-        p.exit_on_rise = true;
-        assert!(!take_profit_met(&p, -5_000, -4_999));
-        assert!(take_profit_met(&p, -5_000, -5_000));
-        assert!(take_profit_met(&p, -5_000, -6_000));
+        let up = TakeProfit { point: 5_000, above: true };
+        assert!(!take_profit_met(&up, 4_999));
+        assert!(take_profit_met(&up, 5_000));
+        assert!(take_profit_met(&up, 6_000));
+        // The user's token is token Y: profit is the point falling, whatever the exit rule says.
+        let down = TakeProfit { point: -5_000, above: false };
+        assert!(!take_profit_met(&down, -4_999));
+        assert!(take_profit_met(&down, -5_000));
+        assert!(take_profit_met(&down, -6_000));
     }
 
     #[test]

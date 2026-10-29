@@ -40,7 +40,7 @@ use near_sdk::serde_json::{Value, json};
 use near_sdk::store::{IterableMap, IterableSet, LookupMap};
 use near_sdk::{AccountId, BorshStorageKey, Gas, GasWeight, NearToken, PanicOnDefault, Promise, PromiseError, PromiseOrValue, env, near};
 use std::collections::HashMap;
-pub use policy::{Policy, RateWindow, RebalanceRequest, Refusal, SEEN_MAX_AGE_SECS, SEEN_MIN_AGE_SECS, check_out_of_range, check_rebalance, check_seen_age, moved_against, take_profit_met};
+pub use policy::{Policy, RateWindow, RebalanceRequest, Refusal, SEEN_MAX_AGE_SECS, SEEN_MIN_AGE_SECS, check_out_of_range, check_rebalance, check_seen_age, moved_against, take_profit_met, TakeProfit};
 
 // Gas (v1.1). Every callback that follows a step on Rhea gets a static floor that pays for the WHOLE
 // rest of its chain (built below from the end of each chain back to its start), so a transaction
@@ -238,7 +238,7 @@ pub struct Guardian {
     /// v1.4: take profit, set by the user only: the pool point at which the agent may close the
     /// position (the price risen to it; fallen to it with exit_on_rise). Kept apart from the policy
     /// so v1.3 records need no migration. Cleared when the position closes.
-    take_profit: LookupMap<AccountId, i32>,
+    take_profit: LookupMap<AccountId, TakeProfit>,
 }
 
 /// The state as v1.3 stored it, read once by `migrate`.
@@ -1016,9 +1016,9 @@ impl Guardian {
         let mut reason = "user";
         if !by_user {
             // Which of the user's rules is met: the exit rule, or take profit (v1.4).
-            let target = self.take_profit.get(&user).copied();
+            let target = self.take_profit.get(&user).cloned();
             let stop_at = |point: i32| acct.policy.exit_drop_points > 0 && moved_against(&acct.policy, acct.high_point, acct.low_point, point) >= i64::from(acct.policy.exit_drop_points);
-            let profit_at = |point: i32| target.is_some_and(|t| take_profit_met(&acct.policy, t, point));
+            let profit_at = |point: i32| target.as_ref().is_some_and(|t| take_profit_met(t, point));
             if !stop_at(cur) && !profit_at(cur) {
                 return self.bail(&user, "Exit rule not met: the price has not moved far enough against the user, nor reached the take-profit target");
             }
@@ -1067,28 +1067,28 @@ impl Guardian {
         true
     }
 
-    /// v1.4, the user only: the pool point at which the agent may close the position for profit
-    /// (the price risen to it; fallen to it with exit_on_rise, the same direction as the exit rule's
-    /// opposite). `None` removes it. Allowed while paused: it only ever leads to a way out.
-    pub fn set_take_profit(&mut self, point: Option<i32>) {
+    /// v1.4, the user only: the target at which the agent may close the position for profit,
+    /// with its direction (above: the point rising to it). None removes it. Allowed while paused:
+    /// it only ever leads to a way out.
+    pub fn set_take_profit(&mut self, target: Option<TakeProfit>) {
         let user = env::predecessor_account_id();
         let acct = self.account(&user);
-        match point {
-            Some(p) => {
+        match &target {
+            Some(t) => {
                 if acct.position.is_none() {
                     env::panic_str("Open a position first: take profit closes it");
                 }
-                self.take_profit.insert(user.clone(), p);
+                self.take_profit.insert(user.clone(), t.clone());
             }
             None => {
                 self.take_profit.remove(&user);
             }
         }
-        emit("take_profit_set", json!({ "user": user, "point": point }));
+        emit("take_profit_set", json!({ "user": user, "target": target }));
     }
 
-    pub fn get_take_profit(&self, user: AccountId) -> Option<i32> {
-        self.take_profit.get(&user).copied()
+    pub fn get_take_profit(&self, user: AccountId) -> Option<TakeProfit> {
+        self.take_profit.get(&user).cloned()
     }
 
     /// Sends the user `amount` (or all) of a pool token from their ledger: Rhea pays this contract,
@@ -1993,15 +1993,15 @@ mod tests {
     fn take_profit_is_the_users_and_needs_a_position() {
         let mut g = joined();
         ctx("alice.testnet", ZERO);
-        assert!(panics(|| g.set_take_profit(Some(5_000))), "no position yet");
+        assert!(panics(|| g.set_take_profit(Some(TakeProfit { point: 5_000, above: true }))), "no position yet");
         with_position(&mut g);
         ctx("alice.testnet", ZERO);
-        g.set_take_profit(Some(5_000));
-        assert_eq!(g.get_take_profit(acc("alice.testnet")), Some(5_000));
+        g.set_take_profit(Some(TakeProfit { point: 5_000, above: true }));
+        assert_eq!(g.get_take_profit(acc("alice.testnet")), Some(TakeProfit { point: 5_000, above: true }));
         // The agent sets nothing for her: set_take_profit always acts on the caller's own record.
         ctx("agent.testnet", ZERO);
-        assert!(panics(|| g.set_take_profit(Some(1))));
-        assert_eq!(g.get_take_profit(acc("alice.testnet")), Some(5_000));
+        assert!(panics(|| g.set_take_profit(Some(TakeProfit { point: 1, above: true }))));
+        assert_eq!(g.get_take_profit(acc("alice.testnet")), Some(TakeProfit { point: 5_000, above: true }));
         ctx("alice.testnet", ZERO);
         g.set_take_profit(None);
         assert_eq!(g.get_take_profit(acc("alice.testnet")), None);
@@ -2018,7 +2018,7 @@ mod tests {
         ctx("agent.testnet", ZERO);
         assert!(panics(|| drop(g.exit(acc("alice.testnet")))));
         ctx("alice.testnet", ZERO);
-        g.set_take_profit(Some(5_000));
+        g.set_take_profit(Some(TakeProfit { point: 5_000, above: true }));
         ctx("agent.testnet", ZERO);
         let _ = g.exit(acc("alice.testnet"));
         g.unlock();
@@ -2043,11 +2043,34 @@ mod tests {
     }
 
     #[test]
+    fn take_profit_keeps_its_own_direction_without_an_exit_rule() {
+        // A pool whose token X is the quote: the user's token rising is the point falling. No exit
+        // rule (so exit_on_rise is false); the target's own direction decides.
+        let mut g = joined();
+        with_position(&mut g);
+        let mut a = g.get_account(acc("alice.testnet")).unwrap();
+        a.policy.exit_drop_points = 0;
+        a.policy.exit_on_rise = false;
+        g.accounts.insert(acc("alice.testnet"), a);
+        ctx("alice.testnet", ZERO);
+        g.set_take_profit(Some(TakeProfit { point: -5_000, above: false }));
+        // The point rising is not her profit: refused.
+        g.seen.insert(acc("alice.testnet"), Seen { point: 6_000, at_secs: 9_700 });
+        at("guardian.testnet", 10_000);
+        assert!(matches!(g.on_pool_for_exit(acc("alice.testnet"), false, pool_at(6_000)), PromiseOrValue::Value(false)));
+        // The point down to the target, now and 5 minutes ago: taken.
+        g.seen.insert(acc("alice.testnet"), Seen { point: -5_100, at_secs: 9_700 });
+        at("guardian.testnet", 10_000);
+        assert!(matches!(g.on_pool_for_exit(acc("alice.testnet"), false, pool_at(-5_400)), PromiseOrValue::Promise(_)));
+        assert!(exit_logs().contains("take_profit"));
+    }
+
+    #[test]
     fn the_exit_rule_still_comes_first() {
         let mut g = joined();
         with_position(&mut g); // exit rule: 2_000 points below the high of 0
         ctx("alice.testnet", ZERO);
-        g.set_take_profit(Some(5_000));
+        g.set_take_profit(Some(TakeProfit { point: 5_000, above: true }));
         g.seen.insert(acc("alice.testnet"), Seen { point: -2_100, at_secs: 9_800 });
         at("guardian.testnet", 10_000);
         assert!(matches!(g.on_pool_for_exit(acc("alice.testnet"), false, pool_at(-2_500)), PromiseOrValue::Promise(_)));
@@ -2059,7 +2082,7 @@ mod tests {
         let mut g = joined();
         with_position(&mut g);
         ctx("alice.testnet", ZERO);
-        g.set_take_profit(Some(5_000));
+        g.set_take_profit(Some(TakeProfit { point: 5_000, above: true }));
         ctx("guardian.testnet", ZERO);
         g.lock();
         let _ = g.on_cash_out_closed(acc("alice.testnet"), false, Ok((U128(0), U128(0))));

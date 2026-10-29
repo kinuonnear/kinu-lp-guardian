@@ -139,7 +139,7 @@ async fn v13_to_v14_then_take_profit_on_real_prices() -> testresult::TestResult<
     expect("alice deposit TKQ", t.call("alice.sandbox", TKQ, "ft_transfer_call", json!({ "receiver_id": G, "amount": "100000000000", "msg": "" }), yocto).await, "ok");
     let open = json!({ "left_point": 303400, "right_point": 306200 }).to_string();
     expect("alice deposit wNEAR + open", t.call("alice.sandbox", WRAP, "ft_transfer_call", json!({ "receiver_id": G, "amount": "2000000000000000000000000", "msg": open }), yocto).await, "ok");
-    expect("v1.3 has no take profit", t.call("alice.sandbox", G, "set_take_profit", json!({ "point": 306000 }), zero).await, "FAIL");
+    expect("v1.3 has no take profit", t.call("alice.sandbox", G, "set_take_profit", json!({ "target": { "point": 306000, "above": true } }), zero).await, "FAIL");
     let alice_v13 = t.view(G, "get_account", json!({ "user": "alice.sandbox" })).await;
 
     // v1.3 -> v1.4: stage, the DAO proposes, the delay passes, a stranger runs it.
@@ -158,9 +158,9 @@ async fn v13_to_v14_then_take_profit_on_real_prices() -> testresult::TestResult<
     // Take profit on real prices: Alice sets a target 1.5% above the price.
     let start = t.point().await;
     let target = start + 150;
-    expect("a stranger sets Alice's target", t.call("stranger.sandbox", G, "set_take_profit", json!({ "point": target }), zero).await, "has not joined");
-    expect("alice sets take profit", t.call("alice.sandbox", G, "set_take_profit", json!({ "point": target }), zero).await, "ok");
-    assert_eq!(t.view(G, "get_take_profit", json!({ "user": "alice.sandbox" })).await, json!(target));
+    expect("a stranger sets Alice's target", t.call("stranger.sandbox", G, "set_take_profit", json!({ "target": { "point": target, "above": true } }), zero).await, "has not joined");
+    expect("alice sets take profit", t.call("alice.sandbox", G, "set_take_profit", json!({ "target": { "point": target, "above": true } }), zero).await, "ok");
+    assert_eq!(t.view(G, "get_take_profit", json!({ "user": "alice.sandbox" })).await, json!({ "point": target, "above": true }));
     expect("agent exits before the target", t.call("agent.sandbox", G, "exit", json!({ "user": "alice.sandbox" }), zero).await, "REFUSED");
     // A whale pushes the price past the target for a moment, the agent pokes there, arbitrage undoes it.
     let lp_tkq = t.ft(TKQ, "lp.sandbox").await;

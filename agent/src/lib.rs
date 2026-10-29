@@ -67,13 +67,20 @@ pub struct World<'a> {
     pub me: &'a str,
     pub account: &'a AccountView,
     pub pool: &'a PoolView,
-    /// Contract v1.4: the user's take-profit target point (get_take_profit), if any.
-    pub take_profit: Option<i32>,
+    /// Contract v1.4: the user's take-profit target (get_take_profit), if any.
+    pub take_profit: Option<TakeProfitView>,
 }
 
-/// Contract v1.4: the price at point reached the target in the user's favour (as the contract checks).
-pub fn take_profit_met(v: &AccountView, target: i32, point: i32) -> bool {
-    if v.policy.exit_on_rise { point <= target } else { point >= target }
+/// Contract v1.4: a take-profit target with its own direction (above: the point rising to it).
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct TakeProfitView {
+    pub point: i32,
+    pub above: bool,
+}
+
+/// Contract v1.4: the price at point reached the target (as the contract checks).
+pub fn take_profit_met(tp: &TakeProfitView, point: i32) -> bool {
+    if tp.above { point >= tp.point } else { point <= tp.point }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -111,7 +118,7 @@ fn confirmed_at(w: &World, action: &Action, then: i32) -> bool {
         Action::Exit => {
             // The same rule that is met now must have been met then (as the contract checks).
             let stop = |p: i32| v.policy.exit_drop_points > 0 && moved_against(v, p) >= i64::from(v.policy.exit_drop_points);
-            let profit = |p: i32| w.take_profit.is_some_and(|t| take_profit_met(v, t, p));
+            let profit = |p: i32| w.take_profit.as_ref().is_some_and(|t| take_profit_met(t, p));
             let now = w.pool.current_point;
             (stop(now) && stop(then)) || (profit(now) && profit(then))
         }
@@ -183,7 +190,7 @@ pub fn decide(w: &World) -> Action {
         return Action::Exit;
     }
     // Take profit (contract v1.4): the user's target reached.
-    if w.take_profit.is_some_and(|t| take_profit_met(v, t, cur)) {
+    if w.take_profit.as_ref().is_some_and(|t| take_profit_met(t, cur)) {
         return Action::Exit;
     }
     // Re-centre only once the price is outside by more than the user's buffer, and never within
@@ -466,7 +473,7 @@ mod tests {
         v.policy.exit_drop_points = 0;
         let tp = |point: i32, seen: Option<(i32, u64)>| {
             let s = seen.map(|(point, at_secs)| SeenView { point, at_secs });
-            decide_confirmed(&World { me: ME, account: &v, pool: &pool(point), take_profit: Some(500) }, s.as_ref(), 10_000)
+            decide_confirmed(&World { me: ME, account: &v, pool: &pool(point), take_profit: Some(TakeProfitView { point: 500, above: true }) }, s.as_ref(), 10_000)
         };
         // Below the target: no exit (the range is left above: a re-centre is what is due).
         assert!(!matches!(tp(400, Some((400, 9_700))), Action::Exit));
