@@ -124,7 +124,7 @@ async fn v12_to_v13_then_only_dao_and_delay() -> testresult::TestResult<()> {
     assert!(r.is_success(), "upgrade + migrate: {r:?}");
     let cfg = t.view(G, "get_config", json!({})).await;
     println!("v1.3 config {cfg}");
-    assert_eq!(cfg["version"], "1.3.0");
+    assert_eq!(cfg["version"], "1.4.0");
     assert_eq!(cfg["owner"], "dao.sandbox");
     assert_eq!(cfg["users"], 2, "the v1.2 user list is kept");
     assert_eq!(t.view(G, "get_account", json!({ "user": "alice.sandbox" })).await, alice_before, "alice's record kept");
@@ -169,7 +169,7 @@ async fn v12_to_v13_then_only_dao_and_delay() -> testresult::TestResult<()> {
     ok("a stranger runs the upgrade after the delay", t.call("carol.sandbox", G, "execute", json!({ "id": 0 }), zero).await);
     let cfg = t.view(G, "get_config", json!({})).await;
     println!("after the timelocked upgrade {cfg}");
-    assert!(cfg["staged"].is_null() && cfg["pending"] == 0 && cfg["owner"] == "dao.sandbox" && cfg["version"] == "1.3.0");
+    assert!(cfg["staged"].is_null() && cfg["pending"] == 0 && cfg["owner"] == "dao.sandbox" && cfg["version"] == "1.4.0");
     assert_eq!(cfg["admin_delay_secs"], 172_800, "the production build (48 h) now runs");
     assert_eq!(t.view(G, "get_account", json!({ "user": "alice.sandbox" })).await, alice_before, "alice's record kept through it");
     assert!(t.near("lp.sandbox").await - lp_near > 4.9, "the stager got the storage deposit back");

@@ -210,7 +210,8 @@ mod run_impl {
             return Err(format!("block: {err}"));
         }
         let now_secs = rpc_result(&blk)?["header"]["timestamp"].as_u64().ok_or("no block time")? / 1_000_000_000;
-        let action = decide_confirmed(&World { me, account: &account, pool: &pool }, seen.as_ref(), now_secs);
+        let take_profit: Option<i32> = serde_json::from_value(view(GUARDIAN, "get_take_profit", json!({ "user": user }))?).unwrap_or(None);
+        let action = decide_confirmed(&World { me, account: &account, pool: &pool, take_profit }, seen.as_ref(), now_secs);
         // Cost guard: move a position only when a day of fees in the new range pays for the gas.
         // If the market data is unreachable the move goes ahead (a stuck position earns nothing).
         let mut guard = Value::Null;
