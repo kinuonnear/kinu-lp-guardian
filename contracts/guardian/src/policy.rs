@@ -84,6 +84,12 @@ pub fn moved_against(policy: &Policy, high_point: Option<i32>, low_point: Option
     }
 }
 
+/// v1.4 take profit: whether the price at `point` has reached the user's `target` point, in the
+/// user's favour: risen to it, or (with `exit_on_rise`, where the user's token is token Y) fallen to it.
+pub fn take_profit_met(policy: &Policy, target: i32, point: i32) -> bool {
+    if policy.exit_on_rise { point <= target } else { point >= target }
+}
+
 impl Refusal {
     pub fn message(&self) -> &'static str {
         match self {
@@ -264,6 +270,19 @@ mod tests {
         assert_eq!(check_seen_age(Some(10_000), 10_000 + SEEN_MIN_AGE_SECS), Ok(()));
         assert_eq!(check_seen_age(Some(10_000), 10_000 + SEEN_MAX_AGE_SECS), Ok(()));
         assert_eq!(check_seen_age(Some(10_000), 10_000 + SEEN_MAX_AGE_SECS + 1), Err(Refusal::NoRecentPrice), "too old");
+    }
+
+    #[test]
+    fn take_profit_is_reached_in_the_users_favour() {
+        let mut p = policy();
+        assert!(!take_profit_met(&p, 5_000, 4_999));
+        assert!(take_profit_met(&p, 5_000, 5_000));
+        assert!(take_profit_met(&p, 5_000, 6_000));
+        // The user's token is token Y: profit is the point falling.
+        p.exit_on_rise = true;
+        assert!(!take_profit_met(&p, -5_000, -4_999));
+        assert!(take_profit_met(&p, -5_000, -5_000));
+        assert!(take_profit_met(&p, -5_000, -6_000));
     }
 
     #[test]

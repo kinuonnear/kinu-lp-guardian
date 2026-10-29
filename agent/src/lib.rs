@@ -67,6 +67,13 @@ pub struct World<'a> {
     pub me: &'a str,
     pub account: &'a AccountView,
     pub pool: &'a PoolView,
+    /// Contract v1.4: the user's take-profit target point (get_take_profit), if any.
+    pub take_profit: Option<i32>,
+}
+
+/// Contract v1.4: the price at point reached the target in the user's favour (as the contract checks).
+pub fn take_profit_met(v: &AccountView, target: i32, point: i32) -> bool {
+    if v.policy.exit_on_rise { point <= target } else { point >= target }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -98,9 +105,16 @@ fn moved_against(v: &AccountView, point: i32) -> i64 {
 }
 
 /// Whether `action` was already due at the earlier price `then`, as the contract checks it.
-fn confirmed_at(v: &AccountView, action: &Action, then: i32) -> bool {
+fn confirmed_at(w: &World, action: &Action, then: i32) -> bool {
+    let v = w.account;
     match action {
-        Action::Exit => v.policy.exit_drop_points > 0 && moved_against(v, then) >= i64::from(v.policy.exit_drop_points),
+        Action::Exit => {
+            // The same rule that is met now must have been met then (as the contract checks).
+            let stop = |p: i32| v.policy.exit_drop_points > 0 && moved_against(v, p) >= i64::from(v.policy.exit_drop_points);
+            let profit = |p: i32| w.take_profit.is_some_and(|t| take_profit_met(v, t, p));
+            let now = w.pool.current_point;
+            (stop(now) && stop(then)) || (profit(now) && profit(then))
+        }
         Action::Rebalance { left_point, right_point, .. } => {
             let Some(pos) = &v.position else { return false };
             let t = i64::from(then);
@@ -122,7 +136,7 @@ pub fn decide_confirmed(w: &World, seen: Option<&SeenView>, now_secs: u64) -> Ac
     }
     let age = seen.map(|s| now_secs.saturating_sub(s.at_secs));
     match (seen, age) {
-        (Some(s), Some(a)) if (SEEN_MIN_AGE_SECS..=SEEN_MAX_AGE_SECS).contains(&a) && confirmed_at(w.account, &action, s.point) => action,
+        (Some(s), Some(a)) if (SEEN_MIN_AGE_SECS..=SEEN_MAX_AGE_SECS).contains(&a) && confirmed_at(w, &action, s.point) => action,
         (Some(_), Some(a)) if a < SEEN_MIN_AGE_SECS => Action::Noop("rule met; waiting for the confirmation window"),
         _ => Action::Poke,
     }
@@ -166,6 +180,10 @@ pub fn decide(w: &World) -> Action {
         i64::from(v.high_point.unwrap_or(cur).max(cur)) - i64::from(cur)
     };
     if exit_on && moved >= i64::from(v.policy.exit_drop_points) {
+        return Action::Exit;
+    }
+    // Take profit (contract v1.4): the user's target reached.
+    if w.take_profit.is_some_and(|t| take_profit_met(v, t, cur)) {
         return Action::Exit;
     }
     // Re-centre only once the price is outside by more than the user's buffer, and never within
@@ -434,12 +452,29 @@ mod tests {
         PoolView { pool_id: "x|y|100".into(), token_x: "x".into(), token_y: "y".into(), current_point: point, point_delta: 40, fee: 100, liquidity: "0".into() }
     }
     fn run(v: &AccountView, point: i32, _wallet: &[(String, u128)], _funded: bool) -> Action {
-        decide(&World { me: ME, account: v, pool: &pool(point) })
+        decide(&World { me: ME, account: v, pool: &pool(point), take_profit: None })
     }
 
     fn confirmed(v: &AccountView, point: i32, seen: Option<(i32, u64)>, now: u64) -> Action {
         let s = seen.map(|(point, at_secs)| SeenView { point, at_secs });
-        decide_confirmed(&World { me: ME, account: v, pool: &pool(point) }, s.as_ref(), now)
+        decide_confirmed(&World { me: ME, account: v, pool: &pool(point), take_profit: None }, s.as_ref(), now)
+    }
+
+    #[test]
+    fn takes_profit_at_the_users_target_once_confirmed() {
+        let mut v = vault(Some((-100, 100)), Some(10));
+        v.policy.exit_drop_points = 0;
+        let tp = |point: i32, seen: Option<(i32, u64)>| {
+            let s = seen.map(|(point, at_secs)| SeenView { point, at_secs });
+            decide_confirmed(&World { me: ME, account: &v, pool: &pool(point), take_profit: Some(500) }, s.as_ref(), 10_000)
+        };
+        // Below the target: no exit (the range is left above: a re-centre is what is due).
+        assert!(!matches!(tp(400, Some((400, 9_700))), Action::Exit));
+        // At the target, never read: poke first; read 5 minutes ago below it (pushed now): read again.
+        assert_eq!(tp(520, None), Action::Poke);
+        assert_eq!(tp(520, Some((300, 9_700))), Action::Poke);
+        // Reached then and now: exit.
+        assert_eq!(tp(520, Some((510, 9_700))), Action::Exit);
     }
 
     #[test]
@@ -586,7 +621,7 @@ mod tests {
         assert_eq!(a.policy.exit_drop_points, 2000);
         // At 291077 the price fell 13,723 points from the high: the agent exits (the contract agreed in tests/shared.rs).
         let pool = PoolView { pool_id: "tkq.near|wrap.near|10000".into(), token_x: "tkq.near".into(), token_y: "wrap.near".into(), current_point: 291_077, point_delta: 200, fee: 10000, liquidity: "0".into() };
-        assert_eq!(decide(&World { me: ME, account: &a, pool: &pool }), Action::Exit);
+        assert_eq!(decide(&World { me: ME, account: &a, pool: &pool, take_profit: None }), Action::Exit);
     }
 
     #[test]

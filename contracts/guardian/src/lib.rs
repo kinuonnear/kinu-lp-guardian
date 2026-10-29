@@ -40,7 +40,7 @@ use near_sdk::serde_json::{Value, json};
 use near_sdk::store::{IterableMap, IterableSet, LookupMap};
 use near_sdk::{AccountId, BorshStorageKey, Gas, GasWeight, NearToken, PanicOnDefault, Promise, PromiseError, PromiseOrValue, env, near};
 use std::collections::HashMap;
-pub use policy::{Policy, RateWindow, RebalanceRequest, Refusal, SEEN_MAX_AGE_SECS, SEEN_MIN_AGE_SECS, check_out_of_range, check_rebalance, check_seen_age, moved_against};
+pub use policy::{Policy, RateWindow, RebalanceRequest, Refusal, SEEN_MAX_AGE_SECS, SEEN_MIN_AGE_SECS, check_out_of_range, check_rebalance, check_seen_age, moved_against, take_profit_met};
 
 // Gas (v1.1). Every callback that follows a step on Rhea gets a static floor that pays for the WHOLE
 // rest of its chain (built below from the end of each chain back to its start), so a transaction
@@ -83,7 +83,7 @@ const CB_LIQ_CASH: u64 = T_REMOVE + CB_CASH_CLOSED + T_OWN;
 const fn tg(t: u64) -> Gas {
     Gas::from_tgas(t)
 }
-pub const VERSION: &str = "1.3.0";
+pub const VERSION: &str = "1.4.0";
 /// How long an admin action waits after it is proposed (v1.3): long enough for every user to see
 /// the event and cash out.
 #[cfg(not(feature = "short-delay"))]
@@ -209,6 +209,7 @@ enum Key {
     Users,
     Pending,
     Seen,
+    TakeProfit,
 }
 
 #[near(contract_state)]
@@ -233,6 +234,26 @@ pub struct Guardian {
     /// v1.3: emergency pause by the owner, at once (no delay): no joins, deposits, new ranges or agent
     /// re-centres. Every way out stays open: exit (the user's, or the agent's by the user's rule),
     /// withdraw, cash_out, claim, leave.
+    paused: bool,
+    /// v1.4: take profit, set by the user only: the pool point at which the agent may close the
+    /// position (the price risen to it; fallen to it with exit_on_rise). Kept apart from the policy
+    /// so v1.3 records need no migration. Cleared when the position closes.
+    take_profit: LookupMap<AccountId, i32>,
+}
+
+/// The state as v1.3 stored it, read once by `migrate`.
+#[near(serializers = [borsh])]
+struct GuardianV13 {
+    dcl: AccountId,
+    wnear: AccountId,
+    accounts: LookupMap<AccountId, Account>,
+    busy_until: u64,
+    users: IterableSet<AccountId>,
+    owner: AccountId,
+    pending: IterableMap<u32, Pending>,
+    next_pending: u32,
+    staged: Option<Staged>,
+    seen: LookupMap<AccountId, Seen>,
     paused: bool,
 }
 
@@ -401,13 +422,14 @@ impl Guardian {
             staged: None,
             seen: LookupMap::new(Key::Seen),
             paused: false,
+            take_profit: LookupMap::new(Key::TakeProfit),
         }
     }
 
     /// Runs in the same receipt as a deploy of this code (if it panics, the deploy is undone too).
-    /// From v1.2: the same records, plus the owner, an empty admin queue and no prices seen yet; run
-    /// by the contract account (the last time its own key is used; it is deleted right after).
-    /// From v1.3 (a redeploy through `execute`): the state as it is. Private either way.
+    /// Private. From v1.4 (a redeploy): the state as it is. From v1.3 (the upgrade through
+    /// `execute`): everything kept (owner, queue, prices, pause), plus an empty take-profit table.
+    /// From v1.2: the records, plus `owner`, an empty queue and no prices seen yet.
     #[private]
     #[init(ignore_state)]
     pub fn migrate(owner: AccountId) -> Self {
@@ -415,7 +437,23 @@ impl Guardian {
         if let Ok(current) = near_sdk::borsh::from_slice::<Guardian>(&raw) {
             return current;
         }
-        let old: GuardianV12 = near_sdk::borsh::from_slice(&raw).unwrap_or_else(|_| env::panic_str("State is neither v1.2 nor v1.3"));
+        if let Ok(v13) = near_sdk::borsh::from_slice::<GuardianV13>(&raw) {
+            return Self {
+                dcl: v13.dcl,
+                wnear: v13.wnear,
+                accounts: v13.accounts,
+                busy_until: v13.busy_until,
+                users: v13.users,
+                owner: v13.owner,
+                pending: v13.pending,
+                next_pending: v13.next_pending,
+                staged: v13.staged,
+                seen: v13.seen,
+                paused: v13.paused,
+                take_profit: LookupMap::new(Key::TakeProfit),
+            };
+        }
+        let old: GuardianV12 = near_sdk::borsh::from_slice(&raw).unwrap_or_else(|_| env::panic_str("State is neither v1.2, v1.3 nor v1.4"));
         Self {
             dcl: old.dcl,
             wnear: old.wnear,
@@ -428,6 +466,7 @@ impl Guardian {
             staged: None,
             seen: LookupMap::new(Key::Seen),
             paused: false,
+            take_profit: LookupMap::new(Key::TakeProfit),
         }
     }
 
@@ -622,6 +661,7 @@ impl Guardian {
         self.accounts.remove(&user);
         self.users.remove(&user);
         self.seen.remove(&user);
+        self.take_profit.remove(&user);
         emit("left", json!({ "user": user }));
         Promise::new(user).transfer(JOIN_DEPOSIT)
     }
@@ -944,7 +984,8 @@ impl Guardian {
     // ---------- exit and withdraw: the user's way out, no agent needed ----------
 
     /// Closes the position: the tokens land on the user's ledger. The user may always; the agent
-    /// only when the user's exit rule is met.
+    /// only when one of the user's own rules is met: the exit rule (a fall from the best price) or
+    /// take profit (v1.4: the price reached the user's target).
     pub fn exit(&mut self, user: AccountId) -> Promise {
         let caller = env::predecessor_account_id();
         let acct = self.account(&user);
@@ -956,7 +997,7 @@ impl Guardian {
             if acct.agent.as_ref() != Some(&caller) {
                 refuse(Refusal::NotAgent);
             }
-            if acct.policy.exit_drop_points == 0 {
+            if acct.policy.exit_drop_points == 0 && !self.take_profit.contains_key(&user) {
                 env::panic_str("The user has not allowed the agent to exit");
             }
         }
@@ -972,23 +1013,32 @@ impl Guardian {
         let Ok(Some(pool)) = pool else { return self.bail(&user, "Could not read the pool from Rhea DCL") };
         let acct = self.account(&user);
         let cur = pool.current_point;
+        let mut reason = "user";
         if !by_user {
-            if moved_against(&acct.policy, acct.high_point, acct.low_point, cur) < i64::from(acct.policy.exit_drop_points) {
-                return self.bail(&user, "Exit rule not met: the price has not moved far enough against the user");
+            // Which of the user's rules is met: the exit rule, or take profit (v1.4).
+            let target = self.take_profit.get(&user).copied();
+            let stop_at = |point: i32| acct.policy.exit_drop_points > 0 && moved_against(&acct.policy, acct.high_point, acct.low_point, point) >= i64::from(acct.policy.exit_drop_points);
+            let profit_at = |point: i32| target.is_some_and(|t| take_profit_met(&acct.policy, t, point));
+            if !stop_at(cur) && !profit_at(cur) {
+                return self.bail(&user, "Exit rule not met: the price has not moved far enough against the user, nor reached the take-profit target");
             }
-            // v1.3: the rule must already have been met at a price read 3–60 minutes earlier.
+            // v1.3: the same rule must already have been met at a price read 3–60 minutes earlier.
             let seen = self.seen.get(&user).cloned();
             if let Err(r) = check_seen_age(seen.as_ref().map(|s| s.at_secs), now_secs()) {
                 return self.bail(&user, r.message());
             }
             let then = seen.map(|s| s.point).unwrap_or(cur);
-            if moved_against(&acct.policy, acct.high_point, acct.low_point, then) < i64::from(acct.policy.exit_drop_points) {
+            reason = if stop_at(cur) && stop_at(then) {
+                "exit_rule"
+            } else if profit_at(cur) && profit_at(then) {
+                "take_profit"
+            } else {
                 return self.bail(&user, Refusal::NotConfirmed.message());
-            }
+            };
             self.seen.remove(&user);
         }
         let Some(pos) = acct.position else { return self.bail(&user, "No open position") };
-        emit("exit_started", json!({ "user": user, "by": if by_user { "user" } else { "agent" }, "lpt_id": pos.lpt_id, "current_point": cur }));
+        emit("exit_started", json!({ "user": user, "by": if by_user { "user" } else { "agent" }, "reason": reason, "lpt_id": pos.lpt_id, "current_point": cur }));
         PromiseOrValue::Promise(
             view(&self.dcl, "get_liquidity", json!({ "lpt_id": pos.lpt_id }))
                 .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_LIQ_EXIT)).with_unused_gas_weight(2).on_liquidity_for_exit(user, pool)),
@@ -1011,8 +1061,34 @@ impl Guardian {
             let _ = self.bail(&user, "Rhea DCL refused to close the position; it stays open");
             return false;
         }
+        // The position it was set for is closed: a take-profit target never outlives it.
+        self.take_profit.remove(&user);
         self.unlock();
         true
+    }
+
+    /// v1.4, the user only: the pool point at which the agent may close the position for profit
+    /// (the price risen to it; fallen to it with exit_on_rise, the same direction as the exit rule's
+    /// opposite). `None` removes it. Allowed while paused: it only ever leads to a way out.
+    pub fn set_take_profit(&mut self, point: Option<i32>) {
+        let user = env::predecessor_account_id();
+        let acct = self.account(&user);
+        match point {
+            Some(p) => {
+                if acct.position.is_none() {
+                    env::panic_str("Open a position first: take profit closes it");
+                }
+                self.take_profit.insert(user.clone(), p);
+            }
+            None => {
+                self.take_profit.remove(&user);
+            }
+        }
+        emit("take_profit_set", json!({ "user": user, "point": point }));
+    }
+
+    pub fn get_take_profit(&self, user: AccountId) -> Option<i32> {
+        self.take_profit.get(&user).copied()
     }
 
     /// Sends the user `amount` (or all) of a pool token from their ledger: Rhea pays this contract,
@@ -1131,6 +1207,8 @@ impl Guardian {
         if !self.credit_removed(&user, &pool, removed) {
             return self.bail(&user, "Rhea DCL refused to close the position; it stays open");
         }
+        // The position closed: its take-profit target goes with it.
+        self.take_profit.remove(&user);
         self.pay_next(user, leave)
     }
 
@@ -1304,6 +1382,7 @@ impl Guardian {
                 self.accounts.remove(&user);
                 self.users.remove(&user);
                 self.seen.remove(&user);
+                self.take_profit.remove(&user);
                 emit("left", json!({ "user": user }));
                 return PromiseOrValue::Promise(Promise::new(user).transfer(JOIN_DEPOSIT));
             }
@@ -1904,5 +1983,86 @@ mod tests {
         assert!(panics(|| g.clear_staged()));
         g.cancel(id);
         g.clear_staged();
+    }
+
+    fn exit_logs() -> String {
+        near_sdk::test_utils::get_logs().into_iter().filter(|l| l.contains("exit_started") || l.contains("\"refused\"")).collect()
+    }
+
+    #[test]
+    fn take_profit_is_the_users_and_needs_a_position() {
+        let mut g = joined();
+        ctx("alice.testnet", ZERO);
+        assert!(panics(|| g.set_take_profit(Some(5_000))), "no position yet");
+        with_position(&mut g);
+        ctx("alice.testnet", ZERO);
+        g.set_take_profit(Some(5_000));
+        assert_eq!(g.get_take_profit(acc("alice.testnet")), Some(5_000));
+        // The agent sets nothing for her: set_take_profit always acts on the caller's own record.
+        ctx("agent.testnet", ZERO);
+        assert!(panics(|| g.set_take_profit(Some(1))));
+        assert_eq!(g.get_take_profit(acc("alice.testnet")), Some(5_000));
+        ctx("alice.testnet", ZERO);
+        g.set_take_profit(None);
+        assert_eq!(g.get_take_profit(acc("alice.testnet")), None);
+    }
+
+    #[test]
+    fn the_agent_takes_profit_only_on_a_target_reached_now_and_minutes_ago() {
+        let mut g = joined();
+        with_position(&mut g);
+        let mut a = g.get_account(acc("alice.testnet")).unwrap();
+        a.policy.exit_drop_points = 0; // no exit rule: take profit is the only reason to exit
+        g.accounts.insert(acc("alice.testnet"), a);
+        // Without a target the agent may not even start.
+        ctx("agent.testnet", ZERO);
+        assert!(panics(|| drop(g.exit(acc("alice.testnet")))));
+        ctx("alice.testnet", ZERO);
+        g.set_take_profit(Some(5_000));
+        ctx("agent.testnet", ZERO);
+        let _ = g.exit(acc("alice.testnet"));
+        g.unlock();
+        // Below the target now: refused.
+        g.seen.insert(acc("alice.testnet"), Seen { point: 5_200, at_secs: 9_700 });
+        at("guardian.testnet", 10_000);
+        assert!(matches!(g.on_pool_for_exit(acc("alice.testnet"), false, pool_at(4_000)), PromiseOrValue::Value(false)));
+        // Reached now but not 5 minutes ago (a pushed price): refused.
+        g.seen.insert(acc("alice.testnet"), Seen { point: 4_000, at_secs: 9_700 });
+        at("guardian.testnet", 10_000);
+        assert!(matches!(g.on_pool_for_exit(acc("alice.testnet"), false, pool_at(5_400)), PromiseOrValue::Value(false)));
+        assert!(exit_logs().contains("one moment's price"));
+        // Reached now and 5 minutes ago: the agent closes it, for profit.
+        g.seen.insert(acc("alice.testnet"), Seen { point: 5_100, at_secs: 9_700 });
+        at("guardian.testnet", 10_000);
+        assert!(matches!(g.on_pool_for_exit(acc("alice.testnet"), false, pool_at(5_400)), PromiseOrValue::Promise(_)));
+        assert!(exit_logs().contains("\"reason\":\"take_profit\""));
+        // Once closed, the target is gone with the position.
+        assert!(g.on_exited(acc("alice.testnet"), PoolView { token_x: acc("tkq.testnet"), token_y: acc("wrap.testnet"), current_point: 5_400 }, Ok((U128(10), U128(20)))));
+        assert_eq!(g.get_take_profit(acc("alice.testnet")), None);
+        assert!(g.get_account(acc("alice.testnet")).unwrap().position.is_none());
+    }
+
+    #[test]
+    fn the_exit_rule_still_comes_first() {
+        let mut g = joined();
+        with_position(&mut g); // exit rule: 2_000 points below the high of 0
+        ctx("alice.testnet", ZERO);
+        g.set_take_profit(Some(5_000));
+        g.seen.insert(acc("alice.testnet"), Seen { point: -2_100, at_secs: 9_800 });
+        at("guardian.testnet", 10_000);
+        assert!(matches!(g.on_pool_for_exit(acc("alice.testnet"), false, pool_at(-2_500)), PromiseOrValue::Promise(_)));
+        assert!(exit_logs().contains("\"reason\":\"exit_rule\""));
+    }
+
+    #[test]
+    fn take_profit_goes_when_the_user_leaves_or_cashes_out() {
+        let mut g = joined();
+        with_position(&mut g);
+        ctx("alice.testnet", ZERO);
+        g.set_take_profit(Some(5_000));
+        ctx("guardian.testnet", ZERO);
+        g.lock();
+        let _ = g.on_cash_out_closed(acc("alice.testnet"), false, Ok((U128(0), U128(0))));
+        assert_eq!(g.get_take_profit(acc("alice.testnet")), None);
     }
 }
