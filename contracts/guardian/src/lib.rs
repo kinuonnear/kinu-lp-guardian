@@ -31,11 +31,35 @@
 //!   · the agent cannot act on one moment's price: a re-centre or an exit needs the rule already met
 //!     at a price this contract read itself (`poke`) 3 to 60 minutes earlier, so a price pushed by a
 //!     large swap for one block is not enough.
+//!
+//! v1.5 (review 30 Oct 2026):
+//!   · the exit rule's best price (high_point, or low_point with exit_on_rise) moves only on a
+//!     confirmed read: a price that held at two pokes 3 to 60 minutes apart. One trade's spike, or a
+//!     price pushed for one block, no longer becomes the "best price" a fall is measured from (N1).
+//!   · a deposit is measured: this contract's Rhea balance of the token is read before and after the
+//!     forward, and the user is credited the smaller of that and what the token reports. A token
+//!     that over-reports can no longer inflate a ledger into other users' balance (M2). Measuring
+//!     takes two reads, so a deposit no longer opens a range in the same transfer: the page sends
+//!     `open` as its own transaction in the same wallet request.
+//!   · a payout is measured too: tax tokens (nearly.trade, $KINU) keep 1% of every transfer out of
+//!     Rhea, so what reaches this contract can be less than Rhea released. The user is paid what
+//!     arrived: this contract's own token balance less what it owes users (`owed_total`, kept per
+//!     token), capped at what Rhea released. A refused payout is owed exactly that, and `claim`
+//!     pays at most what the contract holds beyond what it owes others. Before, a tax-token payout
+//!     asked for 100%, failed, and left the user owed what could never be paid.
+//!   · cash out moves both tokens side by side (withdraw, read, transfer), so the extra reads fit
+//!     in one transaction.
+//!   · `claim_fees(send)`: the user takes the fees their position earned without closing it (Rhea's
+//!     remove_liquidity with amount 0), onto the ledger or, with `send`, on to the wallet.
+//!   · Rhea's answers are read by hand, so a Rhea upgrade that changes their shape never makes a
+//!     callback panic. A step Rhea carried out that this contract cannot measure (an unreadable
+//!     answer or balance, a payout that never arrived) marks the user `unsettled`; `settle`, which
+//!     anyone may run, credits them what this contract's Rhea balance holds beyond all ledgers
+//!     (`ledger_total`). Until then nothing new starts; every way out works. No owner, no delay.
 
 mod policy;
 
 use near_sdk::json_types::U128;
-use near_sdk::serde::{Deserialize, Serialize};
 use near_sdk::serde_json::{Value, json};
 use near_sdk::store::{IterableMap, IterableSet, LookupMap};
 use near_sdk::{AccountId, BorshStorageKey, Gas, GasWeight, NearToken, PanicOnDefault, Promise, PromiseError, PromiseOrValue, env, near};
@@ -64,26 +88,33 @@ const CB_REMOVED_ADD: u64 = SNAPSHOT + T_OWN;
 const CB_LIQ_MOVE: u64 = T_REMOVE + CB_REMOVED_ADD + T_OWN;
 const CB_POOL_NEW: u64 = SNAPSHOT + T_OWN; // on_pool_for_move with no position yet
 const CB_POOL_HELD: u64 = T_VIEW + CB_LIQ_MOVE + T_OWN; // on_pool_for_move moving a position
-const CB_FORWARDED_OPEN: u64 = T_VIEW + CB_POOL_NEW + T_OWN; // a deposit that opens
+// v1.5 deposit: read the Rhea balance, forward the tokens, read it again, credit the difference.
+const CB_DEP_MEASURED: u64 = CB_OWN;
+const CB_FORWARDED: u64 = T_VIEW + CB_DEP_MEASURED + T_OWN; // reads the balance after the forward
+const CB_DEP_BEFORE: u64 = T_FT_CALL + CB_FORWARDED + T_OWN; // forwards, then on_forwarded
 const CB_LIQ_EXIT: u64 = T_REMOVE + CB_OWN + T_OWN;
 const CB_POOL_EXIT: u64 = T_VIEW + CB_LIQ_EXIT + T_OWN;
-const CB_WITHDRAWN: u64 = T_TRANSFER + CB_OWN + T_OWN;
-/// What cash out's pay_next schedules with `n` payouts left, this one included.
-const fn pay_floor(n: u64) -> u64 {
-    if n == 0 { 0 } else { T_WITHDRAW + cash_withdrawn_floor(n) }
+// v1.5 payouts: the tokens of one payout move side by side (withdraw each from Rhea, read where
+// each landed, transfer each), `ft` of them not wNEAR (wNEAR arrives as NEAR and needs no read).
+const CB_OUT_PAID: u64 = CB_OWN;
+const fn cb_out_arrived(ft: u64) -> u64 {
+    T_OWN + ft * T_TRANSFER + CB_OUT_PAID
 }
-const fn cash_withdrawn_floor(n: u64) -> u64 {
-    T_TRANSFER + cash_paid_floor(n - 1) + T_OWN
+const fn cb_out_withdrawn(ft: u64) -> u64 {
+    if ft == 0 { CB_OWN } else { T_OWN + ft * T_VIEW + cb_out_arrived(ft) }
 }
-const fn cash_paid_floor(left: u64) -> u64 {
-    T_OWN + pay_floor(left)
+const fn out_floor(legs: u64, ft: u64) -> u64 {
+    legs * T_WITHDRAW + cb_out_withdrawn(ft)
 }
-const CB_CASH_CLOSED: u64 = T_OWN + pay_floor(2);
+const CB_CLAIM_MEASURED: u64 = T_TRANSFER + CB_OWN + T_OWN;
+const CB_CASH_CLOSED: u64 = T_OWN + out_floor(2, 2);
 const CB_LIQ_CASH: u64 = T_REMOVE + CB_CASH_CLOSED + T_OWN;
+// v1.5 claim_fees: remove_liquidity with amount 0 takes only the fees; with `send`, both go out.
+const CB_FEES: u64 = T_OWN + out_floor(2, 2);
 const fn tg(t: u64) -> Gas {
     Gas::from_tgas(t)
 }
-pub const VERSION: &str = "1.4.0";
+pub const VERSION: &str = "1.5.0";
 /// How long an admin action waits after it is proposed (v1.3): long enough for every user to see
 /// the event and cash out.
 #[cfg(not(feature = "short-delay"))]
@@ -150,14 +181,6 @@ pub struct Account {
     /// Payouts the user's wallet refused (not registered on the token): held in this contract's own
     /// token wallet until `claim`.
     pub owed: Vec<(AccountId, U128)>,
-}
-
-/// Sent in the `msg` of a token transfer to open (or move) the position right after the deposit.
-#[derive(Deserialize, Serialize, Clone)]
-#[serde(crate = "near_sdk::serde")]
-pub struct OpenMsg {
-    pub left_point: i32,
-    pub right_point: i32,
 }
 
 /// A price this contract read itself for a user's pool (v1.3): what the agent's next action is
@@ -350,6 +373,121 @@ pub fn min_amounts(left: i32, right: i32, current: i32, x: u128, y: u128, slippa
     (floor(mx), floor(my))
 }
 
+/// Per-token totals (v1.5), under raw keys beside the state so the v1.4 state needs no new layout;
+/// `migrate` rebuilds both from the records.
+///   · owed_total: payouts users' wallets refused, held in this contract's own token wallet until
+///     `claim`;
+///   · ledger_total: what all ledgers hold on this contract's Rhea balance. Whatever that balance
+///     holds beyond it belongs to no ledger, and `settle` gives it to the user whose step Rhea
+///     carried out but this contract could not measure.
+fn total_key(kind: &str, token: &AccountId) -> Vec<u8> {
+    [kind.as_bytes(), b":", token.as_bytes()].concat()
+}
+fn read_total(kind: &str, token: &AccountId) -> u128 {
+    env::storage_read(&total_key(kind, token)).and_then(|v| <[u8; 16]>::try_from(v.as_slice()).ok()).map(u128::from_le_bytes).unwrap_or(0)
+}
+fn write_total(kind: &str, token: &AccountId, total: u128) {
+    if total == 0 {
+        env::storage_remove(&total_key(kind, token));
+    } else {
+        env::storage_write(&total_key(kind, token), &total.to_le_bytes());
+    }
+}
+fn owed_total(token: &AccountId) -> u128 {
+    read_total("owed_total", token)
+}
+fn set_owed_total(token: &AccountId, total: u128) {
+    write_total("owed_total", token, total);
+}
+fn ledger_total(token: &AccountId) -> u128 {
+    read_total("ledger_total", token)
+}
+fn set_ledger_total(token: &AccountId, total: u128) {
+    write_total("ledger_total", token, total);
+}
+
+/// Users with a step Rhea carried out that this contract could not measure (v1.5): until `settle`
+/// runs, nothing new starts (deposits come back, no opens or agent moves); every way out works.
+const UNSETTLED: &[u8] = b"unsettled";
+fn unsettled() -> Vec<AccountId> {
+    env::storage_read(UNSETTLED).and_then(|v| near_sdk::serde_json::from_slice(&v).ok()).unwrap_or_default()
+}
+fn set_unsettled(list: &[AccountId]) {
+    if list.is_empty() {
+        env::storage_remove(UNSETTLED);
+    } else {
+        env::storage_write(UNSETTLED, &near_sdk::serde_json::to_vec(list).unwrap_or_default());
+    }
+}
+fn mark_unsettled(user: &AccountId, why: &str) {
+    let mut list = unsettled();
+    if !list.contains(user) {
+        list.push(user.clone());
+    }
+    set_unsettled(&list);
+    emit("unsettled", json!({ "user": user, "why": why }));
+}
+
+/// What a remove_liquidity call came back with (v1.5): the amounts, a refusal, or a success whose
+/// answer this code does not recognise (a Rhea upgrade changed it). Read by hand, so an answer in a
+/// new shape never makes a callback panic.
+pub enum Removed {
+    Amounts(u128, u128),
+    Refused,
+    Unknown,
+}
+fn json_u128(v: &Value) -> Option<u128> {
+    match v {
+        Value::String(s) => s.parse().ok(),
+        Value::Number(n) => n.as_u64().map(u128::from),
+        _ => None,
+    }
+}
+pub fn parse_amounts(bytes: &[u8]) -> Option<(u128, u128)> {
+    let v: Value = near_sdk::serde_json::from_slice(bytes).ok()?;
+    match &v {
+        Value::Array(a) if a.len() == 2 => Some((json_u128(&a[0])?, json_u128(&a[1])?)),
+        Value::Object(o) => Some((json_u128(o.get("amount_x")?)?, json_u128(o.get("amount_y")?)?)),
+        _ => None,
+    }
+}
+fn removed_result() -> Removed {
+    match env::promise_result_checked(0, 512) {
+        Err(PromiseError::Failed) => Removed::Refused,
+        Err(_) => Removed::Unknown,
+        Ok(bytes) => parse_amounts(&bytes).map_or(Removed::Unknown, |(x, y)| Removed::Amounts(x, y)),
+    }
+}
+/// What add_liquidity came back with: the new position's id, a refusal, or an id this code cannot read.
+pub enum Added {
+    Id(String),
+    Refused,
+    Unknown,
+}
+pub fn parse_lpt_id(bytes: &[u8]) -> Option<String> {
+    let v: Value = near_sdk::serde_json::from_slice(bytes).ok()?;
+    let id = match &v {
+        Value::String(s) => s.clone(),
+        Value::Object(o) => o.get("lpt_id")?.as_str()?.to_string(),
+        _ => return None,
+    };
+    if id.is_empty() || id.len() > 256 { None } else { Some(id) }
+}
+fn added_result() -> Added {
+    match env::promise_result_checked(0, 1024) {
+        Err(PromiseError::Failed) => Added::Refused,
+        Err(_) => Added::Unknown,
+        Ok(bytes) => parse_lpt_id(&bytes).map_or(Added::Unknown, Added::Id),
+    }
+}
+/// How a close went: credited, closed but not measured (see `settle`), or refused (still open).
+#[derive(PartialEq, Debug)]
+pub enum Close {
+    Closed,
+    Unmeasured,
+    Refused,
+}
+
 /// What an add left over: lent minus what this contract's Rhea balance lost during it.
 pub fn leftover(lent: u128, before: u128, after: u128) -> u128 {
     let paid = before.saturating_sub(after).min(lent);
@@ -368,10 +506,13 @@ impl Account {
             Some((_, a)) => a.0 += amount,
             None => self.ledger.push((token.clone(), U128(amount))),
         }
+        set_ledger_total(token, ledger_total(token) + amount);
     }
     fn debit(&mut self, token: &AccountId, amount: u128) {
         if let Some((_, a)) = self.ledger.iter_mut().find(|(t, _)| t == token) {
-            a.0 = a.0.saturating_sub(amount);
+            let taken = amount.min(a.0);
+            a.0 -= taken;
+            set_ledger_total(token, ledger_total(token).saturating_sub(taken));
         }
         self.ledger.retain(|(_, a)| a.0 > 0);
     }
@@ -381,15 +522,13 @@ impl Account {
             None => self.owed.push((token.clone(), U128(amount))),
         }
     }
-    /// The next ledger token to pay out: other tokens first (their payout may be refused and needs
-    /// a callback), wNEAR last (NEAR cannot be refused).
-    fn next_payout(&self, wnear: &AccountId) -> Option<(AccountId, u128)> {
+    fn owed_of(&self, token: &AccountId) -> u128 {
+        self.owed.iter().find(|(t, _)| t == token).map(|(_, a)| a.0).unwrap_or(0)
+    }
+    /// The pool tokens on the ledger, for cash out (both move side by side).
+    fn payout_legs(&self) -> Vec<(AccountId, U128)> {
         let (x, y) = self.pool_tokens();
-        let mut order = [x, y];
-        if order[0] == *wnear {
-            order.swap(0, 1);
-        }
-        order.into_iter().map(|t| (self.held(&t), t)).find(|(a, _)| *a > 0).map(|(a, t)| (t, a))
+        [x, y].into_iter().map(|t| (self.held(&t), t)).filter(|(a, _)| *a > 0).map(|(a, t)| (t, U128(a))).collect()
     }
     fn pool_id(&self) -> &str {
         &self.policy.allowed_pools[0]
@@ -403,6 +542,13 @@ impl Account {
     fn note_point(&mut self, point: i32) {
         self.high_point = Some(self.high_point.map_or(point, |h| h.max(point)));
         self.low_point = Some(self.low_point.map_or(point, |l| l.min(point)));
+    }
+    /// v1.5: the marks move only as far as the price held at two reads (`then`, 3 to 60 minutes
+    /// before `now`): the high to at most the lower of the two, the low to at least the higher.
+    fn note_confirmed(&mut self, then: i32, now: i32) {
+        let (held_high, held_low) = (then.min(now), then.max(now));
+        self.high_point = Some(self.high_point.map_or(held_high, |h| h.max(held_high)));
+        self.low_point = Some(self.low_point.map_or(held_low, |l| l.min(held_low)));
     }
 }
 
@@ -430,9 +576,16 @@ impl Guardian {
     /// Private. From v1.4 (a redeploy): the state as it is. From v1.3 (the upgrade through
     /// `execute`): everything kept (owner, queue, prices, pause), plus an empty take-profit table.
     /// From v1.2: the records, plus `owner`, an empty queue and no prices seen yet.
+    /// Every path (v1.5): the per-token totals of what is owed are rebuilt from the records.
     #[private]
     #[init(ignore_state)]
     pub fn migrate(owner: AccountId) -> Self {
+        let g = Self::migrated(owner);
+        g.seed_owed_totals();
+        g
+    }
+
+    fn migrated(owner: AccountId) -> Self {
         let raw = env::storage_read(b"STATE").unwrap_or_else(|| env::panic_str("No state to migrate"));
         if let Ok(current) = near_sdk::borsh::from_slice::<Guardian>(&raw) {
             return current;
@@ -656,6 +809,9 @@ impl Guardian {
         if acct.position.is_some() || !acct.ledger.is_empty() || !acct.owed.is_empty() {
             env::panic_str("Close your position and withdraw first");
         }
+        if unsettled().contains(&user) {
+            env::panic_str("Run settle first: Rhea holds tokens of yours this contract could not measure");
+        }
         // A step in flight could still credit this account.
         self.assert_free();
         self.accounts.remove(&user);
@@ -691,12 +847,12 @@ impl Guardian {
         self.accounts.insert(user, acct);
     }
 
-    // ---------- deposit: one token transfer, optionally opening the position ----------
+    // ---------- deposit: one token transfer, measured ----------
 
     /// A pool token arrives for `sender_id`: forwarded onto this contract's Rhea balance and credited
-    /// to their ledger. `msg` empty: deposit only; `{"left_point":..,"right_point":..}`: then open
-    /// (or move) the position with everything they hold. While another step runs, the whole
-    /// transfer goes back to the sender at once (try again in a moment).
+    /// to their ledger with what that balance actually grew by (v1.5). `msg` must be empty: to place
+    /// the tokens, call `open` next (the page sends both in one wallet request). While another step
+    /// runs, or while paused, the whole transfer goes back to the sender at once.
     pub fn ft_on_transfer(&mut self, sender_id: AccountId, amount: U128, msg: String) -> PromiseOrValue<U128> {
         let token = env::predecessor_account_id();
         let acct = self.account(&sender_id);
@@ -704,18 +860,9 @@ impl Guardian {
         if token != x && token != y {
             env::panic_str("This token is not in your pool");
         }
-        let open: Option<OpenMsg> = if msg.trim().is_empty() { None } else { Some(near_sdk::serde_json::from_str(&msg).unwrap_or_else(|_| env::panic_str("msg must be empty or {\"left_point\",\"right_point\"}"))) };
-        if let Some(o) = &open {
-            if o.left_point >= o.right_point {
-                refuse(Refusal::BadRange);
-            }
-            // Moving a position inside a deposit's chain would need more gas than a token transfer
-            // passes on: deposit first, then `open` (the page sends both in one wallet request).
-            if acct.position.is_some() {
-                env::panic_str("You have a position: deposit without a range, then move it with open");
-            }
+        if !msg.trim().is_empty() {
+            env::panic_str("Deposit with an empty msg, then call open: a deposit no longer opens a range itself (v1.5)");
         }
-        // Paused: the whole transfer goes back to the sender at once.
         if self.paused {
             emit("paused_refund", json!({ "user": sender_id, "token": token, "amount": amount }));
             return PromiseOrValue::Value(amount);
@@ -724,30 +871,69 @@ impl Guardian {
             emit("busy", json!({ "user": sender_id, "token": token, "amount": amount }));
             return PromiseOrValue::Value(amount);
         }
+        if !unsettled().is_empty() {
+            emit("unsettled_refund", json!({ "user": sender_id, "token": token, "amount": amount }));
+            return PromiseOrValue::Value(amount);
+        }
         self.lock();
         PromiseOrValue::Promise(
-            call(&token, "ft_transfer_call", json!({ "receiver_id": self.dcl, "amount": amount, "msg": "\"Deposit\"" }), ONE_YOCTO, tg(T_FT_CALL))
-                .then(Self::ext(env::current_account_id()).with_static_gas(tg(if open.is_some() { CB_FORWARDED_OPEN } else { CB_OWN })).with_unused_gas_weight(2).on_forwarded(sender_id, token, amount, open)),
+            view(&self.dcl, "list_user_assets", json!({ "account_id": env::current_account_id() }))
+                .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_DEP_BEFORE)).with_unused_gas_weight(2).on_deposit_before(sender_id, token, amount)),
         )
     }
 
-    /// Credits what Rhea took and returns the rest to the sender; then opens if asked.
+    /// The Rhea balance before the forward is known: forward the tokens.
     #[private]
-    pub fn on_forwarded(&mut self, user: AccountId, token: AccountId, amount: U128, open: Option<OpenMsg>, #[callback_result] used: Result<U128, PromiseError>) -> U128 {
-        let taken = used.map(|u| u.0).unwrap_or(0).min(amount.0);
-        let mut acct = self.account(&user);
-        acct.credit(&token, taken);
-        let pool_id = acct.pool_id().to_string();
-        self.accounts.insert(user.clone(), acct);
-        emit("deposited", json!({ "user": user, "token": token, "amount": U128(taken), "returned": U128(amount.0 - taken) }));
-        match open {
-            Some(o) if taken > 0 => {
-                // Still locked: the move continues the same step.
-                self.begin_move(user, RebalanceRequest { pool_id, left_point: o.left_point, right_point: o.right_point }, false).detach();
-            }
-            _ => self.unlock(),
+    pub fn on_deposit_before(&mut self, user: AccountId, token: AccountId, amount: U128, #[callback_result] assets: Result<HashMap<AccountId, U128>, PromiseError>) -> PromiseOrValue<U128> {
+        let Ok(assets) = assets else {
+            // Nothing was forwarded: the whole transfer goes back.
+            emit("deposit_refused", json!({ "user": user, "token": token, "amount": amount, "why": "could not read the balance on Rhea DCL" }));
+            self.unlock();
+            return PromiseOrValue::Value(amount);
+        };
+        let before = assets.get(&token).map(|a| a.0).unwrap_or(0);
+        PromiseOrValue::Promise(
+            call(&token, "ft_transfer_call", json!({ "receiver_id": self.dcl, "amount": amount, "msg": "\"Deposit\"" }), ONE_YOCTO, tg(T_FT_CALL))
+                .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_FORWARDED)).with_unused_gas_weight(2).on_forwarded(user, token, amount, U128(before))),
+        )
+    }
+
+    /// The token reports what Rhea took; read the Rhea balance again before crediting anything.
+    #[private]
+    pub fn on_forwarded(&mut self, user: AccountId, token: AccountId, amount: U128, before: U128, #[callback_result] used: Result<U128, PromiseError>) -> PromiseOrValue<U128> {
+        let reported = used.map(|u| u.0).unwrap_or(0).min(amount.0);
+        if reported == 0 {
+            emit("deposited", json!({ "user": user, "token": token, "amount": U128(0), "returned": amount }));
+            self.unlock();
+            return PromiseOrValue::Value(amount);
         }
-        U128(amount.0 - taken)
+        PromiseOrValue::Promise(
+            view(&self.dcl, "list_user_assets", json!({ "account_id": env::current_account_id() }))
+                .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_DEP_MEASURED)).with_unused_gas_weight(2).on_deposit_measured(user, token, amount, before, U128(reported))),
+        )
+    }
+
+    /// Credits the smaller of what the Rhea balance grew by and what the token reported; returns to
+    /// the sender what the token says came back.
+    #[private]
+    pub fn on_deposit_measured(&mut self, user: AccountId, token: AccountId, amount: U128, before: U128, reported: U128, #[callback_result] assets: Result<HashMap<AccountId, U128>, PromiseError>) -> U128 {
+        let mut acct = self.account(&user);
+        match assets {
+            Ok(after) => {
+                let grew = after.get(&token).map(|a| a.0).unwrap_or(0).saturating_sub(before.0);
+                let taken = grew.min(reported.0);
+                if taken < reported.0 {
+                    emit("deposit_short", json!({ "user": user, "token": token, "reported": reported, "measured": U128(grew) }));
+                }
+                acct.credit(&token, taken);
+                emit("deposited", json!({ "user": user, "token": token, "amount": U128(taken), "returned": U128(amount.0 - reported.0) }));
+            }
+            // Could not read the balance: nothing is trusted from the token; settle credits what Rhea got.
+            Err(_) => mark_unsettled(&user, "the deposit reached Rhea but could not be measured"),
+        }
+        self.accounts.insert(user, acct);
+        self.unlock();
+        U128(amount.0 - reported.0)
     }
 
     // ---------- the position ----------
@@ -755,6 +941,7 @@ impl Guardian {
     /// The user places (or moves) their position: any range in their pool.
     pub fn open(&mut self, left_point: i32, right_point: i32) -> Promise {
         self.assert_running();
+        self.assert_settled();
         let user = env::predecessor_account_id();
         let pool_id = self.account(&user).pool_id().to_string();
         if left_point >= right_point {
@@ -768,6 +955,7 @@ impl Guardian {
     /// The user's agent asks for a new range; checked against the user's policy on-chain.
     pub fn request_rebalance(&mut self, user: AccountId, request: RebalanceRequest) -> Promise {
         self.assert_running();
+        self.assert_settled();
         let acct = self.account(&user);
         if acct.frozen {
             refuse(Refusal::Frozen);
@@ -820,10 +1008,21 @@ impl Guardian {
         if acct.position.is_none() {
             return false;
         }
-        acct.note_point(pool.current_point);
-        emit("point_noted", json!({ "user": user, "current_point": pool.current_point, "high_point": acct.high_point, "low_point": acct.low_point }));
+        let now = now_secs();
+        let cur = pool.current_point;
+        let prev = self.seen.get(&user).cloned();
+        // v1.5: a read younger than SEEN_MIN_AGE_SECS stays as it is, so quick re-pokes neither
+        // restart the confirmation clock nor move the marks.
+        if prev.as_ref().is_some_and(|p| now < p.at_secs.saturating_add(SEEN_MIN_AGE_SECS)) {
+            return false;
+        }
+        // The best price moves only as far as the price held at this read and one 3–60 min earlier.
+        if let Some(p) = prev.filter(|p| check_seen_age(Some(p.at_secs), now).is_ok()) {
+            acct.note_confirmed(p.point, cur);
+        }
+        emit("point_noted", json!({ "user": user, "current_point": cur, "high_point": acct.high_point, "low_point": acct.low_point }));
         self.accounts.insert(user.clone(), acct);
-        self.seen.insert(user, Seen { point: pool.current_point, at_secs: now_secs() });
+        self.seen.insert(user, Seen { point: cur, at_secs: now });
         true
     }
 
@@ -895,11 +1094,12 @@ impl Guardian {
     }
 
     #[private]
-    pub fn on_removed_then_add(&mut self, user: AccountId, request: RebalanceRequest, pool: PoolView, #[callback_result] removed: Result<(U128, U128), PromiseError>) -> PromiseOrValue<bool> {
-        if !self.credit_removed(&user, &pool, removed) {
-            return self.bail(&user, "Rhea DCL refused to close the position; it stays open");
+    pub fn on_removed_then_add(&mut self, user: AccountId, request: RebalanceRequest, pool: PoolView) -> PromiseOrValue<bool> {
+        match self.credit_removed(&user, &pool, removed_result()) {
+            Close::Refused => self.bail(&user, "Rhea DCL refused to close the position; it stays open"),
+            Close::Unmeasured => self.bail(&user, "The old range closed but Rhea's answer could not be read: run settle, then open again"),
+            Close::Closed => self.snapshot_then_add(user, request, pool),
         }
-        self.snapshot_then_add(user, request, pool)
     }
 
     /// Reads this contract's Rhea balance right before the add (the ledger takes the difference).
@@ -941,9 +1141,22 @@ impl Guardian {
 
     /// `lent_before`: [lent_x, lent_y, before_x, before_y].
     #[private]
-    pub fn on_added(&mut self, user: AccountId, request: RebalanceRequest, pool: PoolView, lent_before: [U128; 4], #[callback_result] lpt_id: Result<String, PromiseError>) -> PromiseOrValue<bool> {
+    pub fn on_added(&mut self, user: AccountId, request: RebalanceRequest, pool: PoolView, lent_before: [U128; 4]) -> PromiseOrValue<bool> {
+        self.added(user, request, pool, lent_before, added_result())
+    }
+
+    fn added(&mut self, user: AccountId, request: RebalanceRequest, pool: PoolView, lent_before: [U128; 4], added: Added) -> PromiseOrValue<bool> {
         let [lent_x, lent_y, _, _] = lent_before;
-        let Ok(lpt_id) = lpt_id else {
+        if let Added::Unknown = added {
+            // Rhea opened a position whose id this code cannot read: the leftovers are still measured
+            // back onto the ledger; the position itself needs RecoverPosition (reported).
+            emit("position_unrecorded", json!({ "user": user, "pool_id": request.pool_id, "left_point": request.left_point, "right_point": request.right_point }));
+            return PromiseOrValue::Promise(
+                view(&self.dcl, "list_user_assets", json!({ "account_id": env::current_account_id() }))
+                    .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_OWN)).with_unused_gas_weight(2).on_measured(user, pool, lent_before)),
+            );
+        }
+        let Added::Id(lpt_id) = added else {
             // Rhea refused: nothing left the contract's Rhea balance; the tokens are the user's again.
             let mut acct = self.account(&user);
             acct.credit(&pool.token_x, lent_x.0);
@@ -973,8 +1186,8 @@ impl Guardian {
                 acct.credit(&pool.token_x, leftover(lent_x.0, before_x.0, after_x));
                 acct.credit(&pool.token_y, leftover(lent_y.0, before_y.0, after_y));
             }
-            // Could not read the balance: keep the leftover unassigned rather than guess (reported).
-            Err(_) => emit("leftover_unmeasured", json!({ "user": user })),
+            // Could not read the balance: nothing is guessed; settle credits what the add left.
+            Err(_) => mark_unsettled(&user, "the add's leftover could not be measured"),
         }
         self.accounts.insert(user, acct);
         self.unlock();
@@ -1056,20 +1269,45 @@ impl Guardian {
     }
 
     #[private]
-    pub fn on_exited(&mut self, user: AccountId, pool: PoolView, #[callback_result] removed: Result<(U128, U128), PromiseError>) -> bool {
-        if !self.credit_removed(&user, &pool, removed) {
+    pub fn on_exited(&mut self, user: AccountId, pool: PoolView) -> bool {
+        self.exited(user, pool, removed_result())
+    }
+
+    fn exited(&mut self, user: AccountId, pool: PoolView, removed: Removed) -> bool {
+        let close = self.credit_removed(&user, &pool, removed);
+        if close == Close::Refused {
             let _ = self.bail(&user, "Rhea DCL refused to close the position; it stays open");
             return false;
         }
         // The position it was set for is closed: a take-profit target never outlives it.
         self.take_profit.remove(&user);
         self.unlock();
-        true
+        close == Close::Closed
     }
 
     /// v1.4, the user only: the target at which the agent may close the position for profit,
     /// with its direction (above: the point rising to it). None removes it. Allowed while paused:
     /// it only ever leads to a way out.
+    /// The user takes the fees their position earned without closing it (v1.5): Rhea's
+    /// remove_liquidity with amount 0 moves only the fees onto this contract's Rhea balance, and they
+    /// are credited to the user's ledger. With `send`, they go on to the wallet in the same
+    /// transaction (measured like every payout). The position, its range, the exit rule's marks and
+    /// the take-profit target stay as they are. The user only; works while paused.
+    pub fn claim_fees(&mut self, send: bool) -> Promise {
+        let user = env::predecessor_account_id();
+        let Some(pos) = self.account(&user).position else { env::panic_str("No open position") };
+        self.assert_free();
+        self.lock();
+        emit("fees_claim_started", json!({ "user": user, "lpt_id": pos.lpt_id, "send": send }));
+        call(&self.dcl, "remove_liquidity", remove_args(&pos.lpt_id, U128(0)), ZERO, tg(T_REMOVE))
+            .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_FEES)).with_unused_gas_weight(2).on_fees_claimed(user, send))
+    }
+
+    #[private]
+    pub fn on_fees_claimed(&mut self, user: AccountId, send: bool) -> PromiseOrValue<bool> {
+        self.fees_claimed(user, send, removed_result())
+    }
+
     pub fn set_take_profit(&mut self, target: Option<TakeProfit>) {
         let user = env::predecessor_account_id();
         let acct = self.account(&user);
@@ -1092,8 +1330,9 @@ impl Guardian {
     }
 
     /// Sends the user `amount` (or all) of a pool token from their ledger: Rhea pays this contract,
-    /// this contract pays the user. wNEAR arrives as NEAR. Needs no agent and no policy.
-    pub fn withdraw(&mut self, token: AccountId, amount: Option<U128>) -> Promise {
+    /// this contract pays the user what arrived (v1.5: a tax token keeps part of it on the way out
+    /// of Rhea). wNEAR arrives as NEAR. Needs no agent and no policy.
+    pub fn withdraw(&mut self, token: AccountId, amount: Option<U128>) -> PromiseOrValue<bool> {
         let user = env::predecessor_account_id();
         let mut acct = self.account(&user);
         let held = acct.held(&token);
@@ -1105,58 +1344,29 @@ impl Guardian {
         self.lock();
         acct.debit(&token, amount);
         self.accounts.insert(user.clone(), acct);
-        let wnear = token == self.wnear;
-        emit("withdraw_started", json!({ "user": user, "token": token, "amount": U128(amount) }));
-        // wNEAR: Rhea unwraps and sends NEAR to this contract; other tokens: it transfers them here.
-        call(&self.dcl, "withdraw_asset", json!({ "token_id": token, "amount": U128(amount), "skip_unwrap_near": !wnear }), ZERO, tg(T_WITHDRAW))
-            .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_WITHDRAWN)).with_unused_gas_weight(2).on_withdrawn(user, token, U128(amount), wnear))
-    }
-
-    #[private]
-    pub fn on_withdrawn(&mut self, user: AccountId, token: AccountId, amount: U128, wnear: bool, #[callback_result] paid: Result<Value, PromiseError>) -> PromiseOrValue<bool> {
-        if paid.is_err() {
-            // Rhea kept the tokens: they are the user's again.
-            let mut acct = self.account(&user);
-            acct.credit(&token, amount.0);
-            self.accounts.insert(user.clone(), acct);
-            return self.bail(&user, "Rhea DCL did not release the tokens; they stay on your ledger");
-        }
-        if wnear {
-            // NEAR to an existing account cannot be refused.
-            self.unlock();
-            emit("withdrawn", json!({ "user": user, "token": token, "amount": amount }));
-            return PromiseOrValue::Promise(Promise::new(user).transfer(NearToken::from_yoctonear(amount.0)));
-        }
-        PromiseOrValue::Promise(
-            call(&token, "ft_transfer", json!({ "receiver_id": user, "amount": amount }), ONE_YOCTO, tg(T_TRANSFER))
-                .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_OWN)).with_unused_gas_weight(2).on_paid(user, token, amount)),
-        )
-    }
-
-    /// The token refused the payout (e.g. the user is not registered on it): the tokens stay in this
-    /// contract's token wallet, owed to the user until `claim`. Nothing is lost, no further call.
-    #[private]
-    pub fn on_paid(&mut self, user: AccountId, token: AccountId, amount: U128, #[callback_result] sent: Result<(), PromiseError>) -> bool {
-        self.unlock();
-        self.settle_payout(&user, &token, amount, sent.is_ok())
+        self.pay_out(user, vec![(token, U128(amount))], None)
     }
 
     /// Pays what a refused payout left owed, from this contract's own token wallet (Rhea is not
-    /// involved, so no lock). A second refusal keeps it owed.
+    /// involved). v1.5: reads that wallet first and pays at most what it holds beyond what it owes
+    /// others; the claim clears the debt either way (a shortfall is reported), so nothing owed can
+    /// keep a user from leaving. A second refusal keeps what was sent owed.
     pub fn claim(&mut self, token: AccountId) -> Promise {
         let user = env::predecessor_account_id();
-        let mut acct = self.account(&user);
+        let acct = self.account(&user);
         // Locked so the user cannot `leave` before a second refusal is written back.
         self.assert_free();
-        self.lock();
-        let amount = acct.owed.iter().find(|(t, _)| *t == token).map(|(_, a)| a.0).unwrap_or(0);
-        if amount == 0 {
+        if acct.owed_of(&token) == 0 {
             env::panic_str("Nothing owed in this token");
         }
-        acct.owed.retain(|(t, _)| *t != token);
-        self.accounts.insert(user.clone(), acct);
-        call(&token, "ft_transfer", json!({ "receiver_id": user, "amount": U128(amount) }), ONE_YOCTO, tg(T_TRANSFER))
-            .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_OWN)).with_unused_gas_weight(2).on_claimed(user, token, U128(amount)))
+        self.lock();
+        view(&token, "ft_balance_of", json!({ "account_id": env::current_account_id() }))
+            .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_CLAIM_MEASURED)).with_unused_gas_weight(2).on_claim_measured(user, token))
+    }
+
+    #[private]
+    pub fn on_claim_measured(&mut self, user: AccountId, token: AccountId, #[callback_result] balance: Result<U128, PromiseError>) -> PromiseOrValue<bool> {
+        self.claim_measured(user, token, balance.ok().map(|b| b.0))
     }
 
     #[private]
@@ -1165,17 +1375,48 @@ impl Guardian {
         self.settle_payout(&user, &token, amount, sent.is_ok())
     }
 
+    // ---------- payouts (v1.5): every token measured where it lands ----------
+
+    /// After the withdrawals: each token Rhea released is read where it landed; one it kept goes
+    /// back on the ledger.
+    #[private]
+    pub fn on_out_withdrawn(&mut self, user: AccountId, legs: Vec<(AccountId, U128)>, cash: Option<bool>) -> PromiseOrValue<bool> {
+        let released = (0..legs.len()).map(|i| match env::promise_result_checked(i as u64, 16) {
+            Ok(v) => v != b"false",
+            Err(PromiseError::Failed) => false,
+            // Succeeded with a longer answer than a bool.
+            Err(_) => true,
+        });
+        let released = released.collect();
+        self.out_withdrawn(user, legs, cash, released)
+    }
+
+    /// After the reads: each user is paid what arrived.
+    #[private]
+    pub fn on_out_arrived(&mut self, user: AccountId, legs: Vec<(AccountId, U128)>, cash: Option<bool>) -> PromiseOrValue<bool> {
+        let balances = (0..legs.len()).map(|i| env::promise_result_checked(i as u64, 64).ok().and_then(|v| near_sdk::serde_json::from_slice::<U128>(&v).ok()).map(|b| b.0));
+        let balances = balances.collect();
+        self.out_arrived(user, legs, cash, balances)
+    }
+
+    /// After the transfers: a refused one is owed (see `claim`).
+    #[private]
+    pub fn on_out_paid(&mut self, user: AccountId, legs: Vec<(AccountId, U128)>, cash: Option<bool>) -> PromiseOrValue<bool> {
+        let sent = (0..legs.len()).map(|i| !matches!(env::promise_result_checked(i as u64, 0), Err(PromiseError::Failed))).collect();
+        self.out_paid(user, legs, cash, sent)
+    }
+
     // ---------- cash out: one approval for the whole way out ----------
 
     /// Closes the position (if open), sends every pool token on the ledger to the wallet (wNEAR
     /// arrives as NEAR) and, with `leave`, removes the record and returns the join deposit. The
-    /// user only. Each step that fails stops the chain with the tokens on the ledger, where `exit`
-    /// and `withdraw` (which forward all unused gas) still reach them.
+    /// user only. A step that fails leaves the tokens on the ledger, where `exit` and `withdraw`
+    /// (which forward all unused gas) still reach them.
     pub fn cash_out(&mut self, leave: bool) -> PromiseOrValue<bool> {
         let user = env::predecessor_account_id();
         let acct = self.account(&user);
         self.assert_free();
-        if acct.position.is_none() && acct.next_payout(&self.wnear).is_none() {
+        if acct.position.is_none() && acct.payout_legs().is_empty() {
             if !leave {
                 env::panic_str("Nothing to cash out");
             }
@@ -1183,7 +1424,7 @@ impl Guardian {
         }
         self.lock();
         emit("cash_out_started", json!({ "user": user, "leave": leave }));
-        let Some(pos) = acct.position else { return self.pay_next(user, leave) };
+        let Some(pos) = acct.position else { return self.pay_all(user, leave) };
         PromiseOrValue::Promise(
             view(&self.dcl, "get_liquidity", json!({ "lpt_id": pos.lpt_id }))
                 .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_LIQ_CASH)).with_unused_gas_weight(1).on_liquidity_for_cash_out(user, leave)),
@@ -1201,44 +1442,25 @@ impl Guardian {
     }
 
     #[private]
-    pub fn on_cash_out_closed(&mut self, user: AccountId, leave: bool, #[callback_result] removed: Result<(U128, U128), PromiseError>) -> PromiseOrValue<bool> {
+    pub fn on_cash_out_closed(&mut self, user: AccountId, leave: bool) -> PromiseOrValue<bool> {
+        self.cash_out_closed(user, leave, removed_result())
+    }
+
+    fn cash_out_closed(&mut self, user: AccountId, leave: bool, removed: Removed) -> PromiseOrValue<bool> {
         let (token_x, token_y) = self.account(&user).pool_tokens();
         let pool = PoolView { token_x, token_y, current_point: 0 };
-        if !self.credit_removed(&user, &pool, removed) {
-            return self.bail(&user, "Rhea DCL refused to close the position; it stays open");
+        match self.credit_removed(&user, &pool, removed) {
+            Close::Refused => self.bail(&user, "Rhea DCL refused to close the position; it stays open"),
+            Close::Unmeasured => {
+                self.take_profit.remove(&user);
+                self.bail(&user, "The position closed but Rhea's answer could not be read: run settle, then cash out again")
+            }
+            Close::Closed => {
+                // The position closed: its take-profit target goes with it.
+                self.take_profit.remove(&user);
+                self.pay_all(user, leave)
+            }
         }
-        // The position closed: its take-profit target goes with it.
-        self.take_profit.remove(&user);
-        self.pay_next(user, leave)
-    }
-
-    #[private]
-    pub fn on_cash_out_withdrawn(&mut self, user: AccountId, token: AccountId, amount: U128, leave: bool, #[callback_result] paid: Result<Value, PromiseError>) -> PromiseOrValue<bool> {
-        if paid.is_err() {
-            let mut acct = self.account(&user);
-            acct.credit(&token, amount.0);
-            self.accounts.insert(user.clone(), acct);
-            return self.bail(&user, "Rhea DCL did not release the tokens; they stay on your ledger");
-        }
-        if token == self.wnear {
-            emit("withdrawn", json!({ "user": user, "token": token, "amount": amount }));
-            // NEAR to an existing account cannot be refused; the chain goes on beside it.
-            let _ = Promise::new(user.clone()).transfer(NearToken::from_yoctonear(amount.0));
-            return self.pay_next(user, leave);
-        }
-        let acct = self.account(&user);
-        let (x, y) = acct.pool_tokens();
-        let left = [x, y].iter().filter(|t| acct.held(t) > 0).count() as u64;
-        PromiseOrValue::Promise(
-            call_fixed(&token, "ft_transfer", json!({ "receiver_id": user, "amount": amount }), ONE_YOCTO, tg(T_TRANSFER))
-                .then(Self::ext(env::current_account_id()).with_static_gas(tg(cash_paid_floor(left))).with_unused_gas_weight(1).on_cash_out_paid(user, token, amount, leave)),
-        )
-    }
-
-    #[private]
-    pub fn on_cash_out_paid(&mut self, user: AccountId, token: AccountId, amount: U128, leave: bool, #[callback_result] sent: Result<(), PromiseError>) -> PromiseOrValue<bool> {
-        self.settle_payout(&user, &token, amount, sent.is_ok());
-        self.pay_next(user, leave)
     }
 
     // ---------- recovery: an admin action (owner proposes, delay, anyone runs) ----------
@@ -1269,6 +1491,12 @@ impl Guardian {
         if self.paused != paused {
             self.paused = paused;
             emit(if paused { "paused" } else { "resumed" }, json!({ "by": env::predecessor_account_id() }));
+        }
+    }
+
+    fn assert_settled(&self) {
+        if !unsettled().is_empty() {
+            env::panic_str("A step could not be measured: run settle first (anyone can); ways out still work");
         }
     }
 
@@ -1312,7 +1540,8 @@ impl Guardian {
             "pending": self.pending.len(),
             "staged": self.staged,
             "seen_age_secs": [SEEN_MIN_AGE_SECS, SEEN_MAX_AGE_SECS],
-            "paused": self.paused
+            "paused": self.paused,
+            "unsettled": unsettled()
         })
     }
 
@@ -1324,6 +1553,21 @@ impl Guardian {
     /// The last price `poke` read for a user's pool.
     pub fn get_seen(&self, user: AccountId) -> Option<Seen> {
         self.seen.get(&user).cloned()
+    }
+
+    /// What all ledgers hold of `token` on this contract's Rhea balance (v1.5).
+    pub fn get_ledger_total(&self, token: AccountId) -> U128 {
+        U128(ledger_total(&token))
+    }
+
+    /// Users a step could not measure for, waiting for `settle` (v1.5).
+    pub fn get_unsettled(&self) -> Vec<AccountId> {
+        unsettled()
+    }
+
+    /// What this contract owes users in `token`, held in its own token wallet (v1.5).
+    pub fn get_owed_total(&self, token: AccountId) -> U128 {
+        U128(owed_total(&token))
     }
 
     // ---------- helpers ----------
@@ -1358,7 +1602,8 @@ impl Guardian {
         PromiseOrValue::Value(false)
     }
 
-    /// The end of one payout: sent, or refused and owed to the user (see `claim`).
+    /// The end of one payout: sent, or refused and owed to the user (see `claim`). What is owed stays
+    /// in this contract's own token wallet and is counted in its `owed_total`.
     fn settle_payout(&mut self, user: &AccountId, token: &AccountId, amount: U128, sent: bool) -> bool {
         if sent {
             emit("withdrawn", json!({ "user": user, "token": token, "amount": amount }));
@@ -1367,50 +1612,286 @@ impl Guardian {
         let mut acct = self.account(user);
         acct.owe(token, amount.0);
         self.accounts.insert(user.clone(), acct);
+        set_owed_total(token, owed_total(token) + amount.0);
         emit("payout_refused", json!({ "user": user, "token": token, "amount": amount, "why": "Your wallet refused the token (register on it), use claim" }));
         false
     }
 
-    /// Cash out's next step: withdraw the next ledger token from Rhea, or, with the ledger empty,
-    /// end the chain (and leave, if asked and nothing is owed).
-    fn pay_next(&mut self, user: AccountId, leave: bool) -> PromiseOrValue<bool> {
-        let mut acct = self.account(&user);
-        let Some((token, amount)) = acct.next_payout(&self.wnear) else {
-            self.unlock();
-            emit("cash_out_done", json!({ "user": user }));
-            if leave && acct.position.is_none() && acct.owed.is_empty() {
-                self.accounts.remove(&user);
-                self.users.remove(&user);
-                self.seen.remove(&user);
-                self.take_profit.remove(&user);
-                emit("left", json!({ "user": user }));
-                return PromiseOrValue::Promise(Promise::new(user).transfer(JOIN_DEPOSIT));
+    /// The fees Rhea moved onto this contract's balance are the user's; with `send`, they go out.
+    fn fees_claimed(&mut self, user: AccountId, send: bool, fees: Removed) -> PromiseOrValue<bool> {
+        let (fx, fy) = match fees {
+            Removed::Amounts(x, y) => (U128(x), U128(y)),
+            Removed::Refused => return self.bail(&user, "Rhea DCL did not release the fees; the position is unchanged"),
+            Removed::Unknown => {
+                mark_unsettled(&user, "Rhea released the fees but its answer could not be read");
+                return self.bail(&user, "The fees left the position but Rhea's answer could not be read: run settle");
             }
-            return PromiseOrValue::Value(true);
         };
+        let mut acct = self.account(&user);
         let (x, y) = acct.pool_tokens();
-        let n = [x, y].iter().filter(|t| acct.held(t) > 0).count() as u64;
-        acct.debit(&token, amount);
+        acct.credit(&x, fx.0);
+        acct.credit(&y, fy.0);
+        emit("fees_claimed", json!({ "user": user, "lpt_id": acct.position.as_ref().map(|p| &p.lpt_id), "amount_x": fx, "amount_y": fy }));
+        let legs: Vec<(AccountId, U128)> = [(x, fx), (y, fy)].into_iter().filter(|(_, a)| send && a.0 > 0).collect();
+        for (token, amount) in &legs {
+            acct.debit(token, amount.0);
+        }
         self.accounts.insert(user.clone(), acct);
-        let wnear = token == self.wnear;
-        emit("withdraw_started", json!({ "user": user, "token": token, "amount": U128(amount) }));
+        if legs.is_empty() {
+            self.unlock();
+            return PromiseOrValue::Value(true);
+        }
+        self.pay_out(user, legs, None)
+    }
+
+    /// Cash out's payout: every pool token on the ledger, side by side.
+    fn pay_all(&mut self, user: AccountId, leave: bool) -> PromiseOrValue<bool> {
+        let mut acct = self.account(&user);
+        let legs = acct.payout_legs();
+        for (token, amount) in &legs {
+            acct.debit(token, amount.0);
+        }
+        self.accounts.insert(user.clone(), acct);
+        self.pay_out(user, legs, Some(leave))
+    }
+
+    /// Withdraws each leg (already off the ledger) from Rhea, side by side. `cash` is None for a
+    /// withdraw and Some(leave) for a cash out.
+    fn pay_out(&mut self, user: AccountId, legs: Vec<(AccountId, U128)>, cash: Option<bool>) -> PromiseOrValue<bool> {
+        let ft = legs.iter().filter(|(t, _)| *t != self.wnear).count() as u64;
+        // A withdraw forwards its unused gas to Rhea; cash out keeps fixed budgets (see call_fixed).
+        let rhea = if cash.is_none() { call } else { call_fixed };
+        let mut out: Option<Promise> = None;
+        for (token, amount) in &legs {
+            emit("withdraw_started", json!({ "user": user, "token": token, "amount": amount }));
+            // wNEAR: Rhea unwraps and sends NEAR to this contract; other tokens: it transfers them here.
+            let p = rhea(&self.dcl, "withdraw_asset", json!({ "token_id": token, "amount": amount, "skip_unwrap_near": *token != self.wnear }), ZERO, tg(T_WITHDRAW));
+            out = Some(match out {
+                Some(o) => o.and(p),
+                None => p,
+            });
+        }
+        let Some(out) = out else { return self.out_done(user, cash, true) };
+        PromiseOrValue::Promise(out.then(Self::ext(env::current_account_id()).with_static_gas(tg(cb_out_withdrawn(ft))).with_unused_gas_weight(2).on_out_withdrawn(user, legs, cash)))
+    }
+
+    fn out_withdrawn(&mut self, user: AccountId, legs: Vec<(AccountId, U128)>, cash: Option<bool>, released: Vec<bool>) -> PromiseOrValue<bool> {
+        let mut acct = self.account(&user);
+        let (mut arrived, mut all) = (Vec::new(), true);
+        for ((token, amount), released) in legs.into_iter().zip(released) {
+            if !released {
+                // Rhea kept the tokens: they are the user's again.
+                acct.credit(&token, amount.0);
+                all = false;
+                emit("refused", json!({ "user": user, "token": token, "why": "Rhea DCL did not release the tokens; they stay on your ledger" }));
+            } else if token == self.wnear {
+                // NEAR to an existing account cannot be refused; it goes out beside the rest.
+                emit("withdrawn", json!({ "user": user, "token": token, "amount": amount }));
+                let _ = Promise::new(user.clone()).transfer(NearToken::from_yoctonear(amount.0));
+            } else {
+                arrived.push((token, amount));
+            }
+        }
+        self.accounts.insert(user.clone(), acct);
+        let me = env::current_account_id();
+        let mut reads: Option<Promise> = None;
+        for (token, _) in &arrived {
+            let p = view(token, "ft_balance_of", json!({ "account_id": me }));
+            reads = Some(match reads {
+                Some(r) => r.and(p),
+                None => p,
+            });
+        }
+        let Some(reads) = reads else { return self.out_done(user, cash, all) };
+        let ft = arrived.len() as u64;
+        PromiseOrValue::Promise(reads.then(Self::ext(me).with_static_gas(tg(cb_out_arrived(ft))).with_unused_gas_weight(2).on_out_arrived(user, arrived, cash)))
+    }
+
+    /// What arrived is everything in this contract's token wallet beyond what it owes users, and
+    /// never more than Rhea released. A balance that could not be read is owed in full: `claim`
+    /// reads again and never pays out of what others are owed.
+    fn out_arrived(&mut self, user: AccountId, legs: Vec<(AccountId, U128)>, cash: Option<bool>, balances: Vec<Option<u128>>) -> PromiseOrValue<bool> {
+        let mut acct = self.account(&user);
+        let mut sends = Vec::new();
+        for ((token, amount), balance) in legs.into_iter().zip(balances) {
+            let owed = owed_total(&token);
+            let Some(balance) = balance else {
+                acct.owe(&token, amount.0);
+                set_owed_total(&token, owed + amount.0);
+                emit("payout_unmeasured", json!({ "user": user, "token": token, "amount": amount, "why": "Could not read what arrived; use claim" }));
+                continue;
+            };
+            let got = balance.saturating_sub(owed).min(amount.0);
+            if got == 0 {
+                // Rhea said it released them, yet nothing arrived: whatever is still on Rhea goes back
+                // to this user through settle (it is off every ledger now).
+                mark_unsettled(&user, "Rhea reported a payout but nothing arrived");
+                continue;
+            }
+            if got < amount.0 {
+                emit("payout_short", json!({ "user": user, "token": token, "released": amount, "arrived": U128(got) }));
+            }
+            if got > 0 {
+                sends.push((token, U128(got)));
+            }
+        }
+        self.accounts.insert(user.clone(), acct);
+        let mut transfers: Option<Promise> = None;
+        for (token, got) in &sends {
+            let p = call(token, "ft_transfer", json!({ "receiver_id": user, "amount": got }), ONE_YOCTO, tg(T_TRANSFER));
+            transfers = Some(match transfers {
+                Some(t) => t.and(p),
+                None => p,
+            });
+        }
+        let Some(transfers) = transfers else { return self.out_done(user, cash, false) };
+        PromiseOrValue::Promise(transfers.then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_OUT_PAID)).with_unused_gas_weight(2).on_out_paid(user, sends, cash)))
+    }
+
+    fn out_paid(&mut self, user: AccountId, legs: Vec<(AccountId, U128)>, cash: Option<bool>, sent: Vec<bool>) -> PromiseOrValue<bool> {
+        let mut all = true;
+        for ((token, amount), sent) in legs.into_iter().zip(sent) {
+            all &= self.settle_payout(&user, &token, amount, sent);
+        }
+        self.out_done(user, cash, all)
+    }
+
+    /// The end of a payout. A cash out with `leave` removes the record once nothing is left (no
+    /// position, empty ledger, nothing owed) and returns the join deposit.
+    fn out_done(&mut self, user: AccountId, cash: Option<bool>, all: bool) -> PromiseOrValue<bool> {
+        self.unlock();
+        let Some(leave) = cash else { return PromiseOrValue::Value(all) };
+        emit("cash_out_done", json!({ "user": user }));
+        let acct = self.account(&user);
+        if leave && acct.position.is_none() && acct.ledger.is_empty() && acct.owed.is_empty() && !unsettled().contains(&user) {
+            self.accounts.remove(&user);
+            self.users.remove(&user);
+            self.seen.remove(&user);
+            self.take_profit.remove(&user);
+            emit("left", json!({ "user": user }));
+            return PromiseOrValue::Promise(Promise::new(user).transfer(JOIN_DEPOSIT));
+        }
+        PromiseOrValue::Value(all)
+    }
+
+    /// A claim, once this contract's token balance is known: pays the smaller of what is owed and
+    /// what the wallet holds beyond what others are owed, and clears the debt.
+    fn claim_measured(&mut self, user: AccountId, token: AccountId, balance: Option<u128>) -> PromiseOrValue<bool> {
+        let Some(balance) = balance else { return self.bail(&user, "Could not read this contract's token balance; nothing changed, try again") };
+        let mut acct = self.account(&user);
+        let owed = acct.owed_of(&token);
+        let others = owed_total(&token).saturating_sub(owed);
+        let pay = owed.min(balance.saturating_sub(others));
+        acct.owed.retain(|(t, _)| *t != token);
+        self.accounts.insert(user.clone(), acct);
+        set_owed_total(&token, others);
+        if pay < owed {
+            emit("claim_short", json!({ "user": user, "token": token, "owed": U128(owed), "paid": U128(pay) }));
+        }
+        if pay == 0 {
+            self.unlock();
+            return PromiseOrValue::Value(false);
+        }
         PromiseOrValue::Promise(
-            call_fixed(&self.dcl, "withdraw_asset", json!({ "token_id": token, "amount": U128(amount), "skip_unwrap_near": !wnear }), ZERO, tg(T_WITHDRAW))
-                .then(Self::ext(env::current_account_id()).with_static_gas(tg(cash_withdrawn_floor(n))).with_unused_gas_weight(1).on_cash_out_withdrawn(user, token, U128(amount), leave)),
+            call(&token, "ft_transfer", json!({ "receiver_id": user, "amount": U128(pay) }), ONE_YOCTO, tg(T_TRANSFER))
+                .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_OWN)).with_unused_gas_weight(2).on_claimed(user, token, U128(pay))),
         )
     }
 
+    /// Rebuilds `owed_total` and `ledger_total` from the records (run by `migrate`): for every pool
+    /// token of every user, the sums of what users are owed and hold in it.
+    fn seed_owed_totals(&self) {
+        let mut owed: HashMap<AccountId, u128> = HashMap::new();
+        let mut held: HashMap<AccountId, u128> = HashMap::new();
+        for user in self.users.iter() {
+            let Some(a) = self.accounts.get(user) else { continue };
+            let (x, y) = a.pool_tokens();
+            for t in [x, y] {
+                owed.entry(t.clone()).or_default();
+                held.entry(t).or_default();
+            }
+            for (token, amount) in &a.owed {
+                *owed.entry(token.clone()).or_default() += amount.0;
+            }
+            for (token, amount) in &a.ledger {
+                *held.entry(token.clone()).or_default() += amount.0;
+            }
+        }
+        for (token, total) in owed {
+            set_owed_total(&token, total);
+        }
+        for (token, total) in held {
+            set_ledger_total(&token, total);
+        }
+    }
+
     /// After remove_liquidity: the position is gone and the removed amounts are the user's again.
-    fn credit_removed(&mut self, user: &AccountId, pool: &PoolView, removed: Result<(U128, U128), PromiseError>) -> bool {
-        let Ok((rx, ry)) = removed else { return false };
+    /// When Rhea's answer cannot be read, the position is still gone from Rhea: the record says so,
+    /// nothing is guessed, and the user is marked for `settle`.
+    fn credit_removed(&mut self, user: &AccountId, pool: &PoolView, removed: Removed) -> Close {
+        let (rx, ry, close) = match removed {
+            Removed::Refused => return Close::Refused,
+            Removed::Amounts(x, y) => (x, y, Close::Closed),
+            Removed::Unknown => (0, 0, Close::Unmeasured),
+        };
         let mut acct = self.account(user);
-        acct.credit(&pool.token_x, rx.0);
-        acct.credit(&pool.token_y, ry.0);
+        acct.credit(&pool.token_x, rx);
+        acct.credit(&pool.token_y, ry);
         let was = acct.position.take();
         acct.high_point = None;
         acct.low_point = None;
         self.accounts.insert(user.clone(), acct);
-        emit("position_closed", json!({ "user": user, "lpt_id": was.map(|p| p.lpt_id), "amount_x": rx, "amount_y": ry }));
+        if close == Close::Unmeasured {
+            mark_unsettled(user, "Rhea closed the position but its answer could not be read");
+        }
+        emit("position_closed", json!({ "user": user, "lpt_id": was.map(|p| p.lpt_id), "amount_x": U128(rx), "amount_y": U128(ry), "measured": close == Close::Closed }));
+        close
+    }
+
+    // ---------- settle (v1.5): anyone may run it ----------
+
+    /// Credits the one unsettled user with what this contract's Rhea balance holds beyond all ledgers,
+    /// for each of their pool tokens. That surplus can only come from the step that marked them (every
+    /// other step is measured and the lock runs them one at a time). With more than one user marked,
+    /// the owner sorts it out through RecoverCredit.
+    pub fn settle(&mut self) -> Promise {
+        let list = unsettled();
+        if list.is_empty() {
+            env::panic_str("Nothing to settle");
+        }
+        if list.len() > 1 {
+            env::panic_str("More than one unmeasured step: the owner settles them (RecoverCredit)");
+        }
+        self.assert_free();
+        self.lock();
+        let user = list[0].clone();
+        view(&self.dcl, "list_user_assets", json!({ "account_id": env::current_account_id() }))
+            .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_OWN)).with_unused_gas_weight(2).on_settle_read(user))
+    }
+
+    #[private]
+    pub fn on_settle_read(&mut self, user: AccountId, #[callback_result] assets: Result<HashMap<AccountId, U128>, PromiseError>) -> bool {
+        let Ok(assets) = assets else {
+            let _ = self.bail(&user, "Could not read the balances on Rhea DCL; nothing changed, run settle again");
+            return false;
+        };
+        self.settled(user, &assets)
+    }
+
+    fn settled(&mut self, user: AccountId, assets: &HashMap<AccountId, U128>) -> bool {
+        self.unlock();
+        let mut acct = self.account(&user);
+        let (x, y) = acct.pool_tokens();
+        let mut credited = Vec::new();
+        for token in [x, y] {
+            let on_rhea = assets.get(&token).map(|a| a.0).unwrap_or(0);
+            let surplus = on_rhea.saturating_sub(ledger_total(&token));
+            acct.credit(&token, surplus);
+            credited.push((token, U128(surplus)));
+        }
+        self.accounts.insert(user.clone(), acct);
+        set_unsettled(&unsettled().into_iter().filter(|u| *u != user).collect::<Vec<_>>());
+        emit("settled", json!({ "user": user, "credited": credited }));
         true
     }
 }
@@ -1445,6 +1926,14 @@ mod tests {
     }
     fn held(g: &Guardian, who: &str, token: &str) -> u128 {
         g.get_account(acc(who)).unwrap().held(&acc(token))
+    }
+    fn assets(token: &str, amount: u128) -> Result<HashMap<AccountId, U128>, PromiseError> {
+        Ok(HashMap::from([(acc(token), U128(amount))]))
+    }
+    /// A measured deposit (v1.5) that Rhea took whole: the Rhea balance grew by exactly `amount`.
+    fn deposited(g: &mut Guardian, who: &str, token: &str, amount: u128) {
+        ctx("guardian.testnet", ZERO);
+        assert_eq!(g.on_deposit_measured(acc(who), acc(token), U128(amount), U128(1_000), U128(amount), assets(token, 1_000 + amount)), U128(0));
     }
 
     #[test]
@@ -1495,16 +1984,45 @@ mod tests {
     #[test]
     fn deposits_credit_what_rhea_took_and_return_the_rest() {
         let mut g = joined();
-        ctx("guardian.testnet", ZERO);
-        assert_eq!(g.on_forwarded(acc("alice.testnet"), acc("tkq.testnet"), U128(5), None, Ok(U128(5))), U128(0));
+        deposited(&mut g, "alice.testnet", "tkq.testnet", 5);
         assert_eq!(held(&g, "alice.testnet", "tkq.testnet"), 5);
         // Rhea took only part: that part is credited, the rest goes back to the sender.
-        assert_eq!(g.on_forwarded(acc("alice.testnet"), acc("tkq.testnet"), U128(7), None, Ok(U128(3))), U128(4));
+        ctx("guardian.testnet", ZERO);
+        assert_eq!(g.on_deposit_measured(acc("alice.testnet"), acc("tkq.testnet"), U128(7), U128(100), U128(3), assets("tkq.testnet", 103)), U128(4));
         assert_eq!(held(&g, "alice.testnet", "tkq.testnet"), 8);
-        // Rhea failed: nothing credited, all of it back.
-        assert_eq!(g.on_forwarded(acc("alice.testnet"), acc("tkq.testnet"), U128(9), None, Err(PromiseError::Failed)), U128(9));
+        // Rhea failed: nothing credited, all of it back, and no second read.
+        g.lock();
+        assert!(matches!(g.on_forwarded(acc("alice.testnet"), acc("tkq.testnet"), U128(9), U128(100), Err(PromiseError::Failed)), PromiseOrValue::Value(U128(9))));
         assert_eq!(held(&g, "alice.testnet", "tkq.testnet"), 8);
-        assert!(!g.is_busy(), "deposit-only steps release the lock");
+        assert!(!g.is_busy(), "deposit steps release the lock");
+    }
+
+    #[test]
+    fn a_token_that_over_reports_is_credited_only_what_rhea_got() {
+        // M2 (review 30 Oct): the token says Rhea took 10, Rhea's balance grew by 2.
+        let mut g = joined();
+        ctx("guardian.testnet", ZERO);
+        g.lock();
+        assert_eq!(g.on_deposit_measured(acc("alice.testnet"), acc("tkq.testnet"), U128(10), U128(500), U128(10), assets("tkq.testnet", 502)), U128(0));
+        assert_eq!(held(&g, "alice.testnet", "tkq.testnet"), 2);
+        assert!(!g.is_busy());
+        // A balance that did not grow at all (or shrank) credits nothing.
+        assert_eq!(g.on_deposit_measured(acc("alice.testnet"), acc("tkq.testnet"), U128(10), U128(500), U128(10), assets("tkq.testnet", 400)), U128(0));
+        assert_eq!(held(&g, "alice.testnet", "tkq.testnet"), 2);
+    }
+
+    #[test]
+    fn an_unreadable_balance_credits_nothing_and_unlocks() {
+        let mut g = joined();
+        ctx("guardian.testnet", ZERO);
+        g.lock();
+        assert_eq!(g.on_deposit_measured(acc("alice.testnet"), acc("tkq.testnet"), U128(5), U128(0), U128(5), Err(PromiseError::Failed)), U128(0));
+        assert_eq!(held(&g, "alice.testnet", "tkq.testnet"), 0);
+        assert!(!g.is_busy());
+        // The first read failed: nothing was forwarded, the whole transfer goes back.
+        g.lock();
+        assert!(matches!(g.on_deposit_before(acc("alice.testnet"), acc("tkq.testnet"), U128(5), Err(PromiseError::Failed)), PromiseOrValue::Value(U128(5))));
+        assert!(!g.is_busy());
     }
 
     #[test]
@@ -1526,7 +2044,7 @@ mod tests {
         g.lock();
         let pool = PoolView { token_x: acc("tkq.testnet"), token_y: acc("wrap.testnet"), current_point: 0 };
         let req = RebalanceRequest { pool_id: POOL.into(), left_point: -1400, right_point: 1400 };
-        let r = g.on_added(acc("alice.testnet"), req, pool, [U128(10), U128(20), U128(0), U128(0)], Err(PromiseError::Failed));
+        let r = g.added(acc("alice.testnet"), req, pool, [U128(10), U128(20), U128(0), U128(0)], Added::Refused);
         assert!(matches!(r, PromiseOrValue::Value(false)));
         assert_eq!((held(&g, "alice.testnet", "tkq.testnet"), held(&g, "alice.testnet", "wrap.testnet")), (10, 20));
         assert!(!g.is_busy());
@@ -1545,31 +2063,317 @@ mod tests {
         assert!(!g.is_busy());
     }
 
+    fn owed(g: &Guardian, who: &str) -> Vec<(AccountId, U128)> {
+        g.get_account(acc(who)).unwrap().owed
+    }
+    fn refused_payout(g: &mut Guardian, who: &str, token: &str, amount: u128) {
+        ctx("guardian.testnet", ZERO);
+        g.lock();
+        assert!(matches!(g.out_paid(acc(who), vec![(acc(token), U128(amount))], None, vec![false]), PromiseOrValue::Value(false)));
+    }
+
     #[test]
     fn a_refused_payout_is_owed_and_claimable() {
         let mut g = joined();
-        ctx("guardian.testnet", ZERO);
-        g.lock();
-        assert!(!g.on_paid(acc("alice.testnet"), acc("tkq.testnet"), U128(42), Err(PromiseError::Failed)));
-        assert_eq!(g.get_account(acc("alice.testnet")).unwrap().owed, vec![(acc("tkq.testnet"), U128(42))]);
+        refused_payout(&mut g, "alice.testnet", "tkq.testnet", 42);
+        assert_eq!(owed(&g, "alice.testnet"), vec![(acc("tkq.testnet"), U128(42))]);
+        assert_eq!(g.get_owed_total(acc("tkq.testnet")), U128(42), "counted in the total");
         assert!(!g.is_busy());
         ctx("alice.testnet", ZERO);
-        // A claim takes it off; a second refusal puts it back.
+        // A claim reads the wallet first; the debt moves only once the balance is known.
         let _ = g.claim(acc("tkq.testnet"));
-        assert!(g.get_account(acc("alice.testnet")).unwrap().owed.is_empty());
         assert!(g.is_busy(), "a claim holds the lock until its callback");
+        assert_eq!(owed(&g, "alice.testnet"), vec![(acc("tkq.testnet"), U128(42))]);
         ctx("guardian.testnet", ZERO);
+        assert!(matches!(g.claim_measured(acc("alice.testnet"), acc("tkq.testnet"), Some(42)), PromiseOrValue::Promise(_)));
+        assert!(owed(&g, "alice.testnet").is_empty());
+        assert_eq!(g.get_owed_total(acc("tkq.testnet")), U128(0));
+        // A second refusal puts it back.
         assert!(!g.on_claimed(acc("alice.testnet"), acc("tkq.testnet"), U128(42), Err(PromiseError::Failed)));
-        assert_eq!(g.get_account(acc("alice.testnet")).unwrap().owed, vec![(acc("tkq.testnet"), U128(42))]);
+        assert_eq!(owed(&g, "alice.testnet"), vec![(acc("tkq.testnet"), U128(42))]);
+        assert_eq!(g.get_owed_total(acc("tkq.testnet")), U128(42));
         assert!(!g.is_busy());
+    }
+
+    #[test]
+    fn an_unreadable_balance_leaves_a_claim_unchanged() {
+        let mut g = joined();
+        refused_payout(&mut g, "alice.testnet", "tkq.testnet", 42);
+        ctx("alice.testnet", ZERO);
+        let _ = g.claim(acc("tkq.testnet"));
+        ctx("guardian.testnet", ZERO);
+        assert!(matches!(g.claim_measured(acc("alice.testnet"), acc("tkq.testnet"), None), PromiseOrValue::Value(false)));
+        assert_eq!(owed(&g, "alice.testnet"), vec![(acc("tkq.testnet"), U128(42))]);
+        assert_eq!(g.get_owed_total(acc("tkq.testnet")), U128(42));
+        assert!(!g.is_busy());
+    }
+
+    #[test]
+    fn a_tax_token_payout_sends_what_arrived_never_what_others_are_owed() {
+        let mut g = joined();
+        // Bob is owed 7 tkq already (his wallet refused a payout): it sits in the contract's wallet.
+        ctx("bob.testnet", JOIN_DEPOSIT);
+        g.join(policy(), None);
+        refused_payout(&mut g, "bob.testnet", "tkq.testnet", 7);
+        g.unlock();
+        deposited(&mut g, "alice.testnet", "tkq.testnet", 100);
+        ctx("alice.testnet", ZERO);
+        assert!(matches!(g.withdraw(acc("tkq.testnet"), None), PromiseOrValue::Promise(_)));
+        assert_eq!(held(&g, "alice.testnet", "tkq.testnet"), 0, "off the ledger when the withdraw starts");
+        ctx("guardian.testnet", ZERO);
+        assert!(matches!(g.out_withdrawn(acc("alice.testnet"), vec![(acc("tkq.testnet"), U128(100))], None, vec![true]), PromiseOrValue::Promise(_)), "released: read where it landed");
+        // 1% tax on the way out of Rhea: 99 arrived, beside Bob's 7.
+        assert!(matches!(g.out_arrived(acc("alice.testnet"), vec![(acc("tkq.testnet"), U128(100))], None, vec![Some(7 + 99)]), PromiseOrValue::Promise(_)));
+        assert!(near_sdk::test_utils::get_logs().iter().any(|l| l.contains("payout_short") && l.contains("\"arrived\":\"99\"")), "pays 99, not 100");
+        // Her wallet refuses: she is owed exactly the 99.
+        assert!(matches!(g.out_paid(acc("alice.testnet"), vec![(acc("tkq.testnet"), U128(99))], None, vec![false]), PromiseOrValue::Value(false)));
+        assert_eq!(owed(&g, "alice.testnet"), vec![(acc("tkq.testnet"), U128(99))]);
+        assert_eq!(g.get_owed_total(acc("tkq.testnet")), U128(106));
+        assert!(!g.is_busy());
+        // Less arrived than even that (the wallet holds only Bob's 7 and 50 more): never Bob's share.
+        deposited(&mut g, "alice.testnet", "tkq.testnet", 100);
+        ctx("guardian.testnet", ZERO);
+        g.lock();
+        assert!(matches!(g.out_arrived(acc("alice.testnet"), vec![(acc("tkq.testnet"), U128(100))], None, vec![Some(106 + 50)]), PromiseOrValue::Promise(_)));
+        assert!(near_sdk::test_utils::get_logs().iter().any(|l| l.contains("\"arrived\":\"50\"")));
+        // Nothing arrived at all: nothing sent, the chain ends unlocked.
+        assert!(matches!(g.out_arrived(acc("alice.testnet"), vec![(acc("tkq.testnet"), U128(100))], None, vec![Some(106)]), PromiseOrValue::Value(false)));
+        assert!(!g.is_busy());
+    }
+
+    #[test]
+    fn an_unread_payout_is_owed_and_the_claim_pays_only_what_is_there() {
+        let mut g = joined();
+        ctx("bob.testnet", JOIN_DEPOSIT);
+        g.join(policy(), None);
+        refused_payout(&mut g, "bob.testnet", "tkq.testnet", 7);
+        // Alice's 100 were released but the balance could not be read: owed in full, for claim.
+        ctx("guardian.testnet", ZERO);
+        assert!(matches!(g.out_arrived(acc("alice.testnet"), vec![(acc("tkq.testnet"), U128(100))], None, vec![None]), PromiseOrValue::Value(false)));
+        assert_eq!(owed(&g, "alice.testnet"), vec![(acc("tkq.testnet"), U128(100))]);
+        assert_eq!(g.get_owed_total(acc("tkq.testnet")), U128(107));
+        // Only 99 had arrived (tax): the claim pays 99, leaves Bob's 7, and clears her debt.
+        ctx("alice.testnet", ZERO);
+        let _ = g.claim(acc("tkq.testnet"));
+        ctx("guardian.testnet", ZERO);
+        assert!(matches!(g.claim_measured(acc("alice.testnet"), acc("tkq.testnet"), Some(7 + 99)), PromiseOrValue::Promise(_)));
+        assert!(near_sdk::test_utils::get_logs().iter().any(|l| l.contains("claim_short") && l.contains("\"paid\":\"99\"")));
+        assert!(owed(&g, "alice.testnet").is_empty(), "nothing owed keeps her from leaving");
+        assert_eq!(g.get_owed_total(acc("tkq.testnet")), U128(7), "Bob's share untouched");
+    }
+
+    #[test]
+    fn claim_fees_credits_the_fees_and_keeps_the_position() {
+        let mut g = joined();
+        with_position(&mut g);
+        let before = g.get_account(acc("alice.testnet")).unwrap();
+        let (hx, hy) = (before.held(&acc("tkq.testnet")), before.held(&acc("wrap.testnet")));
+        ctx("alice.testnet", ZERO);
+        let _ = g.claim_fees(false);
+        assert!(g.is_busy());
+        ctx("guardian.testnet", ZERO);
+        assert!(matches!(g.fees_claimed(acc("alice.testnet"), false, Removed::Amounts(3, 4)), PromiseOrValue::Value(true)));
+        let a = g.get_account(acc("alice.testnet")).unwrap();
+        assert_eq!((a.held(&acc("tkq.testnet")), a.held(&acc("wrap.testnet"))), (hx + 3, hy + 4), "fees on the ledger");
+        assert_eq!(a.position, before.position, "the position stays");
+        assert_eq!((a.high_point, a.low_point), (before.high_point, before.low_point), "the exit rule's marks stay");
+        assert!(!g.is_busy());
+    }
+
+    #[test]
+    fn claim_fees_can_send_them_on_and_a_refusal_changes_nothing() {
+        let mut g = joined();
+        with_position(&mut g);
+        let before = g.get_account(acc("alice.testnet")).unwrap();
+        ctx("alice.testnet", ZERO);
+        let _ = g.claim_fees(true);
+        ctx("guardian.testnet", ZERO);
+        // Sent: the fees go out by the measured payout (only the token that earned any).
+        assert!(matches!(g.fees_claimed(acc("alice.testnet"), true, Removed::Amounts(0, 4)), PromiseOrValue::Promise(_)));
+        assert!(g.is_busy(), "locked until the payout ends");
+        assert_eq!(g.get_account(acc("alice.testnet")).unwrap().ledger, before.ledger, "the fees went straight out");
+        g.unlock();
+        // Rhea refused: nothing changes, unlocked.
+        ctx("alice.testnet", ZERO);
+        let _ = g.claim_fees(true);
+        ctx("guardian.testnet", ZERO);
+        assert!(matches!(g.fees_claimed(acc("alice.testnet"), true, Removed::Refused), PromiseOrValue::Value(false)));
+        assert_eq!(g.get_account(acc("alice.testnet")).unwrap().ledger, before.ledger);
+        assert!(!g.is_busy());
+    }
+
+    #[test]
+    #[should_panic(expected = "No open position")]
+    fn claim_fees_needs_a_position() {
+        let mut g = joined();
+        ctx("alice.testnet", ZERO);
+        let _ = g.claim_fees(false);
+    }
+
+    fn assets2(x: u128, y: u128) -> HashMap<AccountId, U128> {
+        HashMap::from([(acc("tkq.testnet"), U128(x)), (acc("wrap.testnet"), U128(y))])
+    }
+    fn tkq_pool() -> PoolView {
+        PoolView { token_x: acc("tkq.testnet"), token_y: acc("wrap.testnet"), current_point: 0 }
+    }
+
+    #[test]
+    fn ledger_total_follows_every_credit_and_debit() {
+        let mut g = joined();
+        deposited(&mut g, "alice.testnet", "tkq.testnet", 100);
+        assert_eq!(g.get_ledger_total(acc("tkq.testnet")), U128(100));
+        ctx("alice.testnet", ZERO);
+        let _ = g.withdraw(acc("tkq.testnet"), Some(U128(40)));
+        assert_eq!(g.get_ledger_total(acc("tkq.testnet")), U128(60), "debited when the withdraw starts");
+        // A debit larger than the ledger only takes what is there.
+        let mut a = g.get_account(acc("alice.testnet")).unwrap();
+        a.debit(&acc("tkq.testnet"), 1_000);
+        assert_eq!(g.get_ledger_total(acc("tkq.testnet")), U128(0));
+    }
+
+    #[test]
+    fn rhea_answers_are_read_in_any_shape_they_come_in() {
+        assert_eq!(parse_amounts(br#"["3","4"]"#), Some((3, 4)));
+        assert_eq!(parse_amounts(b"[3,4]"), Some((3, 4)));
+        assert_eq!(parse_amounts(br#"{"amount_x":"5","amount_y":"6","fees":"1"}"#), Some((5, 6)));
+        assert_eq!(parse_amounts(br#""x""#), None);
+        assert_eq!(parse_amounts(b"[1]"), None);
+        assert_eq!(parse_amounts(b"not json"), None);
+        assert_eq!(parse_lpt_id(br#""tkq|wrap|10000#3""#), Some("tkq|wrap|10000#3".into()));
+        assert_eq!(parse_lpt_id(br#"{"lpt_id":"z#1"}"#), Some("z#1".into()));
+        assert_eq!(parse_lpt_id(b"5"), None);
+        assert_eq!(parse_lpt_id(br#""""#), None);
+    }
+
+    #[test]
+    fn an_unreadable_close_marks_the_user_and_settle_credits_what_rhea_released() {
+        let mut g = joined();
+        with_position(&mut g);
+        deposited(&mut g, "alice.testnet", "tkq.testnet", 5);
+        // Bob holds 9 tkq on the same Rhea balance: settle must never give them to Alice.
+        ctx("bob.testnet", JOIN_DEPOSIT);
+        g.join(policy(), None);
+        deposited(&mut g, "bob.testnet", "tkq.testnet", 9);
+        ctx("guardian.testnet", ZERO);
+        g.lock();
+        // Rhea closed the position but answered in a shape this code does not know.
+        assert!(!g.exited(acc("alice.testnet"), tkq_pool(), Removed::Unknown));
+        assert!(g.get_account(acc("alice.testnet")).unwrap().position.is_none(), "the record says the position is gone");
+        assert_eq!(g.get_unsettled(), vec![acc("alice.testnet")]);
+        assert!(!g.is_busy());
+        // Nothing new starts; a deposit comes back whole.
+        ctx("tkq.testnet", ZERO);
+        assert!(matches!(g.ft_on_transfer(acc("bob.testnet"), U128(7), String::new()), PromiseOrValue::Value(U128(7))));
+        ctx("alice.testnet", ZERO);
+        assert!(panics(|| drop(g.open(-1400, 1400))));
+        // Alice cannot leave before her tokens are settled.
+        let mut a = g.get_account(acc("alice.testnet")).unwrap();
+        a.debit(&acc("tkq.testnet"), 5);
+        g.accounts.insert(acc("alice.testnet"), a);
+        assert!(panics(|| drop(g.leave())));
+        deposited(&mut g, "alice.testnet", "tkq.testnet", 5);
+        // Anyone runs settle: Rhea holds 5 + 9 of Alice's and Bob's, plus 30 tkq and 12 wNEAR from the close.
+        ctx("stranger.testnet", ZERO);
+        let _ = g.settle();
+        assert!(g.is_busy());
+        ctx("guardian.testnet", ZERO);
+        assert!(g.settled(acc("alice.testnet"), &assets2(5 + 9 + 30, 12)));
+        assert_eq!((held(&g, "alice.testnet", "tkq.testnet"), held(&g, "alice.testnet", "wrap.testnet")), (35, 12));
+        assert_eq!(held(&g, "bob.testnet", "tkq.testnet"), 9, "Bob's share untouched");
+        assert!(g.get_unsettled().is_empty());
+        assert_eq!(g.get_ledger_total(acc("tkq.testnet")), U128(44));
+        assert!(!g.is_busy());
+    }
+
+    #[test]
+    fn settle_with_nothing_or_two_users_marked_is_refused() {
+        let mut g = joined();
+        ctx("stranger.testnet", ZERO);
+        assert!(panics(|| drop(g.settle())), "nothing to settle");
+        mark_unsettled(&acc("alice.testnet"), "test");
+        mark_unsettled(&acc("bob.testnet"), "test");
+        assert!(panics(|| drop(g.settle())), "two users: the owner sorts it out");
+    }
+
+    #[test]
+    fn a_payout_where_nothing_arrived_is_not_paid_and_waits_for_settle() {
+        let mut g = joined();
+        ctx("guardian.testnet", ZERO);
+        g.lock();
+        assert!(matches!(g.out_arrived(acc("alice.testnet"), vec![(acc("tkq.testnet"), U128(100))], None, vec![Some(0)]), PromiseOrValue::Value(false)));
+        assert_eq!(g.get_unsettled(), vec![acc("alice.testnet")]);
+        assert!(!g.is_busy());
+    }
+
+    #[test]
+    fn unmeasured_deposits_and_leftovers_wait_for_settle() {
+        let mut g = joined();
+        ctx("guardian.testnet", ZERO);
+        g.lock();
+        let _ = g.on_deposit_measured(acc("alice.testnet"), acc("tkq.testnet"), U128(10), U128(1_000), U128(10), Err(PromiseError::Failed));
+        assert_eq!(g.get_unsettled(), vec![acc("alice.testnet")]);
+        assert_eq!(held(&g, "alice.testnet", "tkq.testnet"), 0, "nothing trusted from the token");
+        set_unsettled(&[]);
+        g.lock();
+        let _ = g.on_measured(acc("alice.testnet"), tkq_pool(), [U128(10), U128(20), U128(0), U128(0)], Err(PromiseError::Failed));
+        assert_eq!(g.get_unsettled(), vec![acc("alice.testnet")]);
+        assert!(!g.is_busy());
+    }
+
+    #[test]
+    fn unreadable_fees_or_position_ids_never_panic() {
+        let mut g = joined();
+        with_position(&mut g);
+        ctx("guardian.testnet", ZERO);
+        g.lock();
+        assert!(matches!(g.fees_claimed(acc("alice.testnet"), true, Removed::Unknown), PromiseOrValue::Value(false)));
+        assert!(g.get_account(acc("alice.testnet")).unwrap().position.is_some(), "claiming fees never closes the position");
+        assert_eq!(g.get_unsettled(), vec![acc("alice.testnet")]);
+        assert!(!g.is_busy());
+        // An add whose position id cannot be read: the leftovers are still measured; no record of it.
+        set_unsettled(&[]);
+        let mut a = g.get_account(acc("alice.testnet")).unwrap();
+        a.position = None;
+        g.accounts.insert(acc("alice.testnet"), a);
+        g.lock();
+        let req = RebalanceRequest { pool_id: POOL.into(), left_point: -1400, right_point: 1400 };
+        assert!(matches!(g.added(acc("alice.testnet"), req, tkq_pool(), [U128(10), U128(20), U128(0), U128(0)], Added::Unknown), PromiseOrValue::Promise(_)));
+        assert!(g.get_account(acc("alice.testnet")).unwrap().position.is_none());
+    }
+
+    #[test]
+    fn an_unreadable_cash_out_close_stops_before_paying() {
+        let mut g = joined();
+        with_position(&mut g);
+        ctx("guardian.testnet", ZERO);
+        g.lock();
+        assert!(matches!(g.cash_out_closed(acc("alice.testnet"), true, Removed::Unknown), PromiseOrValue::Value(false)));
+        let a = g.get_account(acc("alice.testnet")).expect("no leaving before settle");
+        assert!(a.position.is_none());
+        assert_eq!(g.get_unsettled(), vec![acc("alice.testnet")]);
+        assert!(!g.is_busy());
+    }
+
+    #[test]
+    fn migrate_rebuilds_the_owed_totals() {
+        let mut g = joined();
+        refused_payout(&mut g, "alice.testnet", "tkq.testnet", 42);
+        set_owed_total(&acc("tkq.testnet"), 999);
+        set_owed_total(&acc("wrap.testnet"), 5);
+        deposited(&mut g, "alice.testnet", "wrap.testnet", 8);
+        set_ledger_total(&acc("wrap.testnet"), 999);
+        g.seed_owed_totals();
+        assert_eq!(g.get_owed_total(acc("tkq.testnet")), U128(42));
+        assert_eq!(g.get_ledger_total(acc("wrap.testnet")), U128(8), "ledger total rebuilt from the records");
+        assert_eq!(g.get_owed_total(acc("wrap.testnet")), U128(0), "a pool token nobody is owed is cleared");
     }
 
     #[test]
     #[should_panic(expected = "Close your position and withdraw first")]
     fn leave_waits_for_what_is_owed() {
         let mut g = joined();
-        ctx("guardian.testnet", ZERO);
-        g.on_paid(acc("alice.testnet"), acc("tkq.testnet"), U128(42), Err(PromiseError::Failed));
+        refused_payout(&mut g, "alice.testnet", "tkq.testnet", 42);
+        g.unlock();
         ctx("alice.testnet", ZERO);
         let _ = g.leave();
     }
@@ -1591,25 +2395,22 @@ mod tests {
     }
 
     #[test]
-    fn cash_out_pays_other_tokens_before_wnear() {
+    fn cash_out_moves_both_tokens_side_by_side() {
         let mut g = joined();
         ctx("guardian.testnet", ZERO);
-        g.on_forwarded(acc("alice.testnet"), acc("wrap.testnet"), U128(9), None, Ok(U128(9)));
-        g.on_forwarded(acc("alice.testnet"), acc("tkq.testnet"), U128(5), None, Ok(U128(5)));
-        let a = g.get_account(acc("alice.testnet")).unwrap();
-        assert_eq!(a.next_payout(&acc("wrap.testnet")), Some((acc("tkq.testnet"), 5)));
-        // The chain: tkq withdrawn and paid, then wNEAR, then the end (and leave).
+        deposited(&mut g, "alice.testnet", "wrap.testnet", 9);
+        deposited(&mut g, "alice.testnet", "tkq.testnet", 5);
         ctx("alice.testnet", ZERO);
         assert!(matches!(g.cash_out(true), PromiseOrValue::Promise(_)));
         assert!(g.is_busy());
-        assert_eq!(held(&g, "alice.testnet", "tkq.testnet"), 0, "debited when its withdraw starts");
+        assert!(g.get_account(acc("alice.testnet")).unwrap().ledger.is_empty(), "both off the ledger when the withdrawals start");
         ctx("guardian.testnet", ZERO);
-        let _ = g.on_cash_out_withdrawn(acc("alice.testnet"), acc("tkq.testnet"), U128(5), true, Ok(Value::Null));
-        // The wallet refused tkq: owed, and the chain goes on to wNEAR.
-        assert!(matches!(g.on_cash_out_paid(acc("alice.testnet"), acc("tkq.testnet"), U128(5), true, Err(PromiseError::Failed)), PromiseOrValue::Promise(_)));
-        assert_eq!(held(&g, "alice.testnet", "wrap.testnet"), 0);
-        let _ = g.on_cash_out_withdrawn(acc("alice.testnet"), acc("wrap.testnet"), U128(9), true, Ok(Value::Null));
-        // Ledger empty: unlocked, but something is owed, so the record stays (no leave).
+        // Both released: wNEAR goes out as NEAR, tkq is read where it landed.
+        let legs = vec![(acc("tkq.testnet"), U128(5)), (acc("wrap.testnet"), U128(9))];
+        assert!(matches!(g.out_withdrawn(acc("alice.testnet"), legs, Some(true), vec![true, true]), PromiseOrValue::Promise(_)));
+        assert!(matches!(g.out_arrived(acc("alice.testnet"), vec![(acc("tkq.testnet"), U128(5))], Some(true), vec![Some(5)]), PromiseOrValue::Promise(_)));
+        // The wallet refused tkq: owed, so the record stays (no leave), unlocked.
+        assert!(matches!(g.out_paid(acc("alice.testnet"), vec![(acc("tkq.testnet"), U128(5))], Some(true), vec![false]), PromiseOrValue::Value(false)));
         assert!(!g.is_busy());
         let a = g.get_account(acc("alice.testnet")).expect("kept while owed");
         assert!(a.ledger.is_empty());
@@ -1617,14 +2418,29 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_cash_out_withdraw_stops_with_the_tokens_on_the_ledger() {
+    fn cash_out_leaves_when_everything_went_out() {
         let mut g = joined();
         ctx("guardian.testnet", ZERO);
-        g.on_forwarded(acc("alice.testnet"), acc("tkq.testnet"), U128(5), None, Ok(U128(5)));
+        deposited(&mut g, "alice.testnet", "tkq.testnet", 5);
         ctx("alice.testnet", ZERO);
         let _ = g.cash_out(true);
         ctx("guardian.testnet", ZERO);
-        assert!(matches!(g.on_cash_out_withdrawn(acc("alice.testnet"), acc("tkq.testnet"), U128(5), true, Err(PromiseError::Failed)), PromiseOrValue::Value(false)));
+        let _ = g.out_withdrawn(acc("alice.testnet"), vec![(acc("tkq.testnet"), U128(5))], Some(true), vec![true]);
+        let _ = g.out_arrived(acc("alice.testnet"), vec![(acc("tkq.testnet"), U128(5))], Some(true), vec![Some(5)]);
+        assert!(matches!(g.out_paid(acc("alice.testnet"), vec![(acc("tkq.testnet"), U128(5))], Some(true), vec![true]), PromiseOrValue::Promise(_)), "the join deposit comes back");
+        assert!(g.get_account(acc("alice.testnet")).is_none());
+        assert!(!g.is_busy());
+    }
+
+    #[test]
+    fn a_refused_cash_out_withdraw_stops_with_the_tokens_on_the_ledger() {
+        let mut g = joined();
+        ctx("guardian.testnet", ZERO);
+        deposited(&mut g, "alice.testnet", "tkq.testnet", 5);
+        ctx("alice.testnet", ZERO);
+        let _ = g.cash_out(true);
+        ctx("guardian.testnet", ZERO);
+        assert!(matches!(g.out_withdrawn(acc("alice.testnet"), vec![(acc("tkq.testnet"), U128(5))], Some(true), vec![false]), PromiseOrValue::Value(false)));
         assert_eq!(held(&g, "alice.testnet", "tkq.testnet"), 5);
         assert!(!g.is_busy());
         assert!(g.get_account(acc("alice.testnet")).is_some());
@@ -1643,7 +2459,7 @@ mod tests {
     fn the_agent_never_opens_from_idle_tokens() {
         let mut g = joined();
         ctx("guardian.testnet", ZERO);
-        g.on_forwarded(acc("alice.testnet"), acc("tkq.testnet"), U128(5), None, Ok(U128(5)));
+        deposited(&mut g, "alice.testnet", "tkq.testnet", 5);
         ctx("agent.testnet", ZERO);
         let _ = g.request_rebalance(acc("alice.testnet"), RebalanceRequest { pool_id: POOL.into(), left_point: -1400, right_point: 1400 });
     }
@@ -1657,42 +2473,100 @@ mod tests {
     }
 
     #[test]
-    fn a_poke_notes_the_best_point() {
+    fn the_best_price_moves_only_when_it_held_at_two_reads() {
+        // N1 (review 30 Oct): one read's spike never becomes the best price the exit rule measures from.
         let mut g = joined();
-        let mut a = g.get_account(acc("alice.testnet")).unwrap();
+        let alice = || acc("alice.testnet");
+        let mut a = g.get_account(alice()).unwrap();
         a.position = Some(PositionRef { lpt_id: "1".into(), pool_id: POOL.into(), left_point: -1400, right_point: 1400 });
         a.note_point(10);
-        g.accounts.insert(acc("alice.testnet"), a);
-        ctx("guardian.testnet", ZERO);
+        g.accounts.insert(alice(), a);
         let pool = |p| Ok(Some(PoolView { token_x: acc("tkq.testnet"), token_y: acc("wrap.testnet"), current_point: p }));
-        assert!(g.on_poked(acc("alice.testnet"), pool(50)));
-        assert!(g.on_poked(acc("alice.testnet"), pool(-30)));
-        let a = g.get_account(acc("alice.testnet")).unwrap();
-        assert_eq!((a.high_point, a.low_point), (Some(50), Some(-30)));
+        let marks = |g: &Guardian| {
+            let a = g.get_account(acc("alice.testnet")).unwrap();
+            (a.high_point, a.low_point)
+        };
+        // A spike to 500: recorded as the price to confirm against, the marks stay.
+        at("guardian.testnet", 1_000);
+        assert!(g.on_poked(alice(), pool(500)));
+        assert_eq!(marks(&g), (Some(10), Some(10)));
+        // A re-poke within 3 minutes changes nothing, not even the recorded price.
+        at("guardian.testnet", 1_060);
+        assert!(!g.on_poked(alice(), pool(900)));
+        assert_eq!(g.get_seen(alice()), Some(Seen { point: 500, at_secs: 1_000 }));
+        // 5 minutes later the price is 40: the spike never held, so the high rises only to 40.
+        at("guardian.testnet", 1_300);
+        assert!(g.on_poked(alice(), pool(40)));
+        assert_eq!(marks(&g), (Some(40), Some(10)));
+        // 60 then 70: the high takes the lower of each pair of reads.
+        at("guardian.testnet", 1_600);
+        assert!(g.on_poked(alice(), pool(60)));
+        assert_eq!(marks(&g), (Some(40), Some(10)));
+        at("guardian.testnet", 1_900);
+        assert!(g.on_poked(alice(), pool(70)));
+        assert_eq!(marks(&g), (Some(60), Some(10)));
+        // A fall lowers the low the same way: only once it held.
+        at("guardian.testnet", 2_200);
+        assert!(g.on_poked(alice(), pool(-30)));
+        assert_eq!(marks(&g), (Some(60), Some(10)));
+        at("guardian.testnet", 2_500);
+        assert!(g.on_poked(alice(), pool(-40)));
+        assert_eq!(marks(&g), (Some(60), Some(-30)));
+        // A read more than an hour old confirms nothing.
+        at("guardian.testnet", 2_500 + 3_700);
+        assert!(g.on_poked(alice(), pool(1_000)));
+        assert_eq!(marks(&g), (Some(60), Some(-30)));
+    }
+
+    #[test]
+    fn a_pushed_mark_cannot_confirm_an_exit_later() {
+        // N1 attack: one pushed read at a poke, then fair reads; the exit rule stays unmet.
+        let mut g = joined();
+        let alice = || acc("alice.testnet");
+        let mut a = g.get_account(alice()).unwrap();
+        a.policy.exit_drop_points = 2_877;
+        a.position = Some(PositionRef { lpt_id: "1".into(), pool_id: POOL.into(), left_point: -1400, right_point: 1400 });
+        a.note_point(0);
+        g.accounts.insert(alice(), a);
+        let pool = |p| Ok(Some(PoolView { token_x: acc("tkq.testnet"), token_y: acc("wrap.testnet"), current_point: p }));
+        at("guardian.testnet", 1_000);
+        g.on_poked(alice(), pool(5_000)); // pushed
+        at("guardian.testnet", 1_300);
+        g.on_poked(alice(), pool(0)); // back to fair
+        at("guardian.testnet", 1_600);
+        g.on_poked(alice(), pool(0));
+        let a = g.get_account(alice()).unwrap();
+        assert_eq!(a.high_point, Some(0), "the pushed read never became the best price");
+        assert_eq!(moved_against(&a.policy, a.high_point, a.low_point, 0), 0);
     }
 
     #[test]
     fn gas_floors_cover_each_chain_within_300_tgas() {
         // Each entry point: what it schedules, plus its own work, must fit a wallet's 300 TGas
         // (a token transfer passes ~270 of it on to ft_on_transfer).
-        let deposit_open = T_FT_CALL + CB_FORWARDED_OPEN + T_OWN;
+        // v1.5: a deposit is read, forwarded and read again; the page attaches 200 TGas to it (a token
+        // passes ~170 on). Opening is its own call (`open`, 300 TGas).
+        let deposit = T_VIEW + CB_DEP_BEFORE + T_OWN;
+        let open_new = T_VIEW + CB_POOL_NEW + T_OWN;
         let agent_move = T_VIEW + CB_POOL_HELD + T_OWN;
         let cash_out = T_VIEW + CB_LIQ_CASH + T_OWN;
         let exit = T_VIEW + CB_POOL_EXIT + T_OWN;
-        let withdraw = T_WITHDRAW + CB_WITHDRAWN + T_OWN;
-        println!("deposit+open {deposit_open}, move {agent_move}, cash_out {cash_out}, exit {exit}, withdraw {withdraw}");
-        assert!(deposit_open <= 265 && agent_move <= 290 && cash_out <= 290 && exit <= 290 && withdraw <= 290);
+        // v1.5: a payout reads where each token landed; cash out moves both tokens side by side.
+        let withdraw = out_floor(1, 1) + T_OWN;
+        let claim = T_VIEW + CB_CLAIM_MEASURED + T_OWN;
+        let claim_fees = T_REMOVE + CB_FEES + T_OWN;
+        assert!(claim_fees <= 290, "claim_fees and send both tokens: {claim_fees}");
+        println!("deposit {deposit}, open {open_new}, move {agent_move}, cash_out {cash_out}, exit {exit}, withdraw {withdraw}, claim {claim}");
+        assert!(deposit <= 160 && open_new <= 290 && agent_move <= 290 && cash_out <= 290 && exit <= 290 && withdraw <= 290 && claim <= 290);
+        assert!(CB_CASH_CLOSED >= T_OWN + out_floor(2, 2), "cash out pays for two tokens that are not wNEAR");
         // The chain behind an add always has its measurement step paid for.
         assert!(CB_ADDED >= T_VIEW + CB_OWN && CB_SNAP_ADD >= T_ADD + CB_ADDED);
     }
 
     #[test]
-    #[should_panic(expected = "deposit without a range, then move it with open")]
-    fn a_deposit_never_moves_an_open_position() {
+    #[should_panic(expected = "Deposit with an empty msg, then call open")]
+    fn a_deposit_never_opens_or_moves_a_position() {
         let mut g = joined();
-        let mut a = g.get_account(acc("alice.testnet")).unwrap();
-        a.position = Some(PositionRef { lpt_id: "1".into(), pool_id: POOL.into(), left_point: -1400, right_point: 1400 });
-        g.accounts.insert(acc("alice.testnet"), a);
         ctx("tkq.testnet", ZERO);
         let _ = g.ft_on_transfer(acc("alice.testnet"), U128(5), r#"{"left_point":0,"right_point":1400}"#.into());
     }
@@ -1852,7 +2726,7 @@ mod tests {
     fn leave_needs_an_empty_ledger() {
         let mut g = joined();
         ctx("guardian.testnet", ZERO);
-        g.on_forwarded(acc("alice.testnet"), acc("tkq.testnet"), U128(5), None, Ok(U128(5)));
+        deposited(&mut g, "alice.testnet", "tkq.testnet", 5);
         ctx("alice.testnet", ZERO);
         let _ = g.leave();
     }
@@ -1885,7 +2759,7 @@ mod tests {
         let mut g = joined();
         with_position(&mut g);
         ctx("guardian.testnet", ZERO);
-        g.on_forwarded(acc("alice.testnet"), acc("tkq.testnet"), U128(5), None, Ok(U128(5)));
+        deposited(&mut g, "alice.testnet", "tkq.testnet", 5);
         ctx("dao.testnet", ZERO);
         g.set_paused(true);
         // Nothing new: no join, no range, no agent re-centre; a deposit comes back whole.
@@ -2037,7 +2911,7 @@ mod tests {
         assert!(matches!(g.on_pool_for_exit(acc("alice.testnet"), false, pool_at(5_400)), PromiseOrValue::Promise(_)));
         assert!(exit_logs().contains("\"reason\":\"take_profit\""));
         // Once closed, the target is gone with the position.
-        assert!(g.on_exited(acc("alice.testnet"), PoolView { token_x: acc("tkq.testnet"), token_y: acc("wrap.testnet"), current_point: 5_400 }, Ok((U128(10), U128(20)))));
+        assert!(g.exited(acc("alice.testnet"), PoolView { token_x: acc("tkq.testnet"), token_y: acc("wrap.testnet"), current_point: 5_400 }, Removed::Amounts(10, 20)));
         assert_eq!(g.get_take_profit(acc("alice.testnet")), None);
         assert!(g.get_account(acc("alice.testnet")).unwrap().position.is_none());
     }
@@ -2085,7 +2959,7 @@ mod tests {
         g.set_take_profit(Some(TakeProfit { point: 5_000, above: true }));
         ctx("guardian.testnet", ZERO);
         g.lock();
-        let _ = g.on_cash_out_closed(acc("alice.testnet"), false, Ok((U128(0), U128(0))));
+        let _ = g.cash_out_closed(acc("alice.testnet"), false, Removed::Amounts(0, 0));
         assert_eq!(g.get_take_profit(acc("alice.testnet")), None);
     }
 }

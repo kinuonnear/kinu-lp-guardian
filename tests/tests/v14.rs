@@ -109,7 +109,7 @@ async fn v13_to_v14_then_take_profit_on_real_prices() -> testresult::TestResult<
     let (yocto, zero) = (NearToken::from_yoctonear(1), NearToken::from_near(0));
 
     deploy(WRAP, fixture("wrap-near.wasm"), json!({})).await;
-    deploy("dcl.sandbox", fixture("dcl-2.4.0.wasm"), json!({ "owner_id": "owner.sandbox", "wnear_id": WRAP, "farming_contract_id": "farm.sandbox" })).await;
+    deploy("dcl.sandbox", kinu_guardian_tests::dcl_wasm(), json!({ "owner_id": "owner.sandbox", "wnear_id": WRAP, "farming_contract_id": "farm.sandbox" })).await;
     deploy(TKQ, built("kinu_guardian_testtoken"), json!({ "owner_id": "owner.sandbox", "total_supply": "1000000000000000000", "symbol": "TKQ", "decimals": 12 })).await;
     t.call("owner.sandbox", "dcl.sandbox", "extend_whitelisted_tokens", json!({ "token_ids": [TKQ, WRAP] }), yocto).await;
     for who in ["dcl.sandbox", "lp.sandbox", "alice.sandbox"] {
@@ -151,7 +151,7 @@ async fn v13_to_v14_then_take_profit_on_real_prices() -> testresult::TestResult<
     expect("a stranger runs the upgrade", t.call("stranger.sandbox", G, "execute", json!({ "id": 0 }), zero).await, "ok");
     let cfg = t.view(G, "get_config", json!({})).await;
     println!("{:<58} version {} owner {} users {}", "after the upgrade", cfg["version"], cfg["owner"], cfg["users"]);
-    assert_eq!(cfg["version"], "1.4.0");
+    assert_eq!(cfg["version"], "1.5.0");
     assert_eq!(cfg["owner"], "dao.sandbox", "owner kept");
     assert_eq!(t.view(G, "get_account", json!({ "user": "alice.sandbox" })).await, alice_v13, "alice's record kept through the upgrade");
 

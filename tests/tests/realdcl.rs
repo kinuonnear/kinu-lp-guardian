@@ -90,7 +90,7 @@ pub async fn real_dcl() -> testresult::TestResult<(near_sandbox::Sandbox, T)> {
         }
     };
     deploy("wrap.sandbox", fixture("wrap-near.wasm"), json!({})).await;
-    deploy("dcl.sandbox", fixture("dcl-2.4.0.wasm"), json!({ "owner_id": "owner.sandbox", "wnear_id": "wrap.sandbox", "farming_contract_id": "farm.sandbox" })).await;
+    deploy("dcl.sandbox", kinu_guardian_tests::dcl_wasm(), json!({ "owner_id": "owner.sandbox", "wnear_id": "wrap.sandbox", "farming_contract_id": "farm.sandbox" })).await;
     deploy("tkq.sandbox", built("kinu_guardian_testtoken"), json!({ "owner_id": "owner.sandbox", "total_supply": "1000000000000000000", "symbol": "TKQ", "decimals": 12 })).await;
     // As on mainnet, both tokens are on the DCL's whitelist (deposits of other tokens fail with E016).
     let r = t.try_call("owner.sandbox", "dcl.sandbox", "extend_whitelisted_tokens", json!({ "token_ids": ["tkq.sandbox", "wrap.sandbox"] }), NearToken::from_yoctonear(1), 30).await;
@@ -369,7 +369,7 @@ async fn probe_dcl_init() -> testresult::TestResult<()> {
     let t = T { net: net.clone(), signer: signer.clone() };
     Contract::deploy("wrap.sandbox".parse()?).use_code(fixture("wrap-near.wasm")).without_init_call().with_signer(signer.clone()).send_to(&net).await?.assert_success();
     println!("wrap new() -> {}", t.try_call("wrap.sandbox", "wrap.sandbox", "new", json!({}), NearToken::from_near(0), 100).await);
-    Contract::deploy("dcl.sandbox".parse()?).use_code(fixture("dcl-2.4.0.wasm")).without_init_call().with_signer(signer.clone()).send_to(&net).await?.assert_success();
+    Contract::deploy("dcl.sandbox".parse()?).use_code(kinu_guardian_tests::dcl_wasm()).without_init_call().with_signer(signer.clone()).send_to(&net).await?.assert_success();
     for args in [
         json!({}),
         json!({ "owner_id": "owner.sandbox" }),

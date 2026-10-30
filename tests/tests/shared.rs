@@ -130,7 +130,7 @@ async fn shared_guardian_on_real_dcl() -> testresult::TestResult<()> {
 
     // Rhea as on mainnet: the real DCL and wrap.near, a 12-decimal token, whitelisted, one 1% pool.
     deploy(WRAP, fixture("wrap-near.wasm"), json!({})).await;
-    deploy("dcl.sandbox", fixture("dcl-2.4.0.wasm"), json!({ "owner_id": "owner.sandbox", "wnear_id": WRAP, "farming_contract_id": "farm.sandbox" })).await;
+    deploy("dcl.sandbox", kinu_guardian_tests::dcl_wasm(), json!({ "owner_id": "owner.sandbox", "wnear_id": WRAP, "farming_contract_id": "farm.sandbox" })).await;
     deploy(TKQ, built("kinu_guardian_testtoken"), json!({ "owner_id": "owner.sandbox", "total_supply": "1000000000000000000", "symbol": "TKQ", "decimals": 12 })).await;
     t.call("owner.sandbox", "dcl.sandbox", "extend_whitelisted_tokens", json!({ "token_ids": [TKQ, WRAP] }), yocto).await;
     for who in ["dcl.sandbox", "lp.sandbox", "alice.sandbox", "bob.sandbox"] {
@@ -168,19 +168,22 @@ async fn shared_guardian_on_real_dcl() -> testresult::TestResult<()> {
     println!("after 2 joins: {} B ({} B per user)", joined, (joined - base) / 2);
     fails("join twice", t.call("bob.sandbox", G, "join", json!({ "policy": policy, "agent": null }), join).await, "Already joined");
 
-    // Alice: TKQ deposit, then a wNEAR deposit that opens her range across the price (one approve each).
+    // Alice: TKQ and wNEAR deposits (each measured on Rhea, v1.5), then she opens her range across the
+    // price (the page sends all three in one wallet request).
     ok("alice deposit TKQ", t.call("alice.sandbox", TKQ, "ft_transfer_call", json!({ "receiver_id": G, "amount": "100000000000", "msg": "" }), yocto).await);
-    let open = json!({ "left_point": 303400, "right_point": 306200 }).to_string();
-    ok("alice deposit wNEAR + open", t.call("alice.sandbox", WRAP, "ft_transfer_call", json!({ "receiver_id": G, "amount": "2000000000000000000000000", "msg": open }), yocto).await);
+    ok("alice deposit wNEAR", t.call("alice.sandbox", WRAP, "ft_transfer_call", json!({ "receiver_id": G, "amount": "2000000000000000000000000", "msg": "" }), yocto).await);
+    let ranged = json!({ "left_point": 303400, "right_point": 306200 }).to_string();
+    fails("a deposit that names a range", t.call("alice.sandbox", WRAP, "ft_transfer_call", json!({ "receiver_id": G, "amount": "1000000000000000000000", "msg": ranged }), yocto).await, "empty msg");
+    ok("alice opens", t.call("alice.sandbox", G, "open", json!({ "left_point": 303400, "right_point": 306200 }), zero).await);
     let (pos, led) = t.ledger("alice.sandbox").await;
     println!("alice: position {} ledger {:?}", pos.as_ref().map(|p| p["lpt_id"].to_string()).unwrap_or("none".into()), led);
     assert!(pos.is_some(), "alice has a position");
     let alice_leftover_wnear = led.iter().find(|(t, _)| t == WRAP).map(|(_, a)| *a).unwrap_or(0);
     assert!(alice_leftover_wnear > 0, "the add's wNEAR leftover is back on her ledger: {led:?}");
 
-    // Bob: wNEAR only, one-sided below the price, in one transfer.
-    let below = json!({ "left_point": 303200, "right_point": 304600 }).to_string();
-    ok("bob deposit wNEAR + open (one side)", t.call("bob.sandbox", WRAP, "ft_transfer_call", json!({ "receiver_id": G, "amount": "1000000000000000000000000", "msg": below }), yocto).await);
+    // Bob: wNEAR only, one-sided below the price (deposit, then open).
+    ok("bob deposit wNEAR", t.call("bob.sandbox", WRAP, "ft_transfer_call", json!({ "receiver_id": G, "amount": "1000000000000000000000000", "msg": "" }), yocto).await);
+    ok("bob opens (one side)", t.call("bob.sandbox", G, "open", json!({ "left_point": 303200, "right_point": 304600 }), zero).await);
     let (bpos, bled) = t.ledger("bob.sandbox").await;
     println!("bob: position {} ledger {:?}", bpos.as_ref().map(|p| p["lpt_id"].to_string()).unwrap_or("none".into()), bled);
     assert!(bpos.is_some());
@@ -244,8 +247,8 @@ async fn shared_guardian_on_real_dcl() -> testresult::TestResult<()> {
     ok("carol join", t.call("carol.sandbox", G, "join", json!({ "policy": policy, "agent": null }), join).await);
     ok("carol deposit TKQ", t.call("carol.sandbox", TKQ, "ft_transfer_call", json!({ "receiver_id": G, "amount": "100000000000", "msg": "" }), yocto).await);
     let cl = point.div_euclid(200) * 200 - 600;
-    let copen = json!({ "left_point": cl, "right_point": cl + 1400 }).to_string();
-    ok("carol deposit wNEAR + open", t.call("carol.sandbox", WRAP, "ft_transfer_call", json!({ "receiver_id": G, "amount": "1000000000000000000000000", "msg": copen }), yocto).await);
+    ok("carol deposit wNEAR", t.call("carol.sandbox", WRAP, "ft_transfer_call", json!({ "receiver_id": G, "amount": "1000000000000000000000000", "msg": "" }), yocto).await);
+    ok("carol opens", t.call("carol.sandbox", G, "open", json!({ "left_point": cl, "right_point": cl + 1400 }), zero).await);
     assert!(t.ledger("carol.sandbox").await.0.is_some(), "carol has a position");
     ok("carol unregisters from TKQ", t.call("carol.sandbox", TKQ, "storage_unregister", json!({ "force": false }), yocto).await);
     let near_before = t.near("carol.sandbox").await;

@@ -118,7 +118,7 @@ async fn attacks_are_refused() -> testresult::TestResult<()> {
 
     // Rhea as on mainnet: real DCL and wrap.near, a 12-decimal token, one 1% pool with deep liquidity.
     deploy(WRAP, fixture("wrap-near.wasm"), json!({})).await;
-    deploy("dcl.sandbox", fixture("dcl-2.4.0.wasm"), json!({ "owner_id": "owner.sandbox", "wnear_id": WRAP, "farming_contract_id": "farm.sandbox" })).await;
+    deploy("dcl.sandbox", kinu_guardian_tests::dcl_wasm(), json!({ "owner_id": "owner.sandbox", "wnear_id": WRAP, "farming_contract_id": "farm.sandbox" })).await;
     deploy(TKQ, built("kinu_guardian_testtoken"), json!({ "owner_id": "owner.sandbox", "total_supply": "1000000000000000000", "symbol": "TKQ", "decimals": 12 })).await;
     t.call("owner.sandbox", "dcl.sandbox", "extend_whitelisted_tokens", json!({ "token_ids": [TKQ, WRAP] }), yocto).await;
     for who in ["dcl.sandbox", "lp.sandbox", "alice.sandbox", "stranger.sandbox"] {
@@ -145,8 +145,8 @@ async fn attacks_are_refused() -> testresult::TestResult<()> {
     let policy = json!({ "allowed_pools": [POOL], "min_width": 1400, "max_width": 5600, "max_distance": 3000, "max_actions": 12, "window_secs": 86400, "max_slippage_bps": 100, "exit_drop_points": 0, "exit_on_rise": false, "rebalance_buffer_points": 100 });
     expect("alice join (agent: agent.sandbox)", t.call("alice.sandbox", G, "join", json!({ "policy": policy, "agent": "agent.sandbox" }), NearToken::from_millinear(10)).await, "ok");
     expect("alice deposit TKQ", t.call("alice.sandbox", TKQ, "ft_transfer_call", json!({ "receiver_id": G, "amount": "100000000000", "msg": "" }), yocto).await, "ok");
-    let open = json!({ "left_point": 303400, "right_point": 306200 }).to_string();
-    expect("alice deposit wNEAR + open around the price", t.call("alice.sandbox", WRAP, "ft_transfer_call", json!({ "receiver_id": G, "amount": "2000000000000000000000000", "msg": open }), yocto).await, "ok");
+    expect("alice deposit wNEAR", t.call("alice.sandbox", WRAP, "ft_transfer_call", json!({ "receiver_id": G, "amount": "2000000000000000000000000", "msg": "" }), yocto).await, "ok");
+    expect("alice opens around the price", t.call("alice.sandbox", G, "open", json!({ "left_point": 303400, "right_point": 306200 }), zero).await, "ok");
     let alice_before = t.view(G, "get_account", json!({ "user": "alice.sandbox" })).await;
     assert!(alice_before["position"].is_object());
 
@@ -222,7 +222,7 @@ async fn attacks_are_refused() -> testresult::TestResult<()> {
     println!("{:<58} {r}", "execute the upgrade whose migrate fails");
     let cfg = t.view(G, "get_config", json!({})).await;
     println!("{:<58} version {} staged {} pending {}", "contract after", cfg["version"], cfg["staged"], cfg["pending"]);
-    assert_eq!(cfg["version"], "1.4.0", "the failed deploy was undone: still the current code");
+    assert_eq!(cfg["version"], "1.5.0", "the failed deploy was undone: still the current code");
     assert!(t.near("stranger.sandbox").await - stranger_near > 4.9, "the stager's storage deposit came back");
     let alice_now = t.view(G, "get_account", json!({ "user": "alice.sandbox" })).await;
     assert!(alice_now["position"].is_object(), "alice's record intact");

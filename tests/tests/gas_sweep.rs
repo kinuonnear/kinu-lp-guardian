@@ -1,5 +1,6 @@
 //! The 29 Oct 2026 mainnet failure, replayed: a deposit that opens a position, given less and less
-//! gas (300 down to 100 TGas), on the contract as deployed (v1.0, Gm53qinU) and on v1.1.
+//! gas (300 down to 100 TGas), on the contract as deployed (v1.0, Gm53qinU), and on the current code
+//! (v1.5: a measured deposit at that gas, then `open` as its own call).
 //!
 //! After every attempt one rule must hold: every position this contract owns on Rhea is on its
 //! owner's record, and the contract's Rhea balance equals the sum of all ledgers. v1.0 could break
@@ -113,7 +114,7 @@ async fn gas_sweep_and_recovery() -> testresult::TestResult<()> {
 
     // Rhea as on mainnet, with deep liquidity from another LP.
     deploy(WRAP, fixture("wrap-near.wasm"), json!({})).await;
-    deploy("dcl.sandbox", fixture("dcl-2.4.0.wasm"), json!({ "owner_id": "owner.sandbox", "wnear_id": WRAP, "farming_contract_id": "farm.sandbox" })).await;
+    deploy("dcl.sandbox", kinu_guardian_tests::dcl_wasm(), json!({ "owner_id": "owner.sandbox", "wnear_id": WRAP, "farming_contract_id": "farm.sandbox" })).await;
     deploy(TKQ, built("kinu_guardian_testtoken"), json!({ "owner_id": "owner.sandbox", "total_supply": "1000000000000000000", "symbol": "TKQ", "decimals": 12 })).await;
     t.call("owner.sandbox", "dcl.sandbox", "extend_whitelisted_tokens", json!({ "token_ids": [TKQ, WRAP] }), yocto, 100).await;
     t.call("owner.sandbox", "dcl.sandbox", "create_pool", json!({ "token_a": TKQ, "token_b": WRAP, "fee": 10000, "init_point": 304800 }), NearToken::from_near(1), 100).await;
@@ -142,6 +143,7 @@ async fn gas_sweep_and_recovery() -> testresult::TestResult<()> {
     let point = t.view("dcl.sandbox", "get_pool", json!({ "pool_id": POOL })).await["current_point"].as_i64().unwrap();
     let right = (point - 200).div_euclid(200) * 200;
     let open = json!({ "left_point": right - 1400, "right_point": right }).to_string();
+    let range = json!({ "left_point": right - 1400, "right_point": right });
 
     let mut stranded: Vec<(String, String)> = Vec::new(); // (user, lpt) on v1.0
     let rpc = format!("http://{}", sandbox.rpc_addr.trim_start_matches("http://"));
@@ -154,7 +156,14 @@ async fn gas_sweep_and_recovery() -> testresult::TestResult<()> {
             assert_eq!(t.call(&u, g, "join", json!({ "policy": policy, "agent": null }), NearToken::from_millinear(10), 30).await, "ok");
             t.call(&u, WRAP, "near_deposit", json!({}), NearToken::from_near(2), 10).await;
             let before = t.ft(WRAP, &u).await;
-            let r = t.call(&u, WRAP, "ft_transfer_call", json!({ "receiver_id": g, "amount": "1000000000000000000000000", "msg": open }), yocto, *p).await;
+            // v1.0 opens in the deposit; the current code deposits (measured) and opens with its own call.
+            let msg = if v == "a" { open.clone() } else { String::new() };
+            let mut r = t.call(&u, WRAP, "ft_transfer_call", json!({ "receiver_id": g, "amount": "1000000000000000000000000", "msg": msg }), yocto, *p).await;
+            if v == "b" && t.ft(WRAP, &u).await != before {
+                let (_, _, rhea, ledgers) = t.audit(g, &users).await;
+                assert!(rhea == ledgers, "v1.5 deposit not exact at {p} TGas: rhea {rhea:?} ledgers {ledgers:?}");
+                r = t.call(&u, g, "open", range.clone(), zero, 300).await;
+            }
             let a = t.view(g, "get_account", json!({ "user": u })).await;
             let back = t.ft(WRAP, &u).await == before;
             let (on_rhea, recorded, rhea, ledgers) = t.audit(g, &users).await;
