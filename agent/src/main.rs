@@ -53,8 +53,9 @@ mod run_impl {
     /// The shared Guardian contract this build serves, and the code it must run (cargo-near build of
     /// contracts/guardian; scripts/codehash.py). A changed contract needs a new agent build.
     pub const GUARDIAN: &str = "lp.kinuonnear.near";
-    // v1.4: the reproducible CI build of 135adb6 (Build #5, NEP-330 metadata inside), deployed from that CI artifact.
-    pub const GUARDIAN_CODE_HASH: &str = "7JzW6wgqKxoDsYxCXjYgu4oqPDxXXf2nPV9bGEhY5yqi";
+    // v1.5: the reproducible CI build of 816f133 (Build #8, NEP-330 metadata inside), deployed from that CI
+    // artifact on 30 Oct 2026 (tx 8LtK9M1r…).
+    pub const GUARDIAN_CODE_HASH: &str = "2X4Kt3qhXSNvzAZS2cNu8FagepG66LDW2PewEp4zaNeH";
     pub const DCL: &str = "dclv2.ref-labs.near";
     /// Where `retire` returns the agent's gas: KINU's account, which funds the agent.
     pub const RETIRE_TO: &str = "kinuonnear.near";
@@ -168,6 +169,9 @@ mod run_impl {
         if runs != GUARDIAN_CODE_HASH {
             return Ok(json!({ "ok": true, "agent": me, "action": "noop", "why": "the Guardian account does not run the published code", "code_hash": runs }));
         }
+        // Rhea's code: anything but the tested build holds re-centres (exits and pokes still run).
+        let (dcl_acct, dcl_err) = rpc::view_account(DCL, "final");
+        let rhea_code = if dcl_err.is_empty() { rpc_result(&dcl_acct).ok().and_then(|r| r["code_hash"].as_str().map(String::from)).unwrap_or_default() } else { String::new() };
         // The scheduler names the users it found something to do for; without names the agent reads
         // the contract's own list (v1.2) and looks at the first ones.
         let mut users = users_from_input(&req);
@@ -182,12 +186,12 @@ mod run_impl {
         let mut pools: Vec<PoolView> = Vec::new();
         let mut out = Vec::new();
         for user in &users {
-            out.push(tick_one(&me, &pk, user, &mut pools).unwrap_or_else(|e| json!({ "u": user, "err": e.chars().take(120).collect::<String>() })));
+            out.push(tick_one(&me, &pk, user, &mut pools, &rhea_code).unwrap_or_else(|e| json!({ "u": user, "err": e.chars().take(120).collect::<String>() })));
         }
         Ok(json!({ "ok": true, "agent": me, "results": out }))
     }
 
-    fn tick_one(me: &str, pk: &[u8; 32], user: &str, pools: &mut Vec<PoolView>) -> Result<Value, String> {
+    fn tick_one(me: &str, pk: &[u8; 32], user: &str, pools: &mut Vec<PoolView>, rhea_code: &str) -> Result<Value, String> {
         let a = view(GUARDIAN, "get_account", json!({ "user": user }))?;
         if a.is_null() {
             return Ok(json!({ "u": user, "a": "noop", "why": "not joined" }));
@@ -211,7 +215,7 @@ mod run_impl {
         }
         let now_secs = rpc_result(&blk)?["header"]["timestamp"].as_u64().ok_or("no block time")? / 1_000_000_000;
         let take_profit: Option<TakeProfitView> = serde_json::from_value(view(GUARDIAN, "get_take_profit", json!({ "user": user }))?).unwrap_or(None);
-        let action = decide_confirmed(&World { me, account: &account, pool: &pool, take_profit }, seen.as_ref(), now_secs);
+        let action = hold_on_rhea_change(decide_confirmed(&World { me, account: &account, pool: &pool, take_profit }, seen.as_ref(), now_secs), rhea_code);
         // Cost guard: move a position only when a day of fees in the new range pays for the gas.
         // If the market data is unreachable the move goes ahead (a stuck position earns nothing).
         let mut guard = Value::Null;

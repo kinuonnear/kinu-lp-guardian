@@ -372,6 +372,19 @@ pub fn rebalance_pays(daily_fee_usd: f64, near_usd: f64) -> bool {
 }
 
 /// The one call on the shared contract the agent makes for a user, as (method, args json).
+/// Rhea DCL build Guardian was tested on (2.4.0). When Rhea runs anything else, the agent holds every
+/// re-centre (it closes and re-opens a position on untested code) but still exits by the user's rules and
+/// pokes: an exit only closes, and the tokens stay on the user's Guardian balance.
+pub const RHEA_CODE_HASH: &str = "FvsWeo3ZBAAZs6mdFAatf2kvga37y5BiRkRnW8GvfZix";
+
+/// The action to send when Rhea runs `rhea_code`: a re-centre becomes a noop unless it is the tested build.
+pub fn hold_on_rhea_change(action: Action, rhea_code: &str) -> Action {
+    match action {
+        Action::Rebalance { .. } if rhea_code != RHEA_CODE_HASH => Action::Noop("Rhea changed its contract: re-centres wait until KINU has tested the new version"),
+        other => other,
+    }
+}
+
 pub fn call_for(action: &Action, user: &str) -> Option<(&'static str, String)> {
     use serde_json::json;
     match action {
@@ -417,6 +430,17 @@ pub fn users_from_input(input: &serde_json::Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_changed_rhea_holds_re_centres_but_not_exits_or_pokes() {
+        use super::*;
+        let move_it = || Action::Rebalance { pool_id: "x|y|100".into(), left_point: 0, right_point: 100 };
+        assert!(matches!(hold_on_rhea_change(move_it(), RHEA_CODE_HASH), Action::Rebalance { .. }));
+        assert!(matches!(hold_on_rhea_change(move_it(), "SomethingElse"), Action::Noop(_)));
+        assert!(matches!(hold_on_rhea_change(move_it(), ""), Action::Noop(_)), "unreadable counts as changed");
+        assert!(matches!(hold_on_rhea_change(Action::Exit, "SomethingElse"), Action::Exit));
+        assert!(matches!(hold_on_rhea_change(Action::Poke, "SomethingElse"), Action::Poke));
+    }
+
     use super::*;
 
     #[test]
