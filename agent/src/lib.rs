@@ -413,12 +413,25 @@ pub fn gas_for(method: &str) -> u64 {
     }
 }
 
-/// The users a run looks at: well-formed NEAR account ids from the (untrusted) input, deduplicated.
+/// One position's record (contract v1.6): a NEAR account id, or that id with `#1` or `#2`.
+pub fn record_ok(u: &str) -> bool {
+    let (id, slot_ok) = match u.split_once('#') {
+        None => (u, true),
+        Some((id, slot)) => (id, slot == "1" || slot == "2"),
+    };
+    slot_ok && (2..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-_.".contains(&b))
+}
+
+/// A wallet's records from `get_slots`, as the contract spells them.
+pub fn records_of(wallet: &str, slots: &[u8]) -> Vec<String> {
+    slots.iter().map(|s| if *s == 0 { wallet.to_string() } else { format!("{wallet}#{s}") }).collect()
+}
+
+/// The records a run looks at: well-formed ones from the (untrusted) input, deduplicated.
 pub fn users_from_input(input: &serde_json::Value) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for u in input["users"].as_array().into_iter().flatten().filter_map(|v| v.as_str()) {
-        let ok = (2..=64).contains(&u.len()) && u.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-_.".contains(&b));
-        if ok && !out.iter().any(|o| o == u) {
+        if record_ok(u) && !out.iter().any(|o| o == u) {
             out.push(u.to_string());
         }
         if out.len() == MAX_USERS_PER_RUN {
@@ -430,6 +443,19 @@ pub fn users_from_input(input: &serde_json::Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_run_takes_position_records_in_the_contracts_spelling() {
+        let implicit = "a".repeat(64);
+        let input = serde_json::json!({ "users": ["alice.near", "alice.near#1", "alice.near#2", "alice.near#1", format!("{implicit}#2")] });
+        assert_eq!(users_from_input(&input), vec!["alice.near".to_string(), "alice.near#1".into(), "alice.near#2".into(), format!("{implicit}#2")]);
+        for bad in ["alice.near#0", "alice.near#3", "alice.near#01", "alice.near#", "alice.near#1#2", "#1", "Alice.near", "a b", "a"] {
+            assert!(!record_ok(bad), "{bad}");
+        }
+        assert!(!record_ok(&"a".repeat(65)));
+        assert_eq!(records_of("alice.near", &[0, 2]), vec!["alice.near".to_string(), "alice.near#2".into()]);
+        assert!(records_of("alice.near", &[]).is_empty());
+    }
+
     #[test]
     fn a_changed_rhea_holds_re_centres_but_not_exits_or_pokes() {
         use super::*;

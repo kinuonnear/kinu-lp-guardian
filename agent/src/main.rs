@@ -172,12 +172,17 @@ mod run_impl {
         // Rhea's code: anything but the tested build holds re-centres (exits and pokes still run).
         let (dcl_acct, dcl_err) = rpc::view_account(DCL, "final");
         let rhea_code = if dcl_err.is_empty() { rpc_result(&dcl_acct).ok().and_then(|r| r["code_hash"].as_str().map(String::from)).unwrap_or_default() } else { String::new() };
-        // The scheduler names the users it found something to do for; without names the agent reads
-        // the contract's own list (v1.2) and looks at the first ones.
+        // The scheduler names the records it found something to do for; without names the agent reads
+        // the contract's own list (v1.2) and each wallet's positions (v1.6), and looks at the first ones.
         let mut users = users_from_input(&req);
         if users.is_empty() {
             let listed = view(GUARDIAN, "get_users", json!({ "from_index": 0, "limit": MAX_USERS_PER_RUN }))?;
-            users = users_from_input(&json!({ "users": listed }));
+            let mut records = Vec::new();
+            for wallet in listed.as_array().into_iter().flatten().filter_map(|v| v.as_str()) {
+                let slots: Vec<u8> = serde_json::from_value(view(GUARDIAN, "get_slots", json!({ "user": wallet }))?).unwrap_or_default();
+                records.extend(records_of(wallet, &slots));
+            }
+            users = users_from_input(&json!({ "users": records }));
         }
         if users.is_empty() {
             return Ok(json!({ "ok": true, "agent": me, "action": "noop", "why": "no users" }));
