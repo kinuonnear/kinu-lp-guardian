@@ -66,6 +66,13 @@ use near_sdk::{AccountId, BorshStorageKey, Gas, GasWeight, NearToken, PanicOnDef
 use std::collections::HashMap;
 pub use policy::{Policy, RateWindow, RebalanceRequest, Refusal, SEEN_MAX_AGE_SECS, SEEN_MIN_AGE_SECS, check_out_of_range, check_rebalance, check_seen_age, moved_against, take_profit_met, TakeProfit};
 
+/// A pool id as Rhea writes it: two account ids and a whole-number fee. The join deposit pays for a
+/// record of ordinary size, so a pool id of any other shape or length never reaches storage (v1.6).
+fn pool_id_ok(id: &str) -> bool {
+    let parts: Vec<&str> = id.split('|').collect();
+    parts.len() == 3 && parts[0].len() <= 64 && parts[1].len() <= 64 && parts[2].len() <= 7 && parts[2].parse::<u32>().is_ok()
+}
+
 /// Positions one wallet can run (v1.6).
 pub const MAX_SLOTS: u8 = 3;
 
@@ -846,7 +853,7 @@ impl Guardian {
             env::panic_str("Attach the join deposit (0.01 NEAR, returned when you leave)");
         }
         policy.validate().unwrap_or_else(|r| refuse(r));
-        if policy.allowed_pools.len() != 1 || policy.allowed_pools[0].split('|').count() != 3 {
+        if policy.allowed_pools.len() != 1 || !pool_id_ok(&policy.allowed_pools[0]) {
             env::panic_str("Policy names exactly one pool, as token_x|token_y|fee");
         }
         let acct = Account { policy, agent, frozen: false, rate: RateWindow::default(), position: None, high_point: None, low_point: None, ledger: Vec::new(), owed: Vec::new() };
@@ -1639,7 +1646,8 @@ impl Guardian {
     }
 
     fn raw_read<T: near_sdk::borsh::BorshDeserialize>(kind: &str, who: &Who) -> Option<T> {
-        env::storage_read(&Self::raw_key(kind, who)).and_then(|v| near_sdk::borsh::from_slice(&v).ok())
+        // Unreadable must stop, not read as "no record": a new join would then write over the old one.
+        env::storage_read(&Self::raw_key(kind, who)).map(|v| near_sdk::borsh::from_slice(&v).unwrap_or_else(|_| env::panic_str("A stored position could not be read")))
     }
 
     fn raw_write<T: near_sdk::borsh::BorshSerialize>(kind: &str, who: &Who, value: &T) {
@@ -3141,6 +3149,35 @@ mod tests {
     }
     fn holds(g: &Guardian, who: Who, token: &str) -> u128 {
         g.get_account(who).unwrap().held(&acc(token))
+    }
+
+    #[test]
+    fn a_pool_id_has_rheas_shape() {
+        assert!(pool_id_ok(POOL));
+        assert!(pool_id_ok(&format!("{}|{}|100", "a".repeat(64), "b".repeat(64))));
+        for bad in ["a|b", "a|b|c|d", "a|b|", "a|b|x", "a|b|-1", "a|b|12345678"] {
+            assert!(!pool_id_ok(bad), "{bad}");
+        }
+        assert!(!pool_id_ok(&format!("{}|b|100", "a".repeat(65))));
+    }
+
+    #[test]
+    #[should_panic(expected = "exactly one pool")]
+    fn a_huge_pool_id_never_reaches_storage() {
+        let mut g = fresh();
+        ctx("alice.testnet", JOIN_DEPOSIT);
+        let mut p = policy();
+        p.allowed_pools = vec![format!("tkq.testnet|wrap.testnet|{}", "9".repeat(100_000))];
+        g.join(p, None, None);
+    }
+
+    #[test]
+    fn a_stored_position_that_cannot_be_read_stops_instead_of_reading_as_empty() {
+        let g = joined();
+        let who = w("alice.testnet", 1);
+        near_sdk::env::storage_write(&Guardian::raw_key("s", &who), b"not a record");
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.rec(&who)));
+        assert!(r.is_err());
     }
 
     #[test]

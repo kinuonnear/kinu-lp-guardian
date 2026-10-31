@@ -77,6 +77,9 @@ impl T {
     async fn near(&self, id: &str) -> f64 {
         near_api::Account(id.parse().unwrap()).view().fetch_from(&self.net).await.map(|r| r.data.amount.as_yoctonear() as f64 / 1e24).unwrap_or(0.0)
     }
+    async fn storage(&self, id: &str) -> u64 {
+        near_api::Account(id.parse().unwrap()).view().fetch_from(&self.net).await.map(|r| r.data.storage_usage).unwrap_or(0)
+    }
     async fn ft(&self, token: &str, id: &str) -> u128 {
         self.view(token, "ft_balance_of", json!({ "account_id": id })).await.as_str().unwrap_or("0").parse().unwrap_or(0)
     }
@@ -181,6 +184,9 @@ async fn three_positions_on_real_dcl() -> testresult::TestResult<()> {
     let policy = |pool: &str| json!({ "allowed_pools": [pool], "min_width": 1400, "max_width": 5600, "max_distance": 3000, "max_actions": 12, "window_secs": 86400, "max_slippage_bps": 100, "exit_drop_points": 0, "exit_on_rise": false, "rebalance_buffer_points": 100 });
 
     println!("\n--- three positions, one wallet ---");
+    let huge = format!("{TKQ}|{WRAP}|{}", "9".repeat(50_000));
+    no("a huge pool id is refused", t.call("carol.sandbox", G, "join", json!({ "policy": policy(&huge), "agent": null }), join).await, "exactly one pool");
+    let storage0 = t.storage(G).await;
     let tkq_in: u128 = 100_000_000_000;
     let wnear_in: u128 = E24;
     ok("alice joins slot 0 (1% pool, agent)", t.call("alice.sandbox", G, "join", json!({ "policy": policy(POOL), "agent": "agent.sandbox" }), join).await);
@@ -214,6 +220,9 @@ async fn three_positions_on_real_dcl() -> testresult::TestResult<()> {
     ok("open slot 2 in the same pool", t.call("alice.sandbox", G, "open", json!({ "left_point": c1 - 1000, "right_point": c1 + 400, "slot": 2 }), zero).await);
     ok("bob opens", t.call("bob.sandbox", G, "open", json!({ "left_point": c1 - 600, "right_point": c1 + 800, "slot": 1 }), zero).await);
     t.books("after four opens").await;
+    let used = t.storage(G).await - storage0;
+    println!("{:<58} {used} bytes for 4 records", "storage");
+    assert!(used / 4 < 1_000, "a record stays inside its join deposit (1,000 bytes): {used}");
     let lpt: Vec<String> = vec![t.acct("alice.sandbox").await["position"]["lpt_id"].as_str().unwrap().into(), t.acct("alice.sandbox#2").await["position"]["lpt_id"].as_str().unwrap().into()];
     assert_ne!(lpt[0], lpt[1], "two positions in one pool are two Rhea positions");
 
