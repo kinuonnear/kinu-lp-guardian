@@ -121,7 +121,7 @@ async fn v14_to_production_v15_in_one_transaction() -> testresult::TestResult<()
     assert!(r.is_success(), "upgrade + migrate: {r:?}");
     let cfg = t.view(G, "get_config", json!({})).await;
     println!("after deploy + migrate {cfg}");
-    assert_eq!(cfg["version"], "1.5.0");
+    assert_eq!(cfg["version"], "1.6.0");
     assert_eq!(cfg["owner"], "kinu.sandbox");
     assert_eq!(cfg["admin_delay_secs"], 172_800, "the production build (48 h)");
     assert_eq!(cfg["users"], 2, "the user list is kept");

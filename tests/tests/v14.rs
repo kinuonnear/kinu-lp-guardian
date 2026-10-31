@@ -151,7 +151,7 @@ async fn v13_to_v14_then_take_profit_on_real_prices() -> testresult::TestResult<
     expect("a stranger runs the upgrade", t.call("stranger.sandbox", G, "execute", json!({ "id": 0 }), zero).await, "ok");
     let cfg = t.view(G, "get_config", json!({})).await;
     println!("{:<58} version {} owner {} users {}", "after the upgrade", cfg["version"], cfg["owner"], cfg["users"]);
-    assert_eq!(cfg["version"], "1.5.0");
+    assert_eq!(cfg["version"], "1.6.0");
     assert_eq!(cfg["owner"], "dao.sandbox", "owner kept");
     assert_eq!(t.view(G, "get_account", json!({ "user": "alice.sandbox" })).await, alice_v13, "alice's record kept through the upgrade");
 

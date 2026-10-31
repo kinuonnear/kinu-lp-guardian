@@ -222,7 +222,7 @@ async fn attacks_are_refused() -> testresult::TestResult<()> {
     println!("{:<58} {r}", "execute the upgrade whose migrate fails");
     let cfg = t.view(G, "get_config", json!({})).await;
     println!("{:<58} version {} staged {} pending {}", "contract after", cfg["version"], cfg["staged"], cfg["pending"]);
-    assert_eq!(cfg["version"], "1.5.0", "the failed deploy was undone: still the current code");
+    assert_eq!(cfg["version"], "1.6.0", "the failed deploy was undone: still the current code");
     assert!(t.near("stranger.sandbox").await - stranger_near > 4.9, "the stager's storage deposit came back");
     let alice_now = t.view(G, "get_account", json!({ "user": "alice.sandbox" })).await;
     assert!(alice_now["position"].is_object(), "alice's record intact");
