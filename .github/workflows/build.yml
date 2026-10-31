@@ -5,7 +5,7 @@ name: Build
 
 on:
   push:
-    branches: [main, v1.4, v1.5]
+    branches: [main, v1.4, v1.5, v1.6]
   workflow_dispatch:
 
 jobs:
