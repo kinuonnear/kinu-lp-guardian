@@ -55,7 +55,7 @@ mod run_impl {
     pub const GUARDIAN: &str = "lp.kinuonnear.near";
     // v1.5: the reproducible CI build of 816f133 (Build #8, NEP-330 metadata inside), deployed from that CI
     // artifact on 30 Oct 2026 (tx 8LtK9M1r…).
-    pub const GUARDIAN_CODE_HASH: &str = "2X4Kt3qhXSNvzAZS2cNu8FagepG66LDW2PewEp4zaNeH";
+    pub const GUARDIAN_CODE_HASH: &str = "2MrgRizd6VH86MFZJbPppsHc9DWVni4adrr9a4J7jNqx";
     pub const DCL: &str = "dclv2.ref-labs.near";
     /// Where `retire` returns the agent's gas: KINU's account, which funds the agent.
     pub const RETIRE_TO: &str = "kinuonnear.near";
