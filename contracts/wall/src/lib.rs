@@ -9,6 +9,9 @@
 //! A bait key is a function-call key on the wall itself, so it can only ever call the wall: its first
 //! signature freezes the wall and the agent on Guardian, and clears the queue. The canceller can stop
 //! and freeze, and send only to `home`. Owner, canceller and home are three different accounts.
+//! Nothing here may keep money from its owner. With the owner key lost, the canceller can ask for a
+//! rescue: after the long wait Guardian cashes out into the wall, and from there money only goes home.
+//! No key can stop a rescue but the canceller's own, so a thief holding the owner key cannot strand it.
 //! The sentinel is an optional watching agent: it can only stop (cancel, freeze), so the worst a fooled
 //! one does is delay an honest payment, and the canceller can dismiss it at once.
 //! No upgrade method, and `new` removes the key that deployed it: nobody holds the wall's own account.
@@ -23,6 +26,8 @@ const MAX_DELAY_SECS: u64 = 7 * 86_400;
 const OWNER_UNFREEZE_SECS: u64 = 7 * 86_400;
 #[cfg(feature = "short-delay")]
 const OWNER_UNFREEZE_SECS: u64 = 7_200;
+/// A rescue closes positions, so it waits as long: the owner, if still there, can act first.
+const RESCUE_SECS: u64 = OWNER_UNFREEZE_SECS;
 const DAY_SECS: u64 = 86_400;
 const MAX_PENDING: usize = 16;
 const MAX_AGENT_PENDING: usize = 4;
@@ -63,6 +68,9 @@ pub enum Action {
     Unfreeze,
     /// Deletes the wall, all its NEAR (storage too) to `home`. Tokens still here would be lost: send them first.
     Close,
+    /// Only `rescue` queues this. It cashes one Guardian slot out into the wall, and stays queued so a
+    /// run that failed (Guardian busy, too little gas) can be repeated; the canceller clears it after.
+    Rescue { slot: u8 },
 }
 
 #[near(serializers = [borsh, json])]
@@ -185,6 +193,7 @@ impl Wall {
             Action::SetCanceller { canceller } => Self::check_roles(&self.owner, canceller, &self.home),
             Action::SetDelay { delay_secs } => Self::check_delay(*delay_secs),
             Action::SetAgent { receivers, limits, .. } => require!(receivers.len() <= MAX_LIST && limits.len() <= MAX_LIST, "List too long"),
+            Action::Rescue { .. } => env::panic_str("Only the canceller"),
             _ => {}
         }
         Some(self.queue(action, wait, false))
@@ -260,6 +269,21 @@ impl Wall {
 
     // ------------------------------------------------------------ anyone, the canceller
 
+    /// With the owner key gone, the only road to a Guardian position. One per slot, frozen or not, and a
+    /// full queue does not refuse it, or a thief could block it by filling the queue.
+    pub fn rescue(&mut self, slot: u8) -> u64 {
+        require!(env::predecessor_account_id() == self.canceller, "Only the canceller");
+        require!(SLOTS.contains(&slot), "No such slot");
+        let waiting = self.pending.iter().any(|r| matches!(r.action, Action::Rescue { slot: s } if s == slot));
+        require!(!waiting, "A rescue for this slot is already waiting");
+        let id = self.next_id;
+        self.next_id += 1;
+        let unlock_secs = now_secs() + RESCUE_SECS;
+        self.pending.push(Request { id, action: Action::Rescue { slot }, unlock_secs, by_agent: false, vouched: false });
+        env::log_str(&format!("wall: rescue {id} of slot {slot} waits until {unlock_secs}"));
+        id
+    }
+
     /// Runs a request whose wait is over.
     pub fn execute(&mut self, id: u64) {
         if self.tripped() {
@@ -267,6 +291,11 @@ impl Wall {
         }
         let i = self.pending.iter().position(|r| r.id == id).unwrap_or_else(|| env::panic_str("No such request"));
         require!(now_secs() >= self.pending[i].unlock_secs, "Still waiting");
+        if let Action::Rescue { slot } = &self.pending[i].action {
+            require!(env::predecessor_account_id() == self.canceller, "Only the canceller");
+            let _ = forward(self.guardian.clone(), "cash_out", json!({ "leave": false, "slot": *slot }).to_string(), NearToken::from_near(0));
+            return;
+        }
         let request = self.pending.remove(i);
         require!(!self.frozen || matches!(request.action, Action::Unfreeze), "The wall is frozen");
         match request.action {
@@ -291,6 +320,7 @@ impl Wall {
                 self.tripwires.retain(|h| *h != hash);
                 let _ = Promise::new(env::current_account_id()).delete_key(public_key);
             }
+            Action::Rescue { .. } => {} // run above: it stays queued
             Action::Unfreeze => self.frozen = false,
             Action::Close => {
                 let me = env::current_account_id();
@@ -315,6 +345,7 @@ impl Wall {
         let watching = Some(&who) == self.sentinel.as_ref();
         require!(who == self.canceller || who == self.owner || watching, "Only the owner, the canceller or the sentinel");
         let i = self.pending.iter().position(|r| r.id == id).unwrap_or_else(|| env::panic_str("No such request"));
+        require!(!matches!(self.pending[i].action, Action::Rescue { .. }) || who == self.canceller, "Only the canceller stops a rescue");
         if watching {
             require!(!matches!(self.pending[i].action, Action::SetSentinel { .. } | Action::Unfreeze), "Not for the sentinel");
             require!(!self.pending[i].vouched, "The canceller vouched for this one");
@@ -430,9 +461,10 @@ impl Wall {
     }
 
     /// Also empties the queue: a request that waited through a freeze must not run the moment it lifts.
+    /// A rescue stays: it is a way out, and a thief must not be able to clear it with a freeze.
     fn set_frozen(&mut self) {
         self.frozen = true;
-        self.pending.clear();
+        self.pending.retain(|r| matches!(r.action, Action::Rescue { .. }));
         for slot in SLOTS {
             let args = json!({ "frozen": true, "slot": slot }).to_string().into_bytes();
             let _ = Promise::new(self.guardian.clone()).function_call("set_frozen".to_string(), args, NearToken::from_near(0), FREEZE_GAS);

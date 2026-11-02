@@ -46,6 +46,7 @@ pub enum WallAction {
     RemoveTripwire { public_key: String },
     Unfreeze,
     Close,
+    Rescue { slot: u8 },
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
@@ -120,7 +121,7 @@ pub fn judge(c: &WallConfig, r: &Request) -> Call {
         WallAction::SetAgent { agent, receivers, limits } if !narrows(c, agent, receivers, limits) => Call::Stop(RULES[7]),
         WallAction::SetAgent { .. } => Call::Leave,
         WallAction::Guardian { .. } => Call::Stop(RULES[8]),
-        WallAction::SetSentinel { .. } | WallAction::Unfreeze => Call::Alarm(RULES[9]),
+        WallAction::SetSentinel { .. } | WallAction::Unfreeze | WallAction::Rescue { .. } => Call::Alarm(RULES[9]),
     }
 }
 
@@ -230,7 +231,7 @@ mod tests {
         for action in [send("shop.near"), send("home.near"), WallAction::SetDelay { delay_secs: 48 * HOUR }, agent(None, &[], "0"), agent(Some("a.near"), &["shop.near"], "50")] {
             assert_eq!(judge(&c, &req(1, action.clone())), Call::Leave, "{action:?}");
         }
-        for action in [WallAction::Unfreeze, WallAction::SetSentinel { sentinel: None }] {
+        for action in [WallAction::Unfreeze, WallAction::SetSentinel { sentinel: None }, WallAction::Rescue { slot: 0 }] {
             assert_eq!(judge(&c, &req(1, action)), Call::Alarm(RULES[9]));
         }
     }

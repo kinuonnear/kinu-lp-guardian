@@ -46,7 +46,7 @@ mod run_impl {
     use serde_json::{json, Value};
 
     /// The wall code this build watches: the global contract hash every wall is deployed from.
-    const WALL_CODE: &str = "FFicPprA43NFJbKwKKQp8CEdRgmsdevJkuZRerAz43Uv";
+    const WALL_CODE: &str = "FL1NRxzDiGmfrCaiBe1rX9WnLBqwDpo8SPtChgg3cS22";
     const MAX_WALLS: usize = 5;
     const T: u64 = 1_000_000_000_000;
 

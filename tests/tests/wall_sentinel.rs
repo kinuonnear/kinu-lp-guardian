@@ -130,6 +130,9 @@ async fn every_request_the_wall_returns_is_read_and_judged() -> testresult::Test
     let pending: Vec<Request> = serde_json::from_value(t.view("get_pending").await)?;
     assert_eq!(pending.len(), 1);
     assert_eq!(judge(&config, &pending[0]), Call::Alarm(RULES[9]));
+    ok("the canceller asks for a rescue", t.call(CANCELLER, "rescue", json!({ "slot": 0 })).await);
+    let pending: Vec<Request> = serde_json::from_value(t.view("get_pending").await)?;
+    assert_eq!(judge(&config, &pending[1]), Call::Alarm(RULES[9]));
     Ok(())
 }
 

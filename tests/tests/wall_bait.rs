@@ -56,7 +56,7 @@ async fn wall_alone() -> testresult::TestResult<()> {
     let signer = Signer::from_secret_key(near_sandbox::config::DEFAULT_GENESIS_ACCOUNT_PRIVATE_KEY.parse()?)?;
     for name in ["kinu", "alice", "carol", "dave", "gd", "sentry", "thief", "wall", "wall2"] {
         let id: AccountId = format!("{name}.sandbox").parse()?;
-        sandbox.create_account(id).initial_balance(NearToken::from_near(20)).send().await?;
+        sandbox.create_account(id).initial_balance(NearToken::from_near(40)).send().await?;
     }
     let t = T { net: net.clone(), signer: signer.clone() };
     let code = std::fs::read(format!("{}/../target/near/kinu_outer_wall_short/kinu_outer_wall.wasm", env!("CARGO_MANIFEST_DIR")))?;
@@ -116,6 +116,20 @@ async fn wall_alone() -> testresult::TestResult<()> {
     ok("the canceller vouches", t.call("carol.sandbox", w2, "vouch", json!({ "id": 0 })).await);
     fails("the sentinel stands down", t.call("sentry.sandbox", w2, "cancel", json!({ "id": 0 })).await, "The canceller vouched");
     ok("the canceller can still cancel", t.call("carol.sandbox", w2, "cancel", json!({ "id": 0 })).await);
+
+    println!("--- A rescue answers to the canceller alone");
+    fails("the owner cannot queue one", t.call("thief.sandbox", w2, "request", json!({ "action": { "Rescue": { "slot": 0 } } })).await, "Only the canceller");
+    fails("nor the sentinel", t.call("sentry.sandbox", w2, "rescue", json!({ "slot": 0 })).await, "Only the canceller");
+    fails("no such slot", t.call("carol.sandbox", w2, "rescue", json!({ "slot": 3 })).await, "No such slot");
+    ok("the canceller asks (1)", t.call("carol.sandbox", w2, "rescue", json!({ "slot": 0 })).await);
+    fails("one per slot", t.call("carol.sandbox", w2, "rescue", json!({ "slot": 0 })).await, "already waiting");
+    fails("the owner cannot stop it", t.call("thief.sandbox", w2, "cancel", json!({ "id": 1 })).await, "Only the canceller stops a rescue");
+    fails("the sentinel cannot stop it", t.call("sentry.sandbox", w2, "cancel", json!({ "id": 1 })).await, "Only the canceller stops a rescue");
+    fails("not before the wait", t.call("carol.sandbox", w2, "execute", json!({ "id": 1 })).await, "Still waiting");
+    println!("{:<46} {}", "a freeze by the owner", t.call("thief.sandbox", w2, "freeze", json!({})).await);
+    assert_eq!(t.pending(w2).await, 1, "a freeze leaves the rescue");
+    ok("the canceller unfreezes", t.call("carol.sandbox", w2, "unfreeze", json!({})).await);
+    ok("the canceller clears it", t.call("carol.sandbox", w2, "cancel", json!({ "id": 1 })).await);
 
     println!("--- The bait at every gas level");
     let bait = near_api::signer::generate_secret_key()?;
