@@ -96,7 +96,7 @@ async fn wall_alone() -> testresult::TestResult<()> {
     assert_eq!(t.pending(w).await, 1);
     println!("{:<46} {}", "the sentinel freezes", t.call("sentry.sandbox", w, "freeze", json!({})).await);
     assert_eq!(t.config(w).await["frozen"], true);
-    assert_eq!(t.pending(w).await, 0, "the queue is empty");
+    assert_eq!(t.pending(w).await, 1, "only what removes the sentinel stays");
     ok("the owner asks to unfreeze (2)", t.call(a, w, "request", json!({ "action": "Unfreeze" })).await);
     fails("the sentinel cannot block that either", t.call("sentry.sandbox", w, "cancel", json!({ "id": 2 })).await, "Not for the sentinel");
     ok("the canceller dismisses a bad sentinel", t.call("carol.sandbox", w, "dismiss_sentinel", json!({})).await);

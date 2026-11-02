@@ -5,7 +5,7 @@ name: Build
 
 on:
   push:
-    branches: [main, v1.4, v1.5, v1.6, v1.7]
+    branches: [main, v1.4, v1.5, v1.6, v1.7, outer-wall-v17]
   workflow_dispatch:
 
 jobs:
@@ -48,3 +48,39 @@ jobs:
         with:
           name: guardian-agent
           path: agent/target/wasm32-wasip2/release/*.wasm
+
+  wall:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-near 0.21.1
+        run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/near/cargo-near/releases/download/cargo-near-v0.21.1/cargo-near-installer.sh | sh
+      - name: Reproducible build of the outer wall
+        run: cargo near build reproducible-wasm --manifest-path contracts/wall/Cargo.toml --out-dir out 2>&1 | tee build.log
+      - name: Code hash
+        run: |
+          grep -E 'SHA-256 checksum (hex|bs58)' build.log
+          sha256sum out/*.wasm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: outer-wall
+          path: out/*.wasm
+
+  sentinel:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sentinel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests (Sentinel)
+        run: cargo test --lib
+      - name: Build for OutLayer (wasm32-wasip2)
+        run: |
+          rustup target add wasm32-wasip2
+          cargo build --release --locked --target wasm32-wasip2
+          sha256sum target/wasm32-wasip2/release/*.wasm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sentinel
+          path: sentinel/target/wasm32-wasip2/release/*.wasm

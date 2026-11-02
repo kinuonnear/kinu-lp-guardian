@@ -187,7 +187,7 @@ async fn a_contract_can_be_the_guardian_user() -> testresult::TestResult<()> {
     let refused = t.call("agent.sandbox", G, "request_rebalance", move_it.clone(), zero).await;
     println!("{:<42} {refused}", "frozen agent tries to move");
     assert!(!refused.starts_with("ok ("), "a frozen agent must not move: {refused}");
-    ok("wall unfreezes the agent", via(G, "set_frozen", json!({ "frozen": false }), zero).await);
+    ok("wall unfreezes the agent", via(G, "set_frozen", json!({ "frozen": false }), NearToken::from_yoctonear(1)).await);
     ok("agent pokes the wall again", t.call("agent.sandbox", G, "poke", json!({ "user": W }), zero).await);
     wait_secs(&sandbox, &t, 200).await;
     ok("agent rebalances the wall", t.call("agent.sandbox", G, "request_rebalance", move_it, zero).await);

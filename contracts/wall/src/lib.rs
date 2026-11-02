@@ -217,7 +217,9 @@ impl Wall {
         self.only_owner();
         require!(AT_ONCE.contains(&method.as_str()), "This call must wait: use request");
         require!(!self.frozen || WAYS_OUT.contains(&method.as_str()), "The wall is frozen");
-        let _ = forward(self.guardian.clone(), &method, args, NearToken::from_near(0));
+        // Guardian v1.7 asks one yocto on a control change.
+        let deposit = if method == "set_take_profit" || method == "set_frozen" { NearToken::from_yoctonear(1) } else { NearToken::from_near(0) };
+        let _ = forward(self.guardian.clone(), &method, args, deposit);
     }
 
     /// Tokens from the wall into Guardian; `msg` names the slot.
@@ -286,18 +288,28 @@ impl Wall {
 
     /// Runs a request whose wait is over.
     pub fn execute(&mut self, id: u64) {
+        // Before the bait check: a stolen owner key could plant the canceller's own key as bait, and
+        // the last road out must not depend on a list that key can write.
+        let rescue = self.pending.iter().find(|r| r.id == id).and_then(|r| match r.action {
+            Action::Rescue { slot } => Some((slot, r.unlock_secs)),
+            _ => None,
+        });
+        if let Some((slot, unlock_secs)) = rescue
+            && env::predecessor_account_id() == self.canceller
+        {
+            require!(env::prepaid_gas() >= MIN_GAS, "Attach at least 60 TGas");
+            require!(now_secs() >= unlock_secs, "Still waiting");
+            let _ = forward(self.guardian.clone(), "cash_out", json!({ "leave": false, "slot": slot }).to_string(), NearToken::from_near(0));
+            return;
+        }
         if self.tripped() {
             return;
         }
         let i = self.pending.iter().position(|r| r.id == id).unwrap_or_else(|| env::panic_str("No such request"));
         require!(now_secs() >= self.pending[i].unlock_secs, "Still waiting");
-        if let Action::Rescue { slot } = &self.pending[i].action {
-            require!(env::predecessor_account_id() == self.canceller, "Only the canceller");
-            let _ = forward(self.guardian.clone(), "cash_out", json!({ "leave": false, "slot": *slot }).to_string(), NearToken::from_near(0));
-            return;
-        }
+        require!(!matches!(self.pending[i].action, Action::Rescue { .. }), "Only the canceller");
         let request = self.pending.remove(i);
-        require!(!self.frozen || matches!(request.action, Action::Unfreeze), "The wall is frozen");
+        require!(!self.frozen || matches!(request.action, Action::Unfreeze | Action::SetSentinel { .. }), "The wall is frozen");
         match request.action {
             Action::Send { token, to, amount } => {
                 let _ = pay(token, to, amount.0);
@@ -367,8 +379,9 @@ impl Wall {
     /// Stops every road but the way home, here and for the agent on Guardian.
     pub fn freeze(&mut self) {
         let who = env::predecessor_account_id();
-        require!(who == self.canceller || who == self.owner || Some(&who) == self.sentinel.as_ref(), "Only the owner, the canceller or the sentinel");
-        self.set_frozen();
+        let watching = Some(&who) == self.sentinel.as_ref();
+        require!(who == self.canceller || who == self.owner || watching, "Only the owner, the canceller or the sentinel");
+        self.set_frozen(watching);
     }
 
     /// A misbehaving sentinel goes at once, frozen or not.
@@ -462,9 +475,11 @@ impl Wall {
 
     /// Also empties the queue: a request that waited through a freeze must not run the moment it lifts.
     /// A rescue stays: it is a way out, and a thief must not be able to clear it with a freeze.
-    fn set_frozen(&mut self) {
+    /// A fooled sentinel must not erase what removes it or lifts its freeze, so its freeze keeps them.
+    /// Any other freeze clears the queue: rescues stay.
+    fn set_frozen(&mut self, keep_remedies: bool) {
         self.frozen = true;
-        self.pending.retain(|r| matches!(r.action, Action::Rescue { .. }));
+        self.pending.retain(|r| matches!(r.action, Action::Rescue { .. }) || (keep_remedies && matches!(r.action, Action::SetSentinel { .. } | Action::Unfreeze)));
         for slot in SLOTS {
             let args = json!({ "frozen": true, "slot": slot }).to_string().into_bytes();
             let _ = Promise::new(self.guardian.clone()).function_call("set_frozen".to_string(), args, NearToken::from_near(0), FREEZE_GAS);
@@ -482,7 +497,7 @@ impl Wall {
         }
         env::log_str("wall: tripwire");
         if !self.frozen {
-            self.set_frozen();
+            self.set_frozen(false);
         }
         true
     }

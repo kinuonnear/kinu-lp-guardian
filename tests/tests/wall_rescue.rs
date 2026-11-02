@@ -190,6 +190,9 @@ async fn a_lost_owner_key_strands_nothing() -> testresult::TestResult<()> {
     ok("execute open", t.call("lp.sandbox", W, "execute", json!({ "id": 2 }), zero).await);
     assert!(t.ledger(W).await.0.is_some(), "a position behind the wall");
 
+    ok("a target at once, one yocto from the wall", t.call(a, W, "guardian_call", at_once("set_take_profit", json!({ "target": { "point": 310000, "above": true } })), zero).await);
+    assert!(t.view(G, "get_take_profit", json!({ "user": W })).await.is_object());
+
     println!("--- The owner key is gone, and a thief holds a copy");
     fails("a stranger cannot ask", t.call("bob.sandbox", W, "rescue", json!({ "slot": 0 }), zero).await, "Only the canceller");
     ok("the canceller asks for a rescue", t.call(CANCELLER, W, "rescue", json!({ "slot": 0 }), zero).await);
@@ -209,7 +212,10 @@ async fn a_lost_owner_key_strands_nothing() -> testresult::TestResult<()> {
     fails("the thief cannot run it", t.call(a, W, "execute", json!({ "id": id }), zero).await, "Only the canceller");
     let (tkq, near_before) = (t.ft(TKQ, W).await, t.near(W).await);
     assert!(t.ledger(W).await.0.is_some(), "still in the position");
-    ok("frozen, the rescue runs", t.call(CANCELLER, W, "execute", json!({ "id": id }), zero).await);
+    // Sandbox accounts share one key, so this is the canceller's key on the bait list.
+    let canceller_key = near_api::Account(CANCELLER.parse()?).list_keys().fetch_from(&net).await?.data[0].0.to_string();
+    println!("{:<42} {}", "the thief plants the canceller's key", t.call(a, W, "add_tripwire", json!({ "public_key": canceller_key }), zero).await);
+    ok("frozen, baited, the rescue runs", t.call(CANCELLER, W, "execute", json!({ "id": id }), zero).await);
     assert!(t.ledger(W).await.0.is_none(), "position closed");
     // Guardian pays its wNEAR out as NEAR.
     let near_gain = t.near(W).await - near_before;
@@ -230,5 +236,41 @@ async fn a_lost_owner_key_strands_nothing() -> testresult::TestResult<()> {
     ok("the canceller sends the NEAR home", t.call(CANCELLER, W, "send_home", json!({ "token": null, "amount": send }), zero).await);
     assert!(t.near(HOME).await - home_near > near_gain * 0.98, "the NEAR is home too");
     ok("the canceller clears the rescue", t.call(CANCELLER, W, "cancel", json!({ "id": id }), zero).await);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_fooled_sentinel_cannot_erase_its_own_removal() -> testresult::TestResult<()> {
+    let sandbox = near_sandbox::Sandbox::start_sandbox().await?;
+    let net = NetworkConfig::from_rpc_url("sandbox", sandbox.rpc_addr.parse()?);
+    let signer = Signer::from_secret_key(near_sandbox::config::DEFAULT_GENESIS_ACCOUNT_PRIVATE_KEY.parse()?)?;
+    for name in ["owner", "carol", "dave", "watcher", "guardian", "wall"] {
+        let id: AccountId = format!("{name}.sandbox").parse()?;
+        sandbox.create_account(id).initial_balance(NearToken::from_near(100)).send().await?;
+    }
+    let t = T { net: net.clone(), signer: signer.clone() };
+    let zero = NearToken::from_near(0);
+    const W: &str = "wall.sandbox";
+    let code = std::fs::read(format!("{}/../target/near/kinu_outer_wall_short/kinu_outer_wall.wasm", env!("CARGO_MANIFEST_DIR")))?;
+    Contract::deploy(W.parse()?).use_code(code).with_init_call("new", json!({ "owner": "owner.sandbox", "canceller": "carol.sandbox", "sentinel": "watcher.sandbox", "home": "dave.sandbox", "guardian": G, "delay_secs": 3600 }))?.with_signer(signer.clone()).send_to(&net).await?.assert_success();
+    let count = || async { t.view(W, "get_pending", json!({})).await.as_array().map(|p| p.len()).unwrap_or(0) };
+    ok("queue a new sentinel", t.call("owner.sandbox", W, "request", json!({ "action": { "SetSentinel": { "sentinel": null } } }), zero).await);
+    ok("queue a delay change", t.call("owner.sandbox", W, "request", json!({ "action": { "SetDelay": { "delay_secs": 7200 } } }), zero).await);
+    ok("the sentinel freezes", t.call("watcher.sandbox", W, "freeze", json!({}), zero).await);
+    assert_eq!(count().await, 1, "what removes it stays, the rest is gone");
+    ok("the owner asks to unfreeze", t.call("owner.sandbox", W, "request", json!({ "action": "Unfreeze" }), zero).await);
+    ok("the sentinel freezes again", t.call("watcher.sandbox", W, "freeze", json!({}), zero).await);
+    assert_eq!(count().await, 2, "both remedies stay");
+    fails("not yet", t.call("carol.sandbox", W, "execute", json!({ "id": 0 }), zero).await, "Still waiting");
+    wait_secs(&sandbox, &t, 7300).await;
+    ok("frozen, the sentinel is replaced", t.call("carol.sandbox", W, "execute", json!({ "id": 0 }), zero).await);
+    assert_eq!(t.view(W, "get_config", json!({})).await["sentinel"], Value::Null);
+    ok("the unfreeze runs", t.call("carol.sandbox", W, "execute", json!({ "id": 2 }), zero).await);
+    assert_eq!(t.view(W, "get_config", json!({})).await["frozen"], false);
+
+    ok("frozen again by the canceller", t.call("carol.sandbox", W, "freeze", json!({}), zero).await);
+    ok("the owner asks to unfreeze", t.call("owner.sandbox", W, "request", json!({ "action": "Unfreeze" }), zero).await);
+    ok("the canceller freezes", t.call("carol.sandbox", W, "freeze", json!({}), zero).await);
+    assert_eq!(count().await, 0, "any other freeze clears the queue");
     Ok(())
 }
