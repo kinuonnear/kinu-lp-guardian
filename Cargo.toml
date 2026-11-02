@@ -1,5 +1,5 @@
 [workspace]
-members = ["contracts/vault", "contracts/probe", "contracts/testtoken", "contracts/mockdcl", "contracts/factory", "contracts/cleanup", "contracts/guardian", "tests"]
+members = ["contracts/vault", "contracts/probe", "contracts/testtoken", "contracts/mockdcl", "contracts/factory", "contracts/cleanup", "contracts/guardian", "contracts/wallprobe", "contracts/wall", "tests"]
 resolver = "3"
 # The agent is its own workspace (wasm32-wasip2, own lockfile); tests use it as a path dependency.
 exclude = ["agent"]
