@@ -79,6 +79,8 @@ pub struct Request {
     pub action: Action,
     pub unlock_secs: u64,
     pub by_agent: bool,
+    /// The canceller's word that this one is honest: the sentinel then leaves it alone.
+    pub vouched: bool,
 }
 
 #[near(serializers = [borsh, json])]
@@ -315,11 +317,20 @@ impl Wall {
         let i = self.pending.iter().position(|r| r.id == id).unwrap_or_else(|| env::panic_str("No such request"));
         if watching {
             require!(!matches!(self.pending[i].action, Action::SetSentinel { .. } | Action::Unfreeze), "Not for the sentinel");
+            require!(!self.pending[i].vouched, "The canceller vouched for this one");
         }
         self.pending.remove(i);
         let reason = reason.unwrap_or_default();
         require!(reason.len() <= MAX_REASON, "Reason too long");
         env::log_str(&format!("wall: request {id} cancelled by {who}: {reason}"));
+    }
+
+    /// Lets an honest request past the sentinel. It gives the canceller nothing new: it can dismiss
+    /// the sentinel outright, and a vouched request can still be cancelled by the owner or the canceller.
+    pub fn vouch(&mut self, id: u64) {
+        require!(env::predecessor_account_id() == self.canceller, "Only the canceller");
+        let request = self.pending.iter_mut().find(|r| r.id == id).unwrap_or_else(|| env::panic_str("No such request"));
+        request.vouched = true;
     }
 
     /// Stops every road but the way home, here and for the agent on Guardian.
@@ -389,7 +400,7 @@ impl Wall {
         let id = self.next_id;
         self.next_id += 1;
         let unlock_secs = now_secs() + wait_secs;
-        self.pending.push(Request { id, action, unlock_secs, by_agent });
+        self.pending.push(Request { id, action, unlock_secs, by_agent, vouched: false });
         env::log_str(&format!("wall: request {id} waits until {unlock_secs}"));
         id
     }

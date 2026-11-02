@@ -1,0 +1,8 @@
+{
+  "display": { "name": "KINU Sentinel" },
+  "operations": ["pubkey", "watch"],
+  "capabilities": { "network": [] },
+  "signing_keys": [
+    { "path": "sentinel", "type": "ed25519" }
+  ]
+}

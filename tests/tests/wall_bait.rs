@@ -107,6 +107,16 @@ async fn wall_alone() -> testresult::TestResult<()> {
     fails("a reason cannot be endless", t.call("carol.sandbox", w, "cancel", json!({ "id": 3, "reason": "x".repeat(300) })).await, "Reason too long");
     ok("a short one is fine", t.call("carol.sandbox", w, "cancel", json!({ "id": 3, "reason": "not mine" })).await);
 
+    println!("--- The canceller vouches, the sentinel stands down");
+    let w2 = "wall2.sandbox";
+    ok("a request (0 on the second wall)", t.call("thief.sandbox", w2, "request", send.clone()).await);
+    fails("the owner cannot vouch", t.call("thief.sandbox", w2, "vouch", json!({ "id": 0 })).await, "Only the canceller");
+    fails("the sentinel cannot vouch", t.call("sentry.sandbox", w2, "vouch", json!({ "id": 0 })).await, "Only the canceller");
+    fails("nothing to vouch for", t.call("carol.sandbox", w2, "vouch", json!({ "id": 9 })).await, "No such request");
+    ok("the canceller vouches", t.call("carol.sandbox", w2, "vouch", json!({ "id": 0 })).await);
+    fails("the sentinel stands down", t.call("sentry.sandbox", w2, "cancel", json!({ "id": 0 })).await, "The canceller vouched");
+    ok("the canceller can still cancel", t.call("carol.sandbox", w2, "cancel", json!({ "id": 0 })).await);
+
     println!("--- The bait at every gas level");
     let bait = near_api::signer::generate_secret_key()?;
     let pk = bait.public_key();

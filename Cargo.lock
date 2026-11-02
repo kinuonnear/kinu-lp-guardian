@@ -1825,6 +1825,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "kinu-guardian-agent",
+ "kinu-sentinel",
  "near-api",
  "near-sandbox",
  "reqwest",
@@ -1862,6 +1863,19 @@ name = "kinu-outer-wall"
 version = "0.1.0"
 dependencies = [
  "near-sdk",
+]
+
+[[package]]
+name = "kinu-sentinel"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "borsh",
+ "bs58 0.5.1",
+ "kinu-guardian-agent",
+ "serde",
+ "serde_json",
+ "wit-bindgen",
 ]
 
 [[package]]

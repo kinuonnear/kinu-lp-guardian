@@ -1,0 +1,33 @@
+[package]
+name = "kinu-sentinel"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "KINU Sentinel: watches outer walls in an OutLayer TEE; it can only cancel and freeze"
+
+[[bin]]
+name = "kinu-sentinel"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+borsh = { version = "1", features = ["derive"] }
+base64 = "0.22"
+bs58 = "0.5"
+kinu-guardian-agent = { path = "../agent" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wit-bindgen = "0.36"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
+
+# Built on its own (target wasm32-wasip2), not part of the contracts workspace.
+[workspace]
