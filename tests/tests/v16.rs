@@ -230,7 +230,7 @@ async fn v15_with_people_inside_to_v16() -> testresult::TestResult<()> {
     let r = upgrade(code.clone()).await;
     assert!(r.is_success(), "upgrade: {r:?}");
     let cfg = t.view(G, "get_config", json!({})).await;
-    assert_eq!(cfg["version"], "1.7.0");
+    assert_eq!(cfg["version"], "1.8.0");
     assert_eq!(cfg["admin_delay_secs"], 172_800, "the production build");
     assert_eq!(snapshot(&t, &who).await, before, "every record, read, target, debt and total is the same");
     println!("{:<58} same", "all records, reads, targets, debts, totals");

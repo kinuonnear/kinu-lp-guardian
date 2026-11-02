@@ -6,10 +6,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 out=${1:-/tmp/dcl-live.wasm}
-curl -sf https://rpc.mainnet.near.org -H 'content-type: application/json' \
+curl -sf https://free.rpc.fastnear.com -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"query","params":{"request_type":"view_code","finality":"final","account_id":"dclv2.ref-labs.near"}}' \
   | python3 -I -c 'import sys, json, base64; r = json.load(sys.stdin)["result"]; open(sys.argv[1], "wb").write(base64.b64decode(r["code_base64"])); print("dclv2.ref-labs.near code_hash", r["hash"])' "$out"
-./scripts/build.sh
+./scripts/build.sh legacy
 cd tests
 failed=0
 for t in realdcl shared attacks direct tax gas_sweep migrate v14 agent_key; do

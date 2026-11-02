@@ -140,6 +140,7 @@ const T_ADD: u64 = 50; // add_liquidity passes at 40 TGas, burns ~12
 const T_REMOVE: u64 = 40; // remove_liquidity passes at 30, burns ~9
 const T_WITHDRAW: u64 = 50; // withdraw_asset passes at 40, burns ~10
 const T_FT_CALL: u64 = 60; // a token into Rhea: ft_transfer_call → ft_on_transfer → resolve
+const T_SWAP: u64 = 60; // a sale: ft_transfer_call → the swap → the output → resolve
 const T_TRANSFER: u64 = 10;
 const CB_OWN: u64 = T_OWN; // a callback that schedules nothing more
 const CB_ADDED: u64 = T_VIEW + CB_OWN + T_OWN; // reads the balance, then on_measured
@@ -172,10 +173,16 @@ const CB_CASH_CLOSED: u64 = T_OWN + out_floor(2, 2);
 const CB_LIQ_CASH: u64 = T_REMOVE + CB_CASH_CLOSED + T_OWN;
 // v1.5 claim_fees: remove_liquidity with amount 0 takes only the fees; with `send`, both go out.
 const CB_FEES: u64 = T_OWN + out_floor(2, 2);
+// v1.8 sale after a cut loss: withdraw, read what arrived, swap, read what came back, send that back.
+const CB_SOLD_READ: u64 = T_TRANSFER + CB_OUT_PAID + T_OWN;
+const CB_SOLD: u64 = T_VIEW + CB_SOLD_READ + T_OWN;
+const CB_SALE_ARRIVED: u64 = T_SWAP + CB_SOLD + T_OWN;
+const CB_SALE_WITHDRAWN: u64 = T_VIEW + CB_SALE_ARRIVED + T_OWN;
+const CB_SALE_POOL: u64 = T_WITHDRAW + CB_SALE_WITHDRAWN + T_OWN;
 const fn tg(t: u64) -> Gas {
     Gas::from_tgas(t)
 }
-pub const VERSION: &str = "1.7.0";
+pub const VERSION: &str = "1.8.0";
 /// How long an admin action waits after it is proposed (v1.3): long enough for every user to see
 /// the event and cash out.
 #[cfg(not(feature = "short-delay"))]
@@ -186,6 +193,8 @@ pub const ADMIN_DELAY_SECS: u64 = 48 * 3_600;
 pub const ADMIN_DELAY_SECS: u64 = 600;
 /// Raw storage key of staged code (kept out of the state struct so normal calls never load it).
 const STAGED_CODE: &[u8] = b"staged_code";
+/// How far a sale may move the price, and how far the price may be from the one recorded before it: 3%.
+pub const SALE_BAND_POINTS: i32 = 300;
 /// Gas for the new code's `migrate`, run in the same receipt as its deploy.
 const T_MIGRATE: u64 = 50;
 const ZERO: NearToken = NearToken::from_yoctonear(0);
@@ -251,6 +260,15 @@ pub struct Account {
 pub struct Seen {
     pub point: i32,
     pub at_secs: u64,
+}
+
+/// A cut loss closed this position: its falling token is still to be sold for the other one (v1.8).
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Sale {
+    pub pool_id: String,
+    pub token_in: AccountId,
+    pub token_out: AccountId,
 }
 
 /// What the owner can do, each only after ADMIN_DELAY_SECS (v1.3).
@@ -997,6 +1015,8 @@ impl Guardian {
             return PromiseOrValue::Value(amount);
         }
         self.lock();
+        // New money is not what the cut loss was for: the sale it left is dropped.
+        self.del_sale(&sender_id);
         PromiseOrValue::Promise(
             view(&self.dcl, "list_user_assets", json!({ "account_id": env::current_account_id() }))
                 .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_DEP_BEFORE)).with_unused_gas_weight(2).on_deposit_before(sender_id, token, amount)),
@@ -1068,6 +1088,8 @@ impl Guardian {
         self.assert_settled();
         let user = Who::mine(slot);
         let pool_id = self.account(&user).pool_id().to_string();
+        // The user takes over from a sale a cut loss left.
+        self.del_sale(&user);
         if left_point >= right_point {
             refuse(Refusal::BadRange);
         }
@@ -1120,8 +1142,12 @@ impl Guardian {
                 refuse(Refusal::Frozen);
             }
         }
-        let pos = acct.position.unwrap_or_else(|| env::panic_str("No open position"));
-        view(&self.dcl, "get_pool", json!({ "pool_id": pos.pool_id }))
+        // With no position a sale still needs a recorded price (v1.8).
+        let pool_id = match acct.position {
+            Some(pos) => pos.pool_id,
+            None => self.sale_of(&user).map(|s| s.pool_id).unwrap_or_else(|| env::panic_str("No open position")),
+        };
+        view(&self.dcl, "get_pool", json!({ "pool_id": pool_id }))
             .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_OWN)).on_poked(user))
     }
 
@@ -1129,7 +1155,8 @@ impl Guardian {
     pub fn on_poked(&mut self, user: Who, #[callback_result] pool: Result<Option<PoolView>, PromiseError>) -> bool {
         let Ok(Some(pool)) = pool else { return false };
         let Some(mut acct) = self.rec(&user) else { return false };
-        if acct.position.is_none() {
+        let open = acct.position.is_some();
+        if !open && self.sale_of(&user).is_none() {
             return false;
         }
         let now = now_secs();
@@ -1141,7 +1168,8 @@ impl Guardian {
             return false;
         }
         // The best price moves only as far as the price held at this read and one 3–60 min earlier.
-        if let Some(p) = prev.filter(|p| check_seen_age(Some(p.at_secs), now).is_ok()) {
+        // The marks belong to a position: a sale only needs the read.
+        if let Some(p) = prev.filter(|p| open && check_seen_age(Some(p.at_secs), now).is_ok()) {
             acct.note_confirmed(p.point, cur);
         }
         emit("point_noted", json!({ "user": user, "current_point": cur, "high_point": acct.high_point, "low_point": acct.low_point }));
@@ -1338,7 +1366,7 @@ impl Guardian {
                 env::panic_str("The user has not allowed the agent to exit");
             }
         }
-        let pos = acct.position.unwrap_or_else(|| env::panic_str("No open position"));
+        let Some(pos) = acct.position else { return self.begin_sale(user, by_user) };
         self.assert_free();
         self.lock();
         view(&self.dcl, "get_pool", json!({ "pool_id": pos.pool_id }))
@@ -1376,28 +1404,29 @@ impl Guardian {
         }
         let Some(pos) = acct.position else { return self.bail(&user, "No open position") };
         emit("exit_started", json!({ "user": user, "by": if by_user { "user" } else { "agent" }, "reason": reason, "lpt_id": pos.lpt_id, "current_point": cur }));
+        let sell = reason == "exit_rule";
         PromiseOrValue::Promise(
             view(&self.dcl, "get_liquidity", json!({ "lpt_id": pos.lpt_id }))
-                .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_LIQ_EXIT)).with_unused_gas_weight(2).on_liquidity_for_exit(user, pool)),
+                .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_LIQ_EXIT)).with_unused_gas_weight(2).on_liquidity_for_exit(user, pool, sell)),
         )
     }
 
     #[private]
-    pub fn on_liquidity_for_exit(&mut self, user: Who, pool: PoolView, #[callback_result] liq: Result<Option<LiquidityView>, PromiseError>) -> PromiseOrValue<bool> {
+    pub fn on_liquidity_for_exit(&mut self, user: Who, pool: PoolView, sell: bool, #[callback_result] liq: Result<Option<LiquidityView>, PromiseError>) -> PromiseOrValue<bool> {
         let Ok(Some(liq)) = liq else { return self.bail(&user, "Could not read the open position from Rhea DCL") };
         let Some(pos) = self.account(&user).position else { return self.bail(&user, "No open position") };
         PromiseOrValue::Promise(
             call(&self.dcl, "remove_liquidity", remove_args(&pos.lpt_id, liq.amount), ZERO, tg(T_REMOVE))
-                .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_OWN)).with_unused_gas_weight(2).on_exited(user, pool)),
+                .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_OWN)).with_unused_gas_weight(2).on_exited(user, pool, sell)),
         )
     }
 
     #[private]
-    pub fn on_exited(&mut self, user: Who, pool: PoolView) -> bool {
-        self.exited(user, pool, removed_result())
+    pub fn on_exited(&mut self, user: Who, pool: PoolView, sell: bool) -> bool {
+        self.exited(user, pool, sell, removed_result())
     }
 
-    fn exited(&mut self, user: Who, pool: PoolView, removed: Removed) -> bool {
+    fn exited(&mut self, user: Who, pool: PoolView, sell: bool, removed: Removed) -> bool {
         let close = self.credit_removed(&user, &pool, removed);
         if close == Close::Refused {
             let _ = self.bail(&user, "Rhea DCL refused to close the position; it stays open");
@@ -1405,8 +1434,176 @@ impl Guardian {
         }
         // The position it was set for is closed: a take-profit target never outlives it.
         self.del_tp(&user);
+        // A cut loss goes on to a sale: it needs a price read after the close, so it is a step of its own.
+        if sell && close == Close::Closed {
+            let acct = self.account(&user);
+            let (x, y) = acct.pool_tokens();
+            let (token_in, token_out) = if acct.policy.exit_on_rise { (y, x) } else { (x, y) };
+            let sale = Sale { pool_id: acct.pool_id().to_string(), token_in, token_out };
+            emit("sale_due", json!({ "user": user, "sale": sale }));
+            self.put_sale(&user, &sale);
+        }
         self.unlock();
         close == Close::Closed
+    }
+
+    // ---------- the sale after a cut loss (v1.8) ----------
+
+    /// `exit` with no position open and a sale due. Rhea swaps inside a price band and pays the record's
+    /// own wallet; what it did not swap comes back here and goes to that wallet too.
+    fn begin_sale(&mut self, user: Who, by_user: bool) -> Promise {
+        let sale = self.sale_of(&user).unwrap_or_else(|| env::panic_str("No open position"));
+        self.assert_running();
+        self.assert_settled();
+        self.assert_free();
+        self.lock();
+        view(&self.dcl, "get_pool", json!({ "pool_id": sale.pool_id }))
+            .and(view(&sale.token_out, "storage_balance_of", json!({ "account_id": user.account() })))
+            .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_SALE_POOL)).with_unused_gas_weight(2).on_pool_for_sale(user, by_user))
+    }
+
+    #[private]
+    pub fn on_pool_for_sale(&mut self, user: Who, by_user: bool, #[callback_result] pool: Result<Option<PoolView>, PromiseError>, #[callback_result] wallet: Result<Option<Value>, PromiseError>) -> PromiseOrValue<bool> {
+        self.sale_checked(user, by_user, pool.ok().flatten(), matches!(wallet, Ok(Some(_))))
+    }
+
+    fn sale_checked(&mut self, user: Who, by_user: bool, pool: Option<PoolView>, registered: bool) -> PromiseOrValue<bool> {
+        let Some(sale) = self.sale_of(&user) else { return self.bail(&user, "No sale is due") };
+        let Some(pool) = pool else { return self.bail(&user, "Could not read the pool from Rhea DCL") };
+        // Rhea would keep the output in its lost and found. NEAR needs no registration.
+        if sale.token_out != self.wnear && !registered {
+            return self.bail(&user, "Your wallet is not registered on the token it would receive; register, then ask again");
+        }
+        let cur = pool.current_point;
+        if !by_user {
+            let seen = self.seen_of(&user);
+            if let Err(r) = check_seen_age(seen.as_ref().map(|s| s.at_secs), now_secs()) {
+                return self.bail(&user, r.message());
+            }
+            if seen.is_none_or(|s| (i64::from(s.point) - i64::from(cur)).abs() > i64::from(SALE_BAND_POINTS)) {
+                return self.bail(&user, Refusal::NotConfirmed.message());
+            }
+        }
+        let mut acct = self.account(&user);
+        let amount = acct.held(&sale.token_in);
+        if amount == 0 {
+            self.del_sale(&user);
+            return self.bail(&user, "Nothing left to sell");
+        }
+        acct.debit(&sale.token_in, amount);
+        self.put(&user, acct);
+        self.del_seen(&user);
+        // The token falls with the point when it is token X, and with the point rising when it is Y.
+        let stop = if sale.token_in == pool.token_x { cur - SALE_BAND_POINTS } else { cur + SALE_BAND_POINTS };
+        emit("sale_started", json!({ "user": user, "by": if by_user { "user" } else { "agent" }, "sale": sale, "amount": U128(amount), "current_point": cur, "stop_point": stop }));
+        PromiseOrValue::Promise(
+            call(&self.dcl, "withdraw_asset", json!({ "token_id": sale.token_in, "amount": U128(amount), "skip_unwrap_near": true }), ZERO, tg(T_WITHDRAW))
+                .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_SALE_WITHDRAWN)).with_unused_gas_weight(2).on_sale_withdrawn(user, sale, U128(amount), stop)),
+        )
+    }
+
+    #[private]
+    pub fn on_sale_withdrawn(&mut self, user: Who, sale: Sale, amount: U128, stop: i32) -> PromiseOrValue<bool> {
+        let released = match env::promise_result_checked(0, 16) {
+            Ok(v) => v != b"false",
+            Err(PromiseError::Failed) => false,
+            Err(_) => true,
+        };
+        if !released {
+            let mut acct = self.account(&user);
+            acct.credit(&sale.token_in, amount.0);
+            self.put(&user, acct);
+            return self.bail(&user, "Rhea DCL did not release the tokens; they stay on your ledger");
+        }
+        self.del_sale(&user);
+        let token = sale.token_in.clone();
+        PromiseOrValue::Promise(
+            view(&token, "ft_balance_of", json!({ "account_id": env::current_account_id() }))
+                .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_SALE_ARRIVED)).with_unused_gas_weight(2).on_sale_arrived(user, sale, amount, stop)),
+        )
+    }
+
+    #[private]
+    pub fn on_sale_arrived(&mut self, user: Who, sale: Sale, amount: U128, stop: i32, #[callback_result] balance: Result<U128, PromiseError>) -> PromiseOrValue<bool> {
+        self.sale_arrived(user, sale, amount, stop, balance.ok().map(|b| b.0))
+    }
+
+    fn sale_arrived(&mut self, user: Who, sale: Sale, amount: U128, stop: i32, balance: Option<u128>) -> PromiseOrValue<bool> {
+        let owed = owed_total(&sale.token_in);
+        let Some(balance) = balance else {
+            self.owe_unmeasured(&user, &sale.token_in, amount.0);
+            self.unlock();
+            return PromiseOrValue::Value(false);
+        };
+        let got = balance.saturating_sub(owed).min(amount.0);
+        if got == 0 {
+            mark_unsettled(&user, "Rhea reported a sale's tokens released but nothing arrived");
+            self.unlock();
+            return PromiseOrValue::Value(false);
+        }
+        if got < amount.0 {
+            emit("payout_short", json!({ "user": user, "token": sale.token_in, "released": amount, "arrived": U128(got) }));
+        }
+        let msg = json!({ "SwapByStopPoint": { "pool_id": sale.pool_id, "output_token": sale.token_out, "stop_point": stop, "skip_unwrap_near": sale.token_out != self.wnear, "swap_out_recipient": user.account() } });
+        PromiseOrValue::Promise(
+            call(&sale.token_in, "ft_transfer_call", json!({ "receiver_id": self.dcl, "amount": U128(got), "msg": msg.to_string() }), ONE_YOCTO, tg(T_SWAP))
+                .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_SOLD)).with_unused_gas_weight(2).on_sold(user, sale, U128(got))),
+        )
+    }
+
+    /// Whatever the swap did, what it left is read where it lands.
+    #[private]
+    pub fn on_sold(&mut self, user: Who, sale: Sale, got: U128) -> Promise {
+        view(&sale.token_in, "ft_balance_of", json!({ "account_id": env::current_account_id() }))
+            .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_SOLD_READ)).with_unused_gas_weight(2).on_sold_read(user, sale, got))
+    }
+
+    #[private]
+    pub fn on_sold_read(&mut self, user: Who, sale: Sale, got: U128, #[callback_result] balance: Result<U128, PromiseError>) -> PromiseOrValue<bool> {
+        self.sold(user, sale, got, balance.ok().map(|b| b.0))
+    }
+
+    fn sold(&mut self, user: Who, sale: Sale, got: U128, balance: Option<u128>) -> PromiseOrValue<bool> {
+        let Some(balance) = balance else {
+            self.owe_unmeasured(&user, &sale.token_in, got.0);
+            self.unlock();
+            return PromiseOrValue::Value(false);
+        };
+        let rest = balance.saturating_sub(owed_total(&sale.token_in)).min(got.0);
+        emit("sold", json!({ "user": user, "token_in": sale.token_in, "token_out": sale.token_out, "sold": U128(got.0 - rest), "rest": U128(rest) }));
+        if rest == 0 {
+            self.unlock();
+            return PromiseOrValue::Value(true);
+        }
+        let legs = vec![(sale.token_in.clone(), U128(rest))];
+        PromiseOrValue::Promise(
+            call(&sale.token_in, "ft_transfer", json!({ "receiver_id": user.account(), "amount": U128(rest) }), ONE_YOCTO, tg(T_TRANSFER))
+                .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_OUT_PAID)).with_unused_gas_weight(2).on_out_paid(user, legs, None)),
+        )
+    }
+
+    fn owe_unmeasured(&mut self, user: &Who, token: &AccountId, amount: u128) {
+        let mut acct = self.account(user);
+        acct.owe(token, amount);
+        self.put(user, acct);
+        set_owed_total(token, owed_total(token) + amount);
+        emit("payout_unmeasured", json!({ "user": user, "token": token, "amount": U128(amount), "why": "Could not read what arrived; use claim" }));
+    }
+
+    /// The user keeps the tokens: the sale a cut loss left is dropped. Allowed while paused.
+    #[payable]
+    pub fn cancel_sale(&mut self, slot: Option<u8>) {
+        near_sdk::assert_one_yocto();
+        let user = Who::mine(slot);
+        if self.sale_of(&user).is_none() {
+            env::panic_str("No sale is due");
+        }
+        self.del_sale(&user);
+        emit("sale_cancelled", json!({ "user": user }));
+    }
+
+    pub fn get_sale(&self, user: Who) -> Option<Sale> {
+        self.sale_of(&user)
     }
 
     /// v1.4, the user only: the target at which the agent may close the position for profit,
@@ -1855,6 +2052,18 @@ impl Guardian {
         env::storage_write(&Self::raw_key(kind, who), &near_sdk::borsh::to_vec(value).unwrap_or_else(|_| env::panic_str("Could not store the record")));
     }
 
+    fn sale_of(&self, who: &Who) -> Option<Sale> {
+        Self::raw_read("s_sale", who)
+    }
+
+    fn put_sale(&mut self, who: &Who, sale: &Sale) {
+        Self::raw_write("s_sale", who, sale);
+    }
+
+    fn del_sale(&mut self, who: &Who) {
+        env::storage_remove(&Self::raw_key("s_sale", who));
+    }
+
     fn rec(&self, who: &Who) -> Option<Account> {
         match who.parts()? {
             (account, 0) => self.accounts.get(&account).cloned(),
@@ -1940,6 +2149,7 @@ impl Guardian {
         }
         self.del_seen(who);
         self.del_tp(who);
+        self.del_sale(who);
         if self.get_slots(account.clone()).is_empty() {
             self.users.remove(&account);
         }
@@ -2644,7 +2854,7 @@ mod tests {
         ctx("guardian.testnet", ZERO);
         g.lock();
         // Rhea closed the position but answered in a shape this code does not know.
-        assert!(!g.exited(acc("alice.testnet").into(), tkq_pool(), Removed::Unknown));
+        assert!(!g.exited(acc("alice.testnet").into(), tkq_pool(), false, Removed::Unknown));
         assert!(g.get_account(acc("alice.testnet").into()).unwrap().position.is_none(), "the record says the position is gone");
         assert_eq!(g.get_unsettled(), vec![acc("alice.testnet")]);
         assert!(!g.is_busy());
@@ -3381,7 +3591,7 @@ mod tests {
         assert!(matches!(g.on_pool_for_exit(acc("alice.testnet").into(), false, pool_at(5_400)), PromiseOrValue::Promise(_)));
         assert!(exit_logs().contains("\"reason\":\"take_profit\""));
         // Once closed, the target is gone with the position.
-        assert!(g.exited(acc("alice.testnet").into(), PoolView { token_x: acc("tkq.testnet"), token_y: acc("wrap.testnet"), current_point: 5_400 }, Removed::Amounts(10, 20)));
+        assert!(g.exited(acc("alice.testnet").into(), PoolView { token_x: acc("tkq.testnet"), token_y: acc("wrap.testnet"), current_point: 5_400 }, false, Removed::Amounts(10, 20)));
         assert_eq!(g.get_take_profit(acc("alice.testnet").into()), None);
         assert!(g.get_account(acc("alice.testnet").into()).unwrap().position.is_none());
     }
@@ -3829,5 +4039,144 @@ mod tests {
         g.set_frozen(true, None);
         ctx("alice.testnet", NearToken::from_yoctonear(1));
         g.set_policy(policy(), None);
+    }
+
+    // ---------- the sale after a cut loss (v1.8): every failure ends with the tokens somewhere the user reaches ----------
+
+    fn sale_ready() -> (Guardian, Who, Sale, PoolView) {
+        let mut g = joined();
+        with_position(&mut g);
+        let alice: Who = acc("alice.testnet").into();
+        let pool = PoolView { token_x: acc("tkq.testnet"), token_y: acc("wrap.testnet"), current_point: 0 };
+        assert!(g.exited(alice.clone(), pool.clone(), true, Removed::Amounts(10, 20)));
+        let sale = g.get_sale(alice.clone()).unwrap();
+        assert_eq!((&sale.token_in, &sale.token_out), (&acc("tkq.testnet"), &acc("wrap.testnet")));
+        (g, alice, sale, pool)
+    }
+
+    #[test]
+    fn v18_a_cut_loss_leaves_a_sale_of_the_falling_token() {
+        let _ = sale_ready();
+    }
+
+    #[test]
+    fn v18_a_close_that_is_no_cut_loss_leaves_no_sale() {
+        let mut g = joined();
+        with_position(&mut g);
+        let pool = PoolView { token_x: acc("tkq.testnet"), token_y: acc("wrap.testnet"), current_point: 0 };
+        assert!(g.exited(acc("alice.testnet").into(), pool, false, Removed::Amounts(10, 20)));
+        assert_eq!(g.get_sale(acc("alice.testnet").into()), None);
+    }
+
+    #[test]
+    fn v18_a_refused_sale_moves_nothing() {
+        let (mut g, alice, sale, pool) = sale_ready();
+        g.lock();
+        // No wallet registration on a token that is not NEAR: the output would sit in Rhea's lost and found.
+        let wrong = Sale { pool_id: sale.pool_id.clone(), token_in: sale.token_out.clone(), token_out: sale.token_in.clone() };
+        g.put_sale(&alice, &wrong);
+        assert!(matches!(g.sale_checked(alice.clone(), true, Some(pool.clone()), false), PromiseOrValue::Value(false)));
+        assert_eq!(g.account(&alice).held(&acc("wrap.testnet")), 20);
+        assert_eq!(g.get_sale(alice.clone()), Some(wrong));
+        assert!(!g.is_busy());
+        g.put_sale(&alice, &sale);
+        // No pool read.
+        g.lock();
+        assert!(matches!(g.sale_checked(alice.clone(), true, None, true), PromiseOrValue::Value(false)));
+        assert_eq!(g.account(&alice).held(&acc("tkq.testnet")), 10);
+        assert!(!g.is_busy());
+        // The agent with no read, and with one too far away.
+        g.lock();
+        assert!(matches!(g.sale_checked(alice.clone(), false, Some(pool.clone()), true), PromiseOrValue::Value(false)));
+        g.seen.insert(acc("alice.testnet"), Seen { point: SALE_BAND_POINTS + 1, at_secs: 9_700 });
+        at("guardian.testnet", 10_000);
+        g.lock();
+        assert!(matches!(g.sale_checked(alice.clone(), false, Some(pool.clone()), true), PromiseOrValue::Value(false)));
+        assert_eq!(g.account(&alice).held(&acc("tkq.testnet")), 10);
+        // At the edge of the band it starts, and the ledger is debited before anything leaves.
+        g.seen.insert(acc("alice.testnet"), Seen { point: SALE_BAND_POINTS, at_secs: 9_700 });
+        g.lock();
+        assert!(matches!(g.sale_checked(alice.clone(), false, Some(pool), true), PromiseOrValue::Promise(_)));
+        assert_eq!(g.account(&alice).held(&acc("tkq.testnet")), 0);
+    }
+
+    #[test]
+    fn v18_rhea_keeping_the_tokens_puts_them_back_on_the_ledger() {
+        let (mut g, alice, sale, pool) = sale_ready();
+        g.lock();
+        let _ = g.sale_checked(alice.clone(), true, Some(pool), true);
+        assert_eq!(g.account(&alice).held(&acc("tkq.testnet")), 0);
+        testing_env!(
+            VMContextBuilder::new().predecessor_account_id(acc("guardian.testnet")).current_account_id(acc("guardian.testnet")).build(),
+            near_sdk::test_vm_config(),
+            near_sdk::RuntimeFeesConfig::test(),
+            Default::default(),
+            vec![near_sdk::PromiseResult::Failed]
+        );
+        assert!(matches!(g.on_sale_withdrawn(alice.clone(), sale, U128(10), -300), PromiseOrValue::Value(false)));
+        assert_eq!(g.account(&alice).held(&acc("tkq.testnet")), 10);
+        assert!(g.get_sale(alice).is_some(), "the sale can run again");
+        assert!(!g.is_busy());
+    }
+
+    #[test]
+    fn v18_a_lost_read_leaves_the_tokens_owed_and_the_lock_free() {
+        let (mut g, alice, sale, pool) = sale_ready();
+        g.lock();
+        let _ = g.sale_checked(alice.clone(), true, Some(pool), true);
+        assert!(matches!(g.sale_arrived(alice.clone(), sale.clone(), U128(10), -300, None), PromiseOrValue::Value(false)));
+        assert_eq!(g.account(&alice).owed_of(&acc("tkq.testnet")), 10);
+        assert_eq!(owed_total(&acc("tkq.testnet")), 10);
+        assert!(!g.is_busy());
+        // The read after the swap, too.
+        g.lock();
+        assert!(matches!(g.sold(alice.clone(), sale, U128(4), None), PromiseOrValue::Value(false)));
+        assert_eq!(g.account(&alice).owed_of(&acc("tkq.testnet")), 14);
+        assert!(!g.is_busy());
+    }
+
+    #[test]
+    fn v18_nothing_arriving_is_marked_for_settle() {
+        let (mut g, alice, sale, pool) = sale_ready();
+        g.lock();
+        let _ = g.sale_checked(alice.clone(), true, Some(pool), true);
+        assert!(matches!(g.sale_arrived(alice.clone(), sale, U128(10), -300, Some(0)), PromiseOrValue::Value(false)));
+        assert!(unsettled().contains(&alice));
+        assert!(!g.is_busy());
+    }
+
+    #[test]
+    fn v18_what_the_swap_left_goes_to_the_wallet_never_more_than_was_sent() {
+        let (mut g, alice, sale, _) = sale_ready();
+        // All sold.
+        g.lock();
+        assert!(matches!(g.sold(alice.clone(), sale.clone(), U128(10), Some(0)), PromiseOrValue::Value(true)));
+        assert!(!g.is_busy());
+        // Part sold: a transfer follows, and what others are owed in that wallet is left alone.
+        set_owed_total(&acc("tkq.testnet"), 100);
+        g.lock();
+        assert!(matches!(g.sold(alice.clone(), sale.clone(), U128(10), Some(104)), PromiseOrValue::Promise(_)));
+        assert!(near_sdk::test_utils::get_logs().iter().any(|l| l.contains("\"event\":\"sold\"") && l.contains("\"sold\":\"6\"") && l.contains("\"rest\":\"4\"")));
+        // A wallet holding more than this sale put in pays no more than this sale put in.
+        g.lock();
+        assert!(matches!(g.sold(alice, sale, U128(10), Some(1_000)), PromiseOrValue::Promise(_)));
+        assert!(near_sdk::test_utils::get_logs().iter().any(|l| l.contains("\"rest\":\"10\"")));
+    }
+
+    #[test]
+    fn v18_the_user_takes_over_from_a_sale() {
+        let (mut g, alice, _, _) = sale_ready();
+        ctx("alice.testnet", NearToken::from_yoctonear(1));
+        g.cancel_sale(None);
+        assert_eq!(g.get_sale(alice.clone()), None);
+        assert!(panics(|| g.cancel_sale(None)));
+    }
+
+    #[test]
+    fn v18_a_stranger_cannot_cancel_a_sale() {
+        let (mut g, alice, _, _) = sale_ready();
+        ctx("mallory.testnet", NearToken::from_yoctonear(1));
+        assert!(panics(|| g.cancel_sale(None)));
+        assert!(g.get_sale(alice).is_some());
     }
 }

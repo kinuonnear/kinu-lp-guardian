@@ -85,6 +85,8 @@ pub fn take_profit_met(tp: &TakeProfitView, point: i32) -> bool {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
+    /// The sale a cut loss left (contract v1.8), through `exit`.
+    Sell,
     Noop(&'static str),
     Poke,
     Rebalance { pool_id: String, left_point: i32, right_point: i32 },
@@ -102,6 +104,28 @@ pub struct SeenView {
 /// it read 3 to 60 minutes before (so one block's pushed price is not enough).
 pub const SEEN_MIN_AGE_SECS: u64 = 180;
 pub const SEEN_MAX_AGE_SECS: u64 = 3_600;
+/// Contract v1.8: a sale needs a read within this distance of the price now.
+pub const SALE_BAND_POINTS: i32 = 300;
+
+/// A cut loss closed the position and left a sale (contract v1.8): `exit` runs it once a read has
+/// aged, `poke` makes that read. A sale waits on the price, it never chases it.
+pub fn decide_sale(v: &AccountView, me: &str, cur: i32, seen: Option<&SeenView>, now_secs: u64) -> Action {
+    if v.agent.as_deref() != Some(me) {
+        return Action::Noop("this user does not name this agent");
+    }
+    if v.frozen {
+        return Action::Noop("the user froze the agent");
+    }
+    let Some(s) = seen else { return Action::Poke };
+    let age = now_secs.saturating_sub(s.at_secs);
+    if age < SEEN_MIN_AGE_SECS {
+        return Action::Noop("a sale waits for its read to age");
+    }
+    if age <= SEEN_MAX_AGE_SECS && (i64::from(s.point) - i64::from(cur)).abs() <= i64::from(SALE_BAND_POINTS) {
+        return Action::Sell;
+    }
+    Action::Poke
+}
 
 fn moved_against(v: &AccountView, point: i32) -> i64 {
     if v.policy.exit_on_rise {
@@ -381,6 +405,7 @@ pub const RHEA_CODE_HASH: &str = "BzhtCCGJibs9ykCZUuMZ9Diq3gFAi4ZGeMHgEuVqvoiA";
 pub fn hold_on_rhea_change(action: Action, rhea_code: &str) -> Action {
     match action {
         Action::Rebalance { .. } if rhea_code != RHEA_CODE_HASH => Action::Noop("Rhea changed its contract: re-centres wait until KINU has tested the new version"),
+        Action::Sell if rhea_code != RHEA_CODE_HASH => Action::Noop("Rhea changed its contract: a sale waits until KINU has tested the new version"),
         other => other,
     }
 }
@@ -390,7 +415,7 @@ pub fn call_for(action: &Action, user: &str) -> Option<(&'static str, String)> {
     match action {
         Action::Noop(_) => None,
         Action::Poke => Some(("poke", json!({ "user": user }).to_string())),
-        Action::Exit => Some(("exit", json!({ "user": user }).to_string())),
+        Action::Exit | Action::Sell => Some(("exit", json!({ "user": user }).to_string())),
         Action::Rebalance { pool_id, left_point, right_point } => Some((
             "request_rebalance",
             json!({ "user": user, "request": { "pool_id": pool_id, "left_point": left_point, "right_point": right_point } }).to_string(),
@@ -402,13 +427,12 @@ pub fn call_for(action: &Action, user: &str) -> Option<(&'static str, String)> {
 pub const MAX_USERS_PER_RUN: usize = 5;
 
 /// Gas the agent attaches per call: what the contract's chain for it reserves (v1.1 floors: move
-/// 235, exit 120, poke ~30 TGas) plus margin. A wallet must hold about a tenth of a NEAR per 100 TGas
+/// 235, exit 120, a sale 255, poke ~30 TGas) plus margin. A wallet must hold about a tenth of a NEAR per 100 TGas
 /// attached at signing (refunded), so the small calls no longer need the 0.3 NEAR a move does.
 pub fn gas_for(method: &str) -> u64 {
     const T: u64 = 1_000_000_000_000;
     match method {
         "poke" => 50 * T,
-        "exit" => 150 * T,
         _ => 300 * T,
     }
 }
@@ -454,6 +478,24 @@ mod tests {
         assert!(!record_ok(&"a".repeat(65)));
         assert_eq!(records_of("alice.near", &[0, 2]), vec!["alice.near".to_string(), "alice.near#2".into()]);
         assert!(records_of("alice.near", &[]).is_empty());
+    }
+
+    #[test]
+    fn a_sale_waits_for_an_aged_read_near_the_price() {
+        let mut v = vault(None, None);
+        v.agent = Some(ME.into());
+        let at = |p: i32, age: u64| SeenView { point: p, at_secs: 10_000 - age };
+        assert!(matches!(decide_sale(&v, ME, 100, None, 10_000), Action::Poke), "no read yet");
+        assert!(matches!(decide_sale(&v, ME, 100, Some(&at(100, 60)), 10_000), Action::Noop(_)), "too young");
+        assert!(matches!(decide_sale(&v, ME, 100, Some(&at(200, 200)), 10_000), Action::Sell), "aged and close");
+        assert!(matches!(decide_sale(&v, ME, 100, Some(&at(500, 200)), 10_000), Action::Poke), "too far: read again");
+        assert!(matches!(decide_sale(&v, ME, 100, Some(&at(100, 4_000)), 10_000), Action::Poke), "too old: read again");
+        v.frozen = true;
+        assert!(matches!(decide_sale(&v, ME, 100, Some(&at(100, 200)), 10_000), Action::Noop(_)), "frozen");
+        v.frozen = false;
+        assert!(matches!(decide_sale(&v, "other.near", 100, Some(&at(100, 200)), 10_000), Action::Noop(_)), "not this agent");
+        assert!(matches!(hold_on_rhea_change(Action::Sell, "SomethingElse"), Action::Noop(_)));
+        assert_eq!(call_for(&Action::Sell, "a.near").map(|c| c.0), Some("exit"));
     }
 
     #[test]
@@ -684,7 +726,7 @@ mod tests {
     #[test]
     fn each_call_gets_its_chains_gas() {
         assert_eq!(gas_for("request_rebalance"), 300_000_000_000_000);
-        assert_eq!(gas_for("exit"), 150_000_000_000_000);
+        assert_eq!(gas_for("exit"), 300_000_000_000_000);
         assert_eq!(gas_for("poke"), 50_000_000_000_000);
     }
 

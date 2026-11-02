@@ -175,7 +175,7 @@ async fn three_positions_on_real_dcl() -> testresult::TestResult<()> {
     }
 
     deploy(G, built("kinu_guardian_shared"), "new", json!({ "dcl": DCL, "wnear": WRAP, "owner": "owner.sandbox" })).await;
-    assert_eq!(t.view(G, "get_config", json!({})).await["version"], "1.7.0");
+    assert_eq!(t.view(G, "get_config", json!({})).await["version"], "1.8.0");
     ok("register_dcl", t.call("owner.sandbox", G, "register_dcl", json!({}), NearToken::from_millinear(500)).await);
     for tok in [TKQ, TAX, WRAP] {
         ok("register_token", t.call("owner.sandbox", G, "register_token", json!({ "token": tok }), reg).await);

@@ -202,6 +202,7 @@ mod run_impl {
             return Ok(json!({ "u": user, "a": "noop", "why": "not joined" }));
         }
         let account: AccountView = serde_json::from_value(a).map_err(|e| e.to_string())?;
+        let selling = account.position.is_none() && !view(GUARDIAN, "get_sale", json!({ "user": user }))?.is_null();
         let pool_id = account.position.as_ref().map(|p| p.pool_id.clone()).or_else(|| account.policy.allowed_pools.first().cloned()).ok_or("no pool")?;
         let pool = match pools.iter().find(|p| p.pool_id == pool_id) {
             Some(p) => p.clone(),
@@ -220,7 +221,8 @@ mod run_impl {
         }
         let now_secs = rpc_result(&blk)?["header"]["timestamp"].as_u64().ok_or("no block time")? / 1_000_000_000;
         let take_profit: Option<TakeProfitView> = serde_json::from_value(view(GUARDIAN, "get_take_profit", json!({ "user": user }))?).unwrap_or(None);
-        let action = hold_on_rhea_change(decide_confirmed(&World { me, account: &account, pool: &pool, take_profit }, seen.as_ref(), now_secs), rhea_code);
+        let due = if selling { decide_sale(&account, me, pool.current_point, seen.as_ref(), now_secs) } else { decide_confirmed(&World { me, account: &account, pool: &pool, take_profit }, seen.as_ref(), now_secs) };
+        let action = hold_on_rhea_change(due, rhea_code);
         // Cost guard: move a position only when a day of fees in the new range pays for the gas.
         // If the market data is unreachable the move goes ahead (a stuck position earns nothing).
         let mut guard = Value::Null;
