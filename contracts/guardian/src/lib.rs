@@ -175,7 +175,7 @@ const CB_FEES: u64 = T_OWN + out_floor(2, 2);
 const fn tg(t: u64) -> Gas {
     Gas::from_tgas(t)
 }
-pub const VERSION: &str = "1.6.0";
+pub const VERSION: &str = "1.7.0";
 /// How long an admin action waits after it is proposed (v1.3): long enough for every user to see
 /// the event and cash out.
 #[cfg(not(feature = "short-delay"))]
@@ -266,6 +266,8 @@ pub enum AdminAction {
     RecoverCredit { user: Who, token: AccountId, amount: U128 },
     /// Hand the owner role to another account (e.g. a new DAO).
     SetOwner { owner: AccountId },
+    /// Name who may pause without the owner (v1.7). None clears it.
+    SetPauser { pauser: Option<AccountId> },
 }
 
 #[near(serializers = [borsh, json])]
@@ -470,6 +472,24 @@ fn set_ledger_total(token: &AccountId, total: u128) {
 /// Users with a step Rhea carried out that this contract could not measure (v1.5): until `settle`
 /// runs, nothing new starts (deposits come back, no opens or agent moves); every way out works.
 const UNSETTLED: &[u8] = b"unsettled";
+/// The pauser lives under its own key, so the contract's layout did not change for it (v1.7).
+const PAUSER: &[u8] = b"pauser";
+/// Tokens a pool may name (v1.7), one key each, so a token's own code cannot hold the lock:
+/// "1" listed, "0" taken off by the owner, which no later listing undoes but the owner's own.
+const LISTED: &[u8] = b"tk:";
+/// Launchpads and bridges (v1.7): only a parent can create its sub-accounts, so `x.nearlytrade.near`
+/// runs what that factory deployed, never an attacker's own code.
+const FACTORY: &[u8] = b"tf:";
+/// The last deposit: until when others wait, whose, which token, and whether it was a second token.
+const DEPOSIT_GAP: &[u8] = b"depgap";
+/// After a deposit ends no other deposit may start for this long (v1.7), so back-to-back deposits
+/// cannot keep the lock from the ways out. The suites written before v1.7 run a build without it.
+#[cfg(not(feature = "legacy-suites"))]
+const DEPOSIT_GAP_SECS: u64 = 10;
+#[cfg(feature = "legacy-suites")]
+const DEPOSIT_GAP_SECS: u64 = 0;
+const MAX_LIST: usize = 50;
+const T_REGISTER: u64 = 30;
 fn unsettled() -> Vec<Who> {
     env::storage_read(UNSETTLED).and_then(|v| near_sdk::serde_json::from_slice(&v).ok()).unwrap_or_default()
 }
@@ -589,7 +609,9 @@ impl Account {
     /// The pool tokens on the ledger, for cash out (both move side by side).
     fn payout_legs(&self) -> Vec<(AccountId, U128)> {
         let (x, y) = self.pool_tokens();
-        [x, y].into_iter().map(|t| (self.held(&t), t)).filter(|(a, _)| *a > 0).map(|(a, t)| (t, U128(a))).collect()
+        // A record naming one token twice holds one balance: one leg (v1.7).
+        let tokens = if x == y { vec![x] } else { vec![x, y] };
+        tokens.into_iter().map(|t| (self.held(&t), t)).filter(|(a, _)| *a > 0).map(|(a, t)| (t, U128(a))).collect()
     }
     fn pool_id(&self) -> &str {
         &self.policy.allowed_pools[0]
@@ -814,12 +836,26 @@ impl Guardian {
                 }
                 acct.credit(&token, amount.0);
                 self.put(&user, acct);
+                // Two unsettled users stop `settle`: the owner's credit settles one, `settle` the other (v1.7).
+                set_unsettled(&unsettled().into_iter().filter(|u| *u != user).collect::<Vec<_>>());
                 emit("recovered_credit", json!({ "user": user, "token": token, "amount": amount }));
                 PromiseOrValue::Value(true)
             }
             AdminAction::SetOwner { owner } => {
                 emit("owner_changed", json!({ "from": self.owner, "to": owner }));
                 self.owner = owner;
+                PromiseOrValue::Value(true)
+            }
+            AdminAction::SetPauser { pauser } => {
+                match &pauser {
+                    Some(who) => {
+                        env::storage_write(PAUSER, who.as_bytes());
+                    }
+                    None => {
+                        env::storage_remove(PAUSER);
+                    }
+                }
+                emit("pauser_changed", json!({ "pauser": pauser }));
                 PromiseOrValue::Value(true)
             }
         }
@@ -857,7 +893,13 @@ impl Guardian {
             env::panic_str("Policy names exactly one pool, as token_x|token_y|fee");
         }
         let acct = Account { policy, agent, frozen: false, rate: RateWindow::default(), position: None, high_point: None, low_point: None, ledger: Vec::new(), owed: Vec::new() };
-        acct.pool_tokens();
+        let (x, y) = acct.pool_tokens();
+        if x == y {
+            env::panic_str("A pool needs two different tokens");
+        }
+        if !Self::listed(&x) || !Self::listed(&y) {
+            env::panic_str("This pool's tokens are not listed on Guardian");
+        }
         self.put(&user, acct);
         self.users.insert(user.account());
         emit("joined", json!({ "user": user }));
@@ -880,7 +922,11 @@ impl Guardian {
         Promise::new(user.account()).transfer(JOIN_DEPOSIT)
     }
 
+    /// One yocto: a function-call key cannot attach it, so a leaked session key cannot change who
+    /// or what controls a position (v1.7). Ways out take no deposit.
+    #[payable]
     pub fn set_policy(&mut self, policy: Policy, slot: Option<u8>) {
+        near_sdk::assert_one_yocto();
         let user = Who::mine(slot);
         let mut acct = self.account(&user);
         policy.validate().unwrap_or_else(|r| refuse(r));
@@ -891,14 +937,21 @@ impl Guardian {
         self.put(&user, acct);
     }
 
+    #[payable]
     pub fn set_agent(&mut self, agent: Option<AccountId>, slot: Option<u8>) {
+        near_sdk::assert_one_yocto();
         let user = Who::mine(slot);
         let mut acct = self.account(&user);
         acct.agent = agent;
         self.put(&user, acct);
     }
 
+    /// Stopping the agent stays one plain call; lifting that stop is a control change (v1.7).
+    #[payable]
     pub fn set_frozen(&mut self, frozen: bool, slot: Option<u8>) {
+        if !frozen {
+            near_sdk::assert_one_yocto();
+        }
         let user = Who::mine(slot);
         let mut acct = self.account(&user);
         acct.frozen = frozen;
@@ -930,7 +983,12 @@ impl Guardian {
             emit("paused_refund", json!({ "user": sender_id, "token": token, "amount": amount }));
             return PromiseOrValue::Value(amount);
         }
-        if self.is_busy() {
+        // Before the lock: a token nobody listed never gets to run while the contract waits on it (v1.7).
+        if !Self::listed(&token) {
+            emit("unlisted_refund", json!({ "user": sender_id, "token": token, "amount": amount }));
+            return PromiseOrValue::Value(amount);
+        }
+        if self.is_busy() || Self::deposit_waits(&sender_id, &token) {
             emit("busy", json!({ "user": sender_id, "token": token, "amount": amount }));
             return PromiseOrValue::Value(amount);
         }
@@ -952,6 +1010,7 @@ impl Guardian {
             // Nothing was forwarded: the whole transfer goes back.
             emit("deposit_refused", json!({ "user": user, "token": token, "amount": amount, "why": "could not read the balance on Rhea DCL" }));
             self.unlock();
+            Self::note_deposit_end(&user, &token);
             return PromiseOrValue::Value(amount);
         };
         let before = assets.get(&token).map(|a| a.0).unwrap_or(0);
@@ -968,6 +1027,7 @@ impl Guardian {
         if reported == 0 {
             emit("deposited", json!({ "user": user, "token": token, "amount": U128(0), "returned": amount }));
             self.unlock();
+            Self::note_deposit_end(&user, &token);
             return PromiseOrValue::Value(amount);
         }
         PromiseOrValue::Promise(
@@ -996,6 +1056,7 @@ impl Guardian {
         }
         self.put(&user, acct);
         self.unlock();
+        Self::note_deposit_end(&user, &token);
         U128(amount.0 - reported.0)
     }
 
@@ -1371,7 +1432,9 @@ impl Guardian {
         self.fees_claimed(user, send, removed_result())
     }
 
+    #[payable]
     pub fn set_take_profit(&mut self, target: Option<TakeProfit>, slot: Option<u8>) {
+        near_sdk::assert_one_yocto();
         let user = Who::mine(slot);
         let acct = self.account(&user);
         match &target {
@@ -1557,6 +1620,142 @@ impl Guardian {
         }
     }
 
+    /// Stops new risk at once. For the pauser, so a pause does not wait for a DAO vote; it has no
+    /// other power, and only the owner resumes (v1.7).
+    pub fn pause(&mut self) {
+        let who = env::predecessor_account_id();
+        if who != self.owner && Some(&who) != Self::pauser().as_ref() {
+            env::panic_str("Only the pauser or the owner can pause");
+        }
+        if !self.paused {
+            self.paused = true;
+            emit("paused", json!({ "by": who }));
+        }
+    }
+
+    /// A misused or stolen pauser goes at once: this only takes power away.
+    pub fn remove_pauser(&mut self) {
+        self.assert_owner();
+        if env::storage_remove(PAUSER) {
+            emit("pauser_changed", json!({ "pauser": Value::Null }));
+        }
+    }
+
+    /// Lists tokens a pool may name, or takes them off. At once: a list only decides what may come
+    /// in, never what may leave, so a mistake here cannot hold anyone's funds.
+    /// A listed token is registered on Rhea too: a token off Rhea's whitelist needs that to be deposited.
+    #[payable]
+    pub fn list_tokens(&mut self, tokens: Vec<AccountId>, listed: bool) -> PromiseOrValue<bool> {
+        self.assert_owner();
+        if tokens.len() > MAX_LIST {
+            env::panic_str("Too many tokens in one call");
+        }
+        for t in &tokens {
+            let key = [LISTED, t.as_bytes()].concat();
+            env::storage_write(&key, if listed { b"1" } else { b"0" });
+        }
+        emit("tokens_listed", json!({ "tokens": tokens, "listed": listed }));
+        if !listed || tokens.is_empty() {
+            let paid = env::attached_deposit();
+            if !paid.is_zero() {
+                let _ = Promise::new(env::predecessor_account_id()).transfer(paid);
+            }
+            return PromiseOrValue::Value(true);
+        }
+        PromiseOrValue::Promise(self.rhea_register(tokens))
+    }
+
+    /// The owner names the launchpads and bridges whose tokens need no listing one by one.
+    pub fn list_factories(&mut self, parents: Vec<AccountId>, trusted: bool) {
+        self.assert_owner();
+        if parents.len() > MAX_LIST {
+            env::panic_str("Too many accounts in one call");
+        }
+        for p in &parents {
+            let key = [FACTORY, p.as_bytes()].concat();
+            if trusted {
+                env::storage_write(&key, b"1");
+            } else {
+                env::storage_remove(&key);
+            }
+        }
+        emit("factories_listed", json!({ "parents": parents, "trusted": trusted }));
+    }
+
+    /// Rhea takes a token off its whitelist only once it is registered, as it asks of its own users.
+    /// Anyone may pay that for a listed token; the deposit goes to Rhea.
+    #[payable]
+    pub fn register_on_rhea(&mut self, token: AccountId) -> Promise {
+        if !Self::listed(&token) {
+            env::panic_str("This token is not listed on Guardian");
+        }
+        self.rhea_register(vec![token])
+    }
+
+    /// Rhea charges the caller for what it stores. A refused deposit comes back to this contract, so
+    /// it goes on to whoever paid.
+    #[private]
+    pub fn on_registered(&mut self, payer: AccountId, paid: U128) -> bool {
+        let done = !matches!(env::promise_result_checked(0, 0), Err(PromiseError::Failed));
+        if !done && paid.0 > 0 {
+            let _ = Promise::new(payer).transfer(NearToken::from_yoctonear(paid.0));
+        }
+        done
+    }
+
+    /// Anyone may list a token Rhea has whitelisted, so what users trade on Rhea needs nobody's
+    /// approval here. It only ever adds a token Rhea vouches for.
+    pub fn list_from_rhea(&mut self, token: AccountId) -> Promise {
+        view(&self.dcl, "get_whitelisted_tokens", json!({})).then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_OWN)).with_unused_gas_weight(2).on_rhea_list(token))
+    }
+
+    #[private]
+    pub fn on_rhea_list(&mut self, token: AccountId, #[callback_result] list: Result<Vec<AccountId>, PromiseError>) -> bool {
+        let key = [LISTED, token.as_bytes()].concat();
+        if !list.is_ok_and(|l| l.contains(&token)) || env::storage_read(&key).is_some() {
+            return Self::listed(&token);
+        }
+        env::storage_write(&key, b"1");
+        emit("tokens_listed", json!({ "tokens": [token], "listed": true, "by": "rhea" }));
+        true
+    }
+
+    pub fn get_listed(&self, token: AccountId) -> bool {
+        Self::listed(&token)
+    }
+
+    #[cfg(not(feature = "legacy-suites"))]
+    fn listed(token: &AccountId) -> bool {
+        match env::storage_read(&[LISTED, token.as_bytes()].concat()) {
+            Some(v) => v == b"1",
+            None => token.as_str().split_once('.').is_some_and(|(_, parent)| env::storage_has_key(&[FACTORY, parent.as_bytes()].concat())),
+        }
+    }
+    #[cfg(feature = "legacy-suites")]
+    fn listed(_token: &AccountId) -> bool {
+        true
+    }
+
+    fn deposit_gap() -> Option<(u64, String, String, bool)> {
+        env::storage_read(DEPOSIT_GAP).and_then(|v| near_sdk::borsh::from_slice(&v).ok()).filter(|g: &(u64, String, String, bool)| now_secs() < g.0)
+    }
+
+    /// Inside the gap only one deposit passes: the same record's other token, once, so a page can
+    /// bring both sides of a pool in one wallet request.
+    fn deposit_waits(user: &Who, token: &AccountId) -> bool {
+        Self::deposit_gap().is_some_and(|(_, who, last, second)| second || who != user.0 || last == token.as_str())
+    }
+
+    fn note_deposit_end(user: &Who, token: &AccountId) {
+        let second = Self::deposit_gap().is_some_and(|(_, who, last, was)| !was && who == user.0 && last != token.as_str());
+        let gap = (now_secs() + DEPOSIT_GAP_SECS, user.0.clone(), token.to_string(), second);
+        env::storage_write(DEPOSIT_GAP, &near_sdk::borsh::to_vec(&gap).unwrap_or_else(|_| env::panic_str("gap")));
+    }
+
+    fn pauser() -> Option<AccountId> {
+        env::storage_read(PAUSER).and_then(|v| String::from_utf8(v).ok()).and_then(|s| s.parse().ok())
+    }
+
     fn assert_settled(&self) {
         if !unsettled().is_empty() {
             env::panic_str("A step could not be measured: run settle first (anyone can); ways out still work");
@@ -1598,6 +1797,8 @@ impl Guardian {
     pub fn get_config(&self) -> Value {
         json!({
             "version": VERSION,
+            "pauser": Self::pauser(),
+            "deposit_free_at": Self::deposit_gap().map_or(0, |g| g.0),
             "dcl": self.dcl,
             "wnear": self.wnear,
             "join_deposit": JOIN_DEPOSIT,
@@ -1945,6 +2146,11 @@ impl Guardian {
 
     /// A claim, once this contract's token balance is known: pays the smaller of what is owed and
     /// what the wallet holds beyond what others are owed, and clears the debt.
+    fn rhea_register(&self, tokens: Vec<AccountId>) -> Promise {
+        let paid = env::attached_deposit();
+        call(&self.dcl, "register_tokens", json!({ "token_ids": tokens }), paid, tg(T_REGISTER))
+            .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_OWN)).on_registered(env::predecessor_account_id(), U128(paid.as_yoctonear())))
+    }
     fn claim_measured(&mut self, user: Who, token: AccountId, balance: Option<u128>) -> PromiseOrValue<bool> {
         let Some(balance) = balance else { return self.bail(&user, "Could not read this contract's token balance; nothing changed, try again") };
         let mut acct = self.account(&user);
@@ -1952,8 +2158,12 @@ impl Guardian {
         let others = owed_total(&token).saturating_sub(owed);
         let pay = owed.min(balance.saturating_sub(others));
         acct.owed.retain(|(t, _)| *t != token);
+        // A short balance pays what it can; the rest stays hers to claim (v1.7).
+        if pay < owed {
+            acct.owe(&token, owed - pay);
+        }
         self.put(&user, acct);
-        set_owed_total(&token, others);
+        set_owed_total(&token, others + (owed - pay));
         if pay < owed {
             emit("claim_short", json!({ "user": user, "token": token, "owed": U128(owed), "paid": U128(pay) }));
         }
@@ -2082,6 +2292,12 @@ mod tests {
     }
     fn policy() -> Policy {
         Policy { allowed_pools: vec![POOL.into()], min_width: 1400, max_width: 5600, max_distance: 3000, max_actions: 12, window_secs: 86_400, max_slippage_bps: 100, exit_drop_points: 0, exit_on_rise: false, rebalance_buffer_points: 100 }
+    }
+    /// One yocto, keeping the caller and the time of the moment.
+    fn tp(g: &mut Guardian, target: Option<TakeProfit>, slot: Option<u8>) {
+        let (who, now) = (env::predecessor_account_id(), env::block_timestamp());
+        testing_env!(VMContextBuilder::new().predecessor_account_id(who).current_account_id(acc("guardian.testnet")).block_timestamp(now).attached_deposit(NearToken::from_yoctonear(1)).build());
+        g.set_take_profit(target, slot);
     }
     fn fresh() -> Guardian {
         Guardian::new(acc("dcl.testnet"), acc("wrap.testnet"), acc("dao.testnet"))
@@ -2329,8 +2545,8 @@ mod tests {
         ctx("guardian.testnet", ZERO);
         assert!(matches!(g.claim_measured(acc("alice.testnet").into(), acc("tkq.testnet"), Some(7 + 99)), PromiseOrValue::Promise(_)));
         assert!(near_sdk::test_utils::get_logs().iter().any(|l| l.contains("claim_short") && l.contains("\"paid\":\"99\"")));
-        assert!(owed(&g, "alice.testnet").is_empty(), "nothing owed keeps her from leaving");
-        assert_eq!(g.get_owed_total(acc("tkq.testnet")), U128(7), "Bob's share untouched");
+        assert_eq!(owed(&g, "alice.testnet").len(), 1, "the rest stays owed");
+        assert_eq!(g.get_owed_total(acc("tkq.testnet")), U128(8), "Bob's share and her remainder");
     }
 
     #[test]
@@ -2915,6 +3131,89 @@ mod tests {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err()
     }
 
+    fn named_pauser(g: &mut Guardian) {
+        ctx("dao.testnet", ZERO);
+        let id = g.propose(AdminAction::SetPauser { pauser: Some(acc("pauser.testnet")) });
+        at("bob.testnet", now_after_delay());
+        let _ = g.execute(id);
+    }
+
+    fn now_after_delay() -> u64 {
+        ADMIN_DELAY_SECS + 1
+    }
+
+    #[test]
+    fn naming_a_pauser_waits_like_any_admin_action() {
+        let mut g = joined();
+        ctx("alice.testnet", ZERO);
+        assert!(panics(|| drop(g.propose(AdminAction::SetPauser { pauser: Some(acc("alice.testnet")) }))));
+        ctx("dao.testnet", ZERO);
+        let id = g.propose(AdminAction::SetPauser { pauser: Some(acc("pauser.testnet")) });
+        assert!(panics(|| drop(g.execute(id))), "the delay holds");
+        assert_eq!(g.get_config()["pauser"], Value::Null);
+        at("bob.testnet", now_after_delay());
+        let _ = g.execute(id);
+        assert_eq!(g.get_config()["pauser"], "pauser.testnet");
+    }
+
+    #[test]
+    fn the_pauser_pauses_and_can_do_nothing_else() {
+        let mut g = joined();
+        with_position(&mut g);
+        named_pauser(&mut g);
+        ctx("alice.testnet", ZERO);
+        assert!(panics(|| g.pause()), "a stranger cannot pause");
+        ctx("pauser.testnet", ZERO);
+        g.pause();
+        g.pause(); // again: nothing changes, nothing fails
+        assert_eq!(g.get_config()["paused"], true);
+        assert!(panics(|| g.set_paused(false)), "only the owner resumes");
+        assert!(panics(|| g.set_paused(true)), "and set_paused stays the owner's");
+        assert!(panics(|| g.remove_pauser()));
+        assert!(panics(|| drop(g.propose(AdminAction::SetPauser { pauser: None }))));
+        assert!(panics(|| drop(g.propose(AdminAction::SetOwner { owner: acc("pauser.testnet") }))));
+        assert!(panics(|| drop(g.propose(AdminAction::RecoverCredit { user: acc("alice.testnet").into(), token: acc("tkq.testnet"), amount: U128(1) }))));
+        assert!(panics(|| drop(g.withdraw(acc("tkq.testnet"), None, None))), "no record, no funds");
+        assert!(panics(|| drop(g.cash_out(false, None))));
+        assert!(panics(|| drop(g.exit(acc("alice.testnet").into()))), "not the owner of this position, not its agent");
+        ctx("dao.testnet", ZERO);
+        g.set_paused(false);
+        assert_eq!(g.get_config()["paused"], false);
+    }
+
+    #[test]
+    fn a_pause_by_the_pauser_leaves_every_way_out_open() {
+        let mut g = joined();
+        with_position(&mut g);
+        ctx("guardian.testnet", ZERO);
+        deposited(&mut g, "alice.testnet", "tkq.testnet", 5);
+        named_pauser(&mut g);
+        ctx("pauser.testnet", ZERO);
+        g.pause();
+        ctx("alice.testnet", ZERO);
+        let _ = g.exit(acc("alice.testnet").into());
+        g.unlock();
+        let _ = g.withdraw(acc("tkq.testnet"), None, None);
+        g.unlock();
+        ctx("agent.testnet", ZERO);
+        let _ = g.poke(acc("alice.testnet").into());
+    }
+
+    #[test]
+    fn the_owner_removes_the_pauser_at_once() {
+        let mut g = joined();
+        named_pauser(&mut g);
+        ctx("dao.testnet", ZERO);
+        g.remove_pauser();
+        g.remove_pauser(); // already gone: nothing fails
+        assert_eq!(g.get_config()["pauser"], Value::Null);
+        ctx("pauser.testnet", ZERO);
+        assert!(panics(|| g.pause()));
+        ctx("dao.testnet", ZERO);
+        g.pause();
+        assert_eq!(g.get_config()["paused"], true, "the owner keeps the brake");
+    }
+
     #[test]
     fn only_the_owner_pauses() {
         let mut g = joined();
@@ -3038,17 +3337,17 @@ mod tests {
     fn take_profit_is_the_users_and_needs_a_position() {
         let mut g = joined();
         ctx("alice.testnet", ZERO);
-        assert!(panics(|| g.set_take_profit(Some(TakeProfit { point: 5_000, above: true }), None)), "no position yet");
+        assert!(panics(|| tp(&mut g, Some(TakeProfit { point: 5_000, above: true }), None)), "no position yet");
         with_position(&mut g);
         ctx("alice.testnet", ZERO);
-        g.set_take_profit(Some(TakeProfit { point: 5_000, above: true }), None);
+        tp(&mut g, Some(TakeProfit { point: 5_000, above: true }), None);
         assert_eq!(g.get_take_profit(acc("alice.testnet").into()), Some(TakeProfit { point: 5_000, above: true }));
         // The agent sets nothing for her: set_take_profit always acts on the caller's own record.
         ctx("agent.testnet", ZERO);
-        assert!(panics(|| g.set_take_profit(Some(TakeProfit { point: 1, above: true }), None)));
+        assert!(panics(|| tp(&mut g, Some(TakeProfit { point: 1, above: true }), None)));
         assert_eq!(g.get_take_profit(acc("alice.testnet").into()), Some(TakeProfit { point: 5_000, above: true }));
         ctx("alice.testnet", ZERO);
-        g.set_take_profit(None, None);
+        tp(&mut g, None, None);
         assert_eq!(g.get_take_profit(acc("alice.testnet").into()), None);
     }
 
@@ -3063,7 +3362,7 @@ mod tests {
         ctx("agent.testnet", ZERO);
         assert!(panics(|| drop(g.exit(acc("alice.testnet").into()))));
         ctx("alice.testnet", ZERO);
-        g.set_take_profit(Some(TakeProfit { point: 5_000, above: true }), None);
+        tp(&mut g, Some(TakeProfit { point: 5_000, above: true }), None);
         ctx("agent.testnet", ZERO);
         let _ = g.exit(acc("alice.testnet").into());
         g.unlock();
@@ -3098,7 +3397,7 @@ mod tests {
         a.policy.exit_on_rise = false;
         g.accounts.insert(acc("alice.testnet"), a);
         ctx("alice.testnet", ZERO);
-        g.set_take_profit(Some(TakeProfit { point: -5_000, above: false }), None);
+        tp(&mut g, Some(TakeProfit { point: -5_000, above: false }), None);
         // The point rising is not her profit: refused.
         g.seen.insert(acc("alice.testnet"), Seen { point: 6_000, at_secs: 9_700 });
         at("guardian.testnet", 10_000);
@@ -3115,7 +3414,7 @@ mod tests {
         let mut g = joined();
         with_position(&mut g); // exit rule: 2_000 points below the high of 0
         ctx("alice.testnet", ZERO);
-        g.set_take_profit(Some(TakeProfit { point: 5_000, above: true }), None);
+        tp(&mut g, Some(TakeProfit { point: 5_000, above: true }), None);
         g.seen.insert(acc("alice.testnet"), Seen { point: -2_100, at_secs: 9_800 });
         at("guardian.testnet", 10_000);
         assert!(matches!(g.on_pool_for_exit(acc("alice.testnet").into(), false, pool_at(-2_500)), PromiseOrValue::Promise(_)));
@@ -3127,7 +3426,7 @@ mod tests {
         let mut g = joined();
         with_position(&mut g);
         ctx("alice.testnet", ZERO);
-        g.set_take_profit(Some(TakeProfit { point: 5_000, above: true }), None);
+        tp(&mut g, Some(TakeProfit { point: 5_000, above: true }), None);
         ctx("guardian.testnet", ZERO);
         g.lock();
         let _ = g.cash_out_closed(acc("alice.testnet").into(), false, Removed::Amounts(0, 0));
@@ -3350,5 +3649,185 @@ mod tests {
         g.forget(&b);
         assert_eq!(g.get_seen(b.clone()), None);
         assert_eq!(g.get_take_profit(b), None);
+    }
+
+    #[cfg(not(feature = "legacy-suites"))]
+    fn listed_ready() -> Guardian {
+        let mut g = fresh();
+        ctx("dao.testnet", NearToken::from_near(0));
+        let _ = g.list_tokens(vec![acc("tkq.testnet"), acc("wrap.testnet")], true);
+        g
+    }
+
+    #[cfg(not(feature = "legacy-suites"))]
+    fn with_pool(pool: &str) -> Policy {
+        let mut p = policy();
+        p.allowed_pools = vec![pool.into()];
+        p
+    }
+
+    #[test]
+    #[cfg(not(feature = "legacy-suites"))]
+    fn v17_a_pool_needs_two_different_tokens() {
+        let mut g = listed_ready();
+        ctx("alice.testnet", JOIN_DEPOSIT);
+        assert!(panics(|| g.join(with_pool("wrap.testnet|wrap.testnet|2000"), None, None)));
+        g.join(policy(), None, None);
+    }
+
+    #[test]
+    #[cfg(not(feature = "legacy-suites"))]
+    fn v17_a_record_with_one_token_twice_is_paid_once() {
+        let acct = Account { policy: with_pool("wrap.testnet|wrap.testnet|2000"), agent: None, frozen: false, rate: RateWindow::default(), position: None, high_point: None, low_point: None, ledger: vec![(acc("wrap.testnet"), U128(5))], owed: Vec::new() };
+        assert_eq!(acct.payout_legs(), vec![(acc("wrap.testnet"), U128(5))]);
+    }
+
+    #[test]
+    #[cfg(not(feature = "legacy-suites"))]
+    fn v17_only_listed_tokens_join() {
+        let mut g = listed_ready();
+        ctx("alice.testnet", JOIN_DEPOSIT);
+        assert!(panics(|| g.join(with_pool("evil.testnet|wrap.testnet|2000"), None, None)));
+        ctx("dao.testnet", NearToken::from_near(0));
+        let _ = g.list_tokens(vec![acc("evil.testnet")], true);
+        ctx("alice.testnet", JOIN_DEPOSIT);
+        g.join(with_pool("evil.testnet|wrap.testnet|2000"), None, None);
+    }
+
+    #[test]
+    #[cfg(not(feature = "legacy-suites"))]
+    fn v17_an_unlisted_token_comes_back_before_the_lock() {
+        let mut g = listed_ready();
+        ctx("alice.testnet", JOIN_DEPOSIT);
+        g.join(policy(), None, None);
+        ctx("dao.testnet", NearToken::from_near(0));
+        let _ = g.list_tokens(vec![acc("tkq.testnet")], false);
+        assert!(!g.get_listed(acc("tkq.testnet")));
+        ctx("tkq.testnet", NearToken::from_near(0));
+        match g.ft_on_transfer(acc("alice.testnet"), U128(7), String::new()) {
+            PromiseOrValue::Value(v) => assert_eq!(v.0, 7),
+            _ => panic!("must come back at once"),
+        }
+        assert!(!g.is_busy());
+    }
+
+    #[test]
+    #[cfg(not(feature = "legacy-suites"))]
+    fn v17_lifting_a_freeze_needs_one_yocto() {
+        let mut g = listed_ready();
+        ctx("alice.testnet", JOIN_DEPOSIT);
+        g.join(policy(), None, None);
+        ctx("alice.testnet", NearToken::from_near(0));
+        g.set_frozen(true, None);
+        assert!(panics(|| g.set_frozen(false, None)));
+        ctx("alice.testnet", NearToken::from_yoctonear(1));
+        g.set_frozen(false, None);
+    }
+
+    #[test]
+    #[cfg(not(feature = "legacy-suites"))]
+    fn v17_the_owners_credit_clears_the_mark_so_settle_can_run_for_the_other() {
+        let mut g = listed_ready();
+        ctx("alice.testnet", JOIN_DEPOSIT);
+        g.join(policy(), None, None);
+        ctx("bob.testnet", JOIN_DEPOSIT);
+        g.join(policy(), None, None);
+        let (alice, bob) = (Who::of(&acc("alice.testnet"), 0), Who::of(&acc("bob.testnet"), 0));
+        set_unsettled(&[alice.clone(), bob.clone()]);
+        at("dao.testnet", 1_000);
+        let id = g.propose(AdminAction::RecoverCredit { user: alice.clone(), token: acc("tkq.testnet"), amount: U128(5) });
+        at("dao.testnet", 1_000 + ADMIN_DELAY_SECS);
+        let _ = g.execute(id);
+        assert_eq!(unsettled(), vec![bob]);
+        assert_eq!(g.account(&alice).held(&acc("tkq.testnet")), 5);
+    }
+
+    #[test]
+    #[cfg(not(feature = "legacy-suites"))]
+    fn v17_rhea_lists_only_what_it_whitelisted_and_never_over_the_owner() {
+        let mut g = fresh();
+        ctx("guardian.testnet", NearToken::from_near(0));
+        assert!(!g.on_rhea_list(acc("evil.testnet"), Ok(vec![acc("tkq.testnet")])));
+        assert!(!g.on_rhea_list(acc("tkq.testnet"), Err(PromiseError::Failed)));
+        assert!(!g.get_listed(acc("tkq.testnet")));
+        assert!(g.on_rhea_list(acc("tkq.testnet"), Ok(vec![acc("tkq.testnet")])));
+        assert!(g.get_listed(acc("tkq.testnet")));
+        ctx("dao.testnet", NearToken::from_near(0));
+        let _ = g.list_tokens(vec![acc("tkq.testnet")], false);
+        ctx("guardian.testnet", NearToken::from_near(0));
+        assert!(!g.on_rhea_list(acc("tkq.testnet"), Ok(vec![acc("tkq.testnet")])), "taken off stays off");
+        assert!(!g.get_listed(acc("tkq.testnet")));
+    }
+
+    #[test]
+    #[cfg(not(feature = "legacy-suites"))]
+    fn v17_a_trusted_factory_lists_its_own_tokens_only() {
+        let mut g = fresh();
+        ctx("alice.testnet", NearToken::from_near(0));
+        assert!(panics(|| g.list_factories(vec![acc("nearlytrade.testnet")], true)));
+        ctx("dao.testnet", NearToken::from_near(0));
+        g.list_factories(vec![acc("nearlytrade.testnet")], true);
+        assert!(g.get_listed(acc("kinu-3.nearlytrade.testnet")));
+        assert!(!g.get_listed(acc("nearlytrade.testnet")), "the factory itself is no token");
+        assert!(!g.get_listed(acc("x.y.nearlytrade.testnet")), "a sub-account of a token is not the factory's");
+        assert!(!g.get_listed(acc("evilnearlytrade.testnet")));
+        let _ = g.list_tokens(vec![acc("kinu-3.nearlytrade.testnet")], false);
+        assert!(!g.get_listed(acc("kinu-3.nearlytrade.testnet")), "the owner's stop wins");
+        let _ = g.list_tokens(vec![acc("kinu-3.nearlytrade.testnet")], true);
+        g.list_factories(vec![acc("nearlytrade.testnet")], false);
+        assert!(g.get_listed(acc("kinu-3.nearlytrade.testnet")), "listed on its own");
+        assert!(!g.get_listed(acc("other.nearlytrade.testnet")));
+    }
+
+    #[test]
+    #[cfg(not(feature = "legacy-suites"))]
+    fn v17_only_a_listed_token_registers_on_rhea() {
+        let mut g = fresh();
+        ctx("alice.testnet", NearToken::from_near(1));
+        assert!(panics(|| drop(g.register_on_rhea(acc("evil.testnet")))));
+    }
+
+    #[test]
+    #[cfg(not(feature = "legacy-suites"))]
+    fn v17_only_the_owner_lists() {
+        let mut g = fresh();
+        ctx("alice.testnet", NearToken::from_near(0));
+        assert!(panics(|| drop(g.list_tokens(vec![acc("evil.testnet")], true))));
+        ctx("dao.testnet", NearToken::from_near(0));
+        let many: Vec<AccountId> = (0..=MAX_LIST).map(|i| acc(&format!("t{i}.testnet"))).collect();
+        assert!(panics(|| drop(g.list_tokens(many, true))));
+    }
+
+    #[test]
+    #[cfg(not(feature = "legacy-suites"))]
+    fn v17_the_gap_lets_one_other_token_of_the_same_record_through_once() {
+        let (alice, bob) = (Who::of(&acc("alice.testnet"), 0), Who::of(&acc("bob.testnet"), 0));
+        let (x, y) = (acc("tkq.testnet"), acc("wrap.testnet"));
+        at("guardian.testnet", 100);
+        assert!(!Guardian::deposit_waits(&alice, &x));
+        Guardian::note_deposit_end(&alice, &x);
+        assert!(Guardian::deposit_waits(&bob, &x), "another record waits");
+        assert!(Guardian::deposit_waits(&alice, &x), "the same token waits");
+        assert!(!Guardian::deposit_waits(&alice, &y), "the other side of the pool passes");
+        Guardian::note_deposit_end(&alice, &y);
+        assert!(Guardian::deposit_waits(&alice, &x), "only once");
+        assert!(Guardian::deposit_waits(&alice, &y), "only once");
+        at("guardian.testnet", 100 + DEPOSIT_GAP_SECS);
+        assert!(!Guardian::deposit_waits(&bob, &x), "the gap ends");
+    }
+
+    #[test]
+    #[cfg(not(feature = "legacy-suites"))]
+    fn v17_control_changes_need_one_yocto_and_ways_out_do_not() {
+        let mut g = listed_ready();
+        ctx("alice.testnet", JOIN_DEPOSIT);
+        g.join(policy(), None, None);
+        ctx("alice.testnet", NearToken::from_near(0));
+        assert!(panics(|| g.set_policy(policy(), None)));
+        assert!(panics(|| g.set_agent(Some(acc("mallory.testnet")), None)));
+        assert!(panics(|| g.set_take_profit(None, None)));
+        g.set_frozen(true, None);
+        ctx("alice.testnet", NearToken::from_yoctonear(1));
+        g.set_policy(policy(), None);
     }
 }

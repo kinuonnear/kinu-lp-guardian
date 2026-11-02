@@ -141,6 +141,8 @@ async fn snapshot(t: &T, who: &[&str]) -> Value {
     out.insert("users".into(), t.view(G, "get_users", json!({})).await);
     let mut cfg = t.view(G, "get_config", json!({})).await;
     cfg.as_object_mut().unwrap().remove("version");
+    cfg.as_object_mut().unwrap().remove("pauser");
+    cfg.as_object_mut().unwrap().remove("deposit_free_at");
     out.insert("config".into(), cfg);
     Value::Object(out)
 }
@@ -196,7 +198,7 @@ async fn v15_with_people_inside_to_v16() -> testresult::TestResult<()> {
     ok("alice deposits wNEAR", t.call("alice.sandbox", WRAP, "ft_transfer_call", json!({ "receiver_id": G, "amount": E24.to_string(), "msg": "" }), yocto).await);
     let c = (t.point(POOL).await / 200) * 200;
     ok("alice opens", t.call("alice.sandbox", G, "open", json!({ "left_point": c - 600, "right_point": c + 800 }), zero).await);
-    ok("alice sets a target", t.call("alice.sandbox", G, "set_take_profit", json!({ "target": { "point": 310000, "above": true } }), zero).await);
+    ok("alice sets a target", t.call("alice.sandbox", G, "set_take_profit", json!({ "target": { "point": 310000, "above": true } }), NearToken::from_near(0)).await);
     ok("bob joins", t.call("bob.sandbox", G, "join", json!({ "policy": policy, "agent": null }), join).await);
     ok("bob deposits, ledger only", t.call("bob.sandbox", WRAP, "ft_transfer_call", json!({ "receiver_id": G, "amount": (E24 / 2).to_string(), "msg": "" }), yocto).await);
     ok("carol joins", t.call("carol.sandbox", G, "join", json!({ "policy": policy, "agent": null }), join).await);
@@ -228,7 +230,7 @@ async fn v15_with_people_inside_to_v16() -> testresult::TestResult<()> {
     let r = upgrade(code.clone()).await;
     assert!(r.is_success(), "upgrade: {r:?}");
     let cfg = t.view(G, "get_config", json!({})).await;
-    assert_eq!(cfg["version"], "1.6.0");
+    assert_eq!(cfg["version"], "1.7.0");
     assert_eq!(cfg["admin_delay_secs"], 172_800, "the production build");
     assert_eq!(snapshot(&t, &who).await, before, "every record, read, target, debt and total is the same");
     println!("{:<58} same", "all records, reads, targets, debts, totals");

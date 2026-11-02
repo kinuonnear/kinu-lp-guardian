@@ -107,7 +107,7 @@ async fn v14_to_production_v15_in_one_transaction() -> testresult::TestResult<()
     }
     let open = json!({ "left_point": 303200, "right_point": 304600 }).to_string();
     ok("alice deposit + open on v1.4", t.call("alice.sandbox", WRAP, "ft_transfer_call", json!({ "receiver_id": G, "amount": "1000000000000000000000000", "msg": open }), yocto).await);
-    ok("alice sets take profit on v1.4", t.call("alice.sandbox", G, "set_take_profit", json!({ "target": { "point": 310000, "above": true } }), zero).await);
+    ok("alice sets take profit on v1.4", t.call("alice.sandbox", G, "set_take_profit", json!({ "target": { "point": 310000, "above": true } }), NearToken::from_near(0)).await);
     ok("bob deposit only on v1.4", t.call("bob.sandbox", WRAP, "ft_transfer_call", json!({ "receiver_id": G, "amount": "500000000000000000000000", "msg": "" }), yocto).await);
     let alice_before = t.view(G, "get_account", json!({ "user": "alice.sandbox" })).await;
     let bob_before = t.view(G, "get_account", json!({ "user": "bob.sandbox" })).await;
@@ -121,7 +121,7 @@ async fn v14_to_production_v15_in_one_transaction() -> testresult::TestResult<()
     assert!(r.is_success(), "upgrade + migrate: {r:?}");
     let cfg = t.view(G, "get_config", json!({})).await;
     println!("after deploy + migrate {cfg}");
-    assert_eq!(cfg["version"], "1.6.0");
+    assert_eq!(cfg["version"], "1.7.0");
     assert_eq!(cfg["owner"], "kinu.sandbox");
     assert_eq!(cfg["admin_delay_secs"], 172_800, "the production build (48 h)");
     assert_eq!(cfg["users"], 2, "the user list is kept");

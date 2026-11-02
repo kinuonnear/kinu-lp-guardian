@@ -270,7 +270,7 @@ async fn shared_guardian_on_real_dcl() -> testresult::TestResult<()> {
     // range opened, so the agent may close it. Then the agent may NOT re-open from his idle tokens.
     let mut bob_policy = policy.clone();
     bob_policy["exit_drop_points"] = json!(2000);
-    ok("bob sets an exit rule", t.call("bob.sandbox", G, "set_policy", json!({ "policy": bob_policy }), zero).await);
+    ok("bob sets an exit rule", t.call("bob.sandbox", G, "set_policy", json!({ "policy": bob_policy }), NearToken::from_yoctonear(1)).await);
     fails("agent cannot exit bob on a price never read", t.call("agent.sandbox", G, "exit", json!({ "user": "bob.sandbox" }), zero).await, "3 to 60 minutes");
     ok("agent pokes bob", t.call("agent.sandbox", G, "poke", json!({ "user": "bob.sandbox" }), zero).await);
     wait_secs(&sandbox, &t, 200).await;

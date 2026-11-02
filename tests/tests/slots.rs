@@ -175,7 +175,7 @@ async fn three_positions_on_real_dcl() -> testresult::TestResult<()> {
     }
 
     deploy(G, built("kinu_guardian_shared"), "new", json!({ "dcl": DCL, "wnear": WRAP, "owner": "owner.sandbox" })).await;
-    assert_eq!(t.view(G, "get_config", json!({})).await["version"], "1.6.0");
+    assert_eq!(t.view(G, "get_config", json!({})).await["version"], "1.7.0");
     ok("register_dcl", t.call("owner.sandbox", G, "register_dcl", json!({}), NearToken::from_millinear(500)).await);
     for tok in [TKQ, TAX, WRAP] {
         ok("register_token", t.call("owner.sandbox", G, "register_token", json!({ "token": tok }), reg).await);
@@ -242,7 +242,7 @@ async fn three_positions_on_real_dcl() -> testresult::TestResult<()> {
     }
     no("bob withdraws from slot 2", t.call("bob.sandbox", G, "withdraw", json!({ "token": TKQ, "slot": 2 }), zero).await, "has not joined");
     no("thief cashes out alice", t.call("thief.sandbox", G, "cash_out", json!({ "leave": false, "slot": 1 }), zero).await, "has not joined");
-    no("thief sets its own agent on slot 1", t.call("thief.sandbox", G, "set_agent", json!({ "agent": "thief.sandbox", "slot": 1 }), zero).await, "has not joined");
+    no("thief sets its own agent on slot 1", t.call("thief.sandbox", G, "set_agent", json!({ "agent": "thief.sandbox", "slot": 1 }), NearToken::from_yoctonear(1)).await, "has not joined");
     assert_eq!(futures_all(&t, &["alice.sandbox", "alice.sandbox#1", "alice.sandbox#2", "bob.sandbox#1"]).await, before, "no record changed");
 
     println!("\n--- the agent works one slot, the others stay ---");

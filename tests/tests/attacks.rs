@@ -159,7 +159,7 @@ async fn attacks_are_refused() -> testresult::TestResult<()> {
     expect("agent: exit Alice (she allowed no exit)", t.call("agent.sandbox", G, "exit", json!({ "user": "alice.sandbox" }), zero).await, "has not allowed the agent to exit");
     let churn = json!({ "user": "alice.sandbox", "request": { "pool_id": POOL, "left_point": 303600, "right_point": 306400 } });
     expect("agent: churn a range that is earning", t.call("agent.sandbox", G, "request_rebalance", churn, zero).await, "not far enough outside");
-    expect("stranger: set Alice's agent", t.call("stranger.sandbox", G, "set_agent", json!({ "agent": "stranger.sandbox" }), zero).await, "has not joined");
+    expect("stranger: set Alice's agent", t.call("stranger.sandbox", G, "set_agent", json!({ "agent": "stranger.sandbox" }), NearToken::from_yoctonear(1)).await, "has not joined");
     assert_eq!(t.view(G, "get_account", json!({ "user": "alice.sandbox" })).await, alice_before, "alice untouched by every attempt");
 
     // ---------- B. a pushed price (M1) ----------
@@ -222,7 +222,7 @@ async fn attacks_are_refused() -> testresult::TestResult<()> {
     println!("{:<58} {r}", "execute the upgrade whose migrate fails");
     let cfg = t.view(G, "get_config", json!({})).await;
     println!("{:<58} version {} staged {} pending {}", "contract after", cfg["version"], cfg["staged"], cfg["pending"]);
-    assert_eq!(cfg["version"], "1.6.0", "the failed deploy was undone: still the current code");
+    assert_eq!(cfg["version"], "1.7.0", "the failed deploy was undone: still the current code");
     assert!(t.near("stranger.sandbox").await - stranger_near > 4.9, "the stager's storage deposit came back");
     let alice_now = t.view(G, "get_account", json!({ "user": "alice.sandbox" })).await;
     assert!(alice_now["position"].is_object(), "alice's record intact");
