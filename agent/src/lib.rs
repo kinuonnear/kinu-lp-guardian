@@ -188,6 +188,15 @@ fn width(policy: &Policy, delta: i32) -> i32 {
     w.min(floor_to(policy.max_width as i32, d)).max(d)
 }
 
+/// After a fall the top stays this part of the owner's width under the old one: about 2% of price on a
+/// ±25% range, 5% on a −50% to +100% range, so the range comes down a little and does not only widen.
+pub const TOP_GAP_PARTS: i32 = 25;
+
+/// The widest range the owner allows, on the pool's point spacing.
+fn widest(policy: &Policy, delta: i32, wd: i32) -> i32 {
+    floor_to(policy.max_width as i32, delta.max(1)).max(wd)
+}
+
 pub fn decide(w: &World) -> Action {
     let v = w.account;
     if v.agent.as_deref() != Some(w.me) {
@@ -224,12 +233,17 @@ pub fn decide(w: &World) -> Action {
     if cur < pos.left_point && i64::from(pos.left_point) - i64::from(cur) > threshold {
         // Price fell below the range: the position is all token X; re-enter just above the price.
         let left = floor_to(cur + ONE_SIDED_MARGIN, d) + d;
-        return Action::Rebalance { pool_id: pos.pool_id.clone(), left_point: left, right_point: left + wd };
+        // X is the user's token and it fell: the range keeps close to its old top, up to the widest
+        // allowed, so a recovery still sells at the prices it left from.
+        let right = if v.policy.exit_on_rise { left + wd } else { floor_to(pos.right_point - wd / TOP_GAP_PARTS, d).clamp(left + wd, left + widest(&v.policy, d, wd)) };
+        return Action::Rebalance { pool_id: pos.pool_id.clone(), left_point: left, right_point: right };
     }
     if cur >= pos.right_point && i64::from(cur) - i64::from(pos.right_point) > threshold {
         // Price rose above the range: all token Y; re-enter just below the price.
         let right = floor_to(cur - ONE_SIDED_MARGIN, d);
-        return Action::Rebalance { pool_id: pos.pool_id.clone(), left_point: right - wd, right_point: right };
+        // With exit_on_rise Y is the user's token and a rising point is its fall: the same rule, mirrored.
+        let left = if v.policy.exit_on_rise { (-floor_to(-(pos.left_point + wd / TOP_GAP_PARTS), d)).clamp(right - widest(&v.policy, d, wd), right - wd) } else { right - wd };
+        return Action::Rebalance { pool_id: pos.pool_id.clone(), left_point: left, right_point: right };
     }
     // Record a new best point for the exit rule; with the rule off a poke would only cost gas.
     let new_mark = if v.policy.exit_on_rise { v.low_point.is_none_or(|l| cur < l) } else { v.high_point.is_none_or(|h| cur > h) };
@@ -604,7 +618,7 @@ mod tests {
 
     #[test]
     fn re_enters_one_sided_next_to_the_price() {
-        // Below the range by 100 (> margin 20 + spacing 40): just above the price, width 160.
+        // Below the range by 100 (> margin 20 + spacing 40): just above the price, the owner's width.
         assert_eq!(run(&vault(Some((1000, 1160)), Some(1100)), 900, &[], false), Action::Rebalance { pool_id: "x|y|100".into(), left_point: 960, right_point: 1120 });
         // Above the range by 80: just below the price.
         assert_eq!(run(&vault(Some((1000, 1160)), Some(1100)), 1240, &[], false), Action::Rebalance { pool_id: "x|y|100".into(), left_point: 1040, right_point: 1200 });
@@ -615,6 +629,68 @@ mod tests {
         let mut v = vault(Some(position), None);
         v.policy.exit_drop_points = 0;
         v
+    }
+
+    #[test]
+    fn a_move_down_keeps_close_to_the_old_top() {
+        // The user's token is X: the price below the range is its fall. A 25th of the width is 40.
+        let mut v = rebalance_only((1000, 4000));
+        v.policy.min_width = 1000;
+        v.policy.max_width = 4000;
+        assert_eq!(run(&v, 900, &[], false), Action::Rebalance { pool_id: "x|y|100".into(), left_point: 960, right_point: 3960 });
+        // Its mirror: the user's token is Y, a rising point is its fall.
+        v.policy.exit_on_rise = true;
+        assert_eq!(run(&v, 4100, &[], false), Action::Rebalance { pool_id: "x|y|100".into(), left_point: 1040, right_point: 4080 });
+    }
+
+    #[test]
+    fn the_gap_follows_the_width_of_the_range() {
+        // A range three times as wide gets three times the gap, on the pool's spacing.
+        let mut v = rebalance_only((1000, 9000));
+        v.policy.min_width = 3000;
+        v.policy.max_width = 12_000;
+        assert_eq!(run(&v, 900, &[], false), Action::Rebalance { pool_id: "x|y|100".into(), left_point: 960, right_point: 8880 });
+    }
+
+    #[test]
+    fn a_move_up_keeps_the_owners_width() {
+        let mut v = rebalance_only((1000, 4000));
+        v.policy.min_width = 1000;
+        v.policy.max_width = 4000;
+        assert_eq!(run(&v, 4100, &[], false), Action::Rebalance { pool_id: "x|y|100".into(), left_point: 3080, right_point: 4080 });
+        v.policy.exit_on_rise = true;
+        assert_eq!(run(&v, 900, &[], false), Action::Rebalance { pool_id: "x|y|100".into(), left_point: 960, right_point: 1960 });
+    }
+
+    #[test]
+    fn the_kept_top_stops_at_the_widest_range_allowed() {
+        // Far below: the widest allowed, the top comes down with the price.
+        let mut v = rebalance_only((1000, 4000));
+        v.policy.min_width = 1000;
+        v.policy.max_width = 2000;
+        assert_eq!(run(&v, 300, &[], false), Action::Rebalance { pool_id: "x|y|100".into(), left_point: 360, right_point: 2360 });
+        v.policy.exit_on_rise = true;
+        assert_eq!(run(&v, 4700, &[], false), Action::Rebalance { pool_id: "x|y|100".into(), left_point: 2680, right_point: 4680 });
+        // A maximum off the spacing rounds down, and every range stays inside the owner's limits.
+        v.policy.max_width = 2050;
+        for cur in [-9000, -900, 300, 900, 4100, 4700, 9000] {
+            for rise in [false, true] {
+                v.policy.exit_on_rise = rise;
+                if let Action::Rebalance { left_point, right_point, .. } = run(&v, cur, &[], false) {
+                    let w = right_point - left_point;
+                    assert!(w >= 1000 && w <= 2050 && w % 40 == 0 && left_point % 40 == 0, "{cur} {rise}: {left_point}..{right_point}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_small_fall_never_narrows_the_range() {
+        // The old top sits closer than the owner's width: the width wins.
+        let mut v = rebalance_only((1000, 1160));
+        v.policy.min_width = 400;
+        v.policy.max_width = 1600;
+        assert_eq!(run(&v, 900, &[], false), Action::Rebalance { pool_id: "x|y|100".into(), left_point: 960, right_point: 1360 });
     }
 
     #[test]
