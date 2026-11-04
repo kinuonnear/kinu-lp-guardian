@@ -17,6 +17,7 @@ jobs:
         run: |
           cargo test -p kinu-guardian-shared --lib --features legacy-suites
           cargo test -p kinu-guardian-shared --lib v17_
+          cargo test -p kinu-guardian-shared --lib v18_window
       - name: Install cargo-near 0.21.1
         run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/near/cargo-near/releases/download/cargo-near-v0.21.1/cargo-near-installer.sh | sh
       - name: Reproducible build (Docker, sourcescan/cargo-near pinned by digest)

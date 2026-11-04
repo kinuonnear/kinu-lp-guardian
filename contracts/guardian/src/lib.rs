@@ -506,6 +506,17 @@ const DEPOSIT_GAP: &[u8] = b"depgap";
 const DEPOSIT_GAP_SECS: u64 = 10;
 #[cfg(feature = "legacy-suites")]
 const DEPOSIT_GAP_SECS: u64 = 0;
+/// Whose ordinary step holds the lock (v1.8); absent while a way out holds it.
+const LOCK_FOR: &[u8] = b"lockfor";
+/// After an ordinary step ends, only the ways out may take the lock for EXIT_WINDOW_SECS (the same
+/// record excepted, EXIT_WINDOW_OWN_STEPS more times), so steps from any number of accounts cannot
+/// keep an exit, a sale or a cash out from running (v1.8). The suites written before run without it.
+const EXIT_WINDOW: &[u8] = b"exitwin";
+#[cfg(not(feature = "legacy-suites"))]
+const EXIT_WINDOW_SECS: u64 = 5;
+#[cfg(feature = "legacy-suites")]
+const EXIT_WINDOW_SECS: u64 = 0;
+const EXIT_WINDOW_OWN_STEPS: u8 = 2;
 const MAX_LIST: usize = 50;
 const T_REGISTER: u64 = 30;
 fn unsettled() -> Vec<Who> {
@@ -934,7 +945,7 @@ impl Guardian {
             env::panic_str("Run settle first: Rhea holds tokens of yours this contract could not measure");
         }
         // A step in flight could still credit this account.
-        self.assert_free();
+        self.assert_free_exit();
         self.forget(&user);
         emit("left", json!({ "user": user }));
         Promise::new(user.account()).transfer(JOIN_DEPOSIT)
@@ -1006,7 +1017,7 @@ impl Guardian {
             emit("unlisted_refund", json!({ "user": sender_id, "token": token, "amount": amount }));
             return PromiseOrValue::Value(amount);
         }
-        if self.is_busy() || Self::deposit_waits(&sender_id, &token) {
+        if self.is_busy() || Self::window_waits(&sender_id) || Self::deposit_waits(&sender_id, &token) {
             emit("busy", json!({ "user": sender_id, "token": token, "amount": amount }));
             return PromiseOrValue::Value(amount);
         }
@@ -1014,7 +1025,7 @@ impl Guardian {
             emit("unsettled_refund", json!({ "user": sender_id, "token": token, "amount": amount }));
             return PromiseOrValue::Value(amount);
         }
-        self.lock();
+        self.lock(&sender_id);
         // New money is not what the cut loss was for: the sale it left is dropped.
         self.del_sale(&sender_id);
         PromiseOrValue::Promise(
@@ -1093,8 +1104,8 @@ impl Guardian {
         if left_point >= right_point {
             refuse(Refusal::BadRange);
         }
-        self.assert_free();
-        self.lock();
+        self.assert_free(&user);
+        self.lock(&user);
         self.begin_move(user, RebalanceRequest { pool_id, left_point, right_point }, false)
     }
 
@@ -1120,11 +1131,11 @@ impl Guardian {
         if acct.position.is_none() {
             env::panic_str("No open position: only the user opens one");
         }
-        self.assert_free();
+        self.assert_free(&user);
         // Only checked here; an action is counted once it passes every check (on_pool_for_move), so
         // a compromised agent cannot use up the user's daily actions with requests that are refused.
         acct.rate.clone().take(&acct.policy, now_secs()).unwrap_or_else(|r| refuse(r));
-        self.lock();
+        self.lock(&user);
         self.begin_move(user, request, true)
     }
 
@@ -1367,8 +1378,8 @@ impl Guardian {
             }
         }
         let Some(pos) = acct.position else { return self.begin_sale(user, by_user) };
-        self.assert_free();
-        self.lock();
+        self.assert_free_exit();
+        self.lock_exit();
         view(&self.dcl, "get_pool", json!({ "pool_id": pos.pool_id }))
             .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_POOL_EXIT)).with_unused_gas_weight(2).on_pool_for_exit(user, by_user))
     }
@@ -1455,8 +1466,8 @@ impl Guardian {
         let sale = self.sale_of(&user).unwrap_or_else(|| env::panic_str("No open position"));
         self.assert_running();
         self.assert_settled();
-        self.assert_free();
-        self.lock();
+        self.assert_free_exit();
+        self.lock_exit();
         view(&self.dcl, "get_pool", json!({ "pool_id": sale.pool_id }))
             .and(view(&sale.token_out, "storage_balance_of", json!({ "account_id": user.account() })))
             .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_SALE_POOL)).with_unused_gas_weight(2).on_pool_for_sale(user, by_user))
@@ -1617,8 +1628,8 @@ impl Guardian {
     pub fn claim_fees(&mut self, send: bool, slot: Option<u8>) -> Promise {
         let user = Who::mine(slot);
         let Some(pos) = self.account(&user).position else { env::panic_str("No open position") };
-        self.assert_free();
-        self.lock();
+        self.assert_free(&user);
+        self.lock(&user);
         emit("fees_claim_started", json!({ "user": user, "lpt_id": pos.lpt_id, "send": send }));
         call(&self.dcl, "remove_liquidity", remove_args(&pos.lpt_id, U128(0)), ZERO, tg(T_REMOVE))
             .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_FEES)).with_unused_gas_weight(2).on_fees_claimed(user, send))
@@ -1663,8 +1674,14 @@ impl Guardian {
         if amount == 0 || amount > held {
             env::panic_str("Nothing to withdraw, or more than you hold");
         }
-        self.assert_free();
-        self.lock();
+        // Everything of a token is a way out; a part of it is an ordinary step (v1.8).
+        if amount == held {
+            self.assert_free_exit();
+            self.lock_exit();
+        } else {
+            self.assert_free(&user);
+            self.lock(&user);
+        }
         acct.debit(&token, amount);
         self.put(&user, acct);
         self.pay_out(user, vec![(token, U128(amount))], None)
@@ -1678,11 +1695,11 @@ impl Guardian {
         let user = Who::mine(slot);
         let acct = self.account(&user);
         // Locked so the user cannot `leave` before a second refusal is written back.
-        self.assert_free();
+        self.assert_free(&user);
         if acct.owed_of(&token) == 0 {
             env::panic_str("Nothing owed in this token");
         }
-        self.lock();
+        self.lock(&user);
         view(&token, "ft_balance_of", json!({ "account_id": env::current_account_id() }))
             .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_CLAIM_MEASURED)).with_unused_gas_weight(2).on_claim_measured(user, token))
     }
@@ -1738,14 +1755,14 @@ impl Guardian {
     pub fn cash_out(&mut self, leave: bool, slot: Option<u8>) -> PromiseOrValue<bool> {
         let user = Who::mine(slot);
         let acct = self.account(&user);
-        self.assert_free();
+        self.assert_free_exit();
         if acct.position.is_none() && acct.payout_legs().is_empty() {
             if !leave {
                 env::panic_str("Nothing to cash out");
             }
             return PromiseOrValue::Promise(self.leave(slot));
         }
-        self.lock();
+        self.lock_exit();
         emit("cash_out_started", json!({ "user": user, "leave": leave }));
         let Some(pos) = acct.position else { return self.pay_all(user, leave) };
         PromiseOrValue::Promise(
@@ -2000,6 +2017,7 @@ impl Guardian {
             "wnear": self.wnear,
             "join_deposit": JOIN_DEPOSIT,
             "busy": self.is_busy(),
+            "exit_window": Self::exit_window().map(|(until, who, left)| json!({ "until": until, "for": who, "left": left })),
             "users": self.users.len(),
             "owner": self.owner,
             "admin_delay_secs": ADMIN_DELAY_SECS,
@@ -2163,18 +2181,54 @@ impl Guardian {
         self.busy_until > now_secs()
     }
 
-    fn assert_free(&self) {
+    /// The window after an ordinary step: until when, for whose record, and how many more ordinary
+    /// steps that record may still take inside it.
+    fn exit_window() -> Option<(u64, String, u8)> {
+        env::storage_read(EXIT_WINDOW).and_then(|v| near_sdk::borsh::from_slice(&v).ok()).filter(|w: &(u64, String, u8)| now_secs() < w.0)
+    }
+
+    /// Inside the window an ordinary step waits, unless it is the same record's, with steps left
+    /// (a page sends deposit, deposit, open in one wallet request).
+    fn window_waits(user: &Who) -> bool {
+        Self::exit_window().is_some_and(|(_, who, left)| who != user.0 || left == 0)
+    }
+
+    /// For ordinary steps: the lock, and the window that keeps a moment free for the ways out.
+    fn assert_free(&self, user: &Who) {
+        if self.is_busy() || Self::window_waits(user) {
+            env::panic_str("Another step is running; try again in a moment");
+        }
+    }
+
+    /// For the ways out (exit, the sale, cash_out, a full withdraw, leave): the lock only.
+    fn assert_free_exit(&self) {
         if self.is_busy() {
             env::panic_str("Another step is running; try again in a moment");
         }
     }
 
-    fn lock(&mut self) {
+    /// An ordinary step takes the lock; its end opens the window (v1.8).
+    fn lock(&mut self, user: &Who) {
         self.busy_until = now_secs() + BUSY_SECS;
+        env::storage_write(LOCK_FOR, user.0.as_bytes());
+    }
+
+    /// A way out takes the lock; its end opens no window, so ways out never wait on each other's.
+    fn lock_exit(&mut self) {
+        self.busy_until = now_secs() + BUSY_SECS;
+        env::storage_remove(LOCK_FOR);
     }
 
     fn unlock(&mut self) {
         self.busy_until = 0;
+        let Some(who) = env::storage_read(LOCK_FOR).and_then(|v| String::from_utf8(v).ok()) else { return };
+        env::storage_remove(LOCK_FOR);
+        let left = match Self::exit_window() {
+            Some((_, last, left)) if last == who => left.saturating_sub(1),
+            _ => EXIT_WINDOW_OWN_STEPS,
+        };
+        let window = (now_secs() + EXIT_WINDOW_SECS, who, left);
+        env::storage_write(EXIT_WINDOW, &near_sdk::borsh::to_vec(&window).unwrap_or_else(|_| env::panic_str("window")));
     }
 
     /// A step that cannot go on: release the lock, say why (the event is the only trace a wallet
@@ -2453,9 +2507,9 @@ impl Guardian {
         if list.len() > 1 {
             env::panic_str("More than one unmeasured step: the owner settles them (RecoverCredit)");
         }
-        self.assert_free();
-        self.lock();
         let user = list[0].clone();
+        self.assert_free(&user);
+        self.lock(&user);
         view(&self.dcl, "list_user_assets", json!({ "account_id": env::current_account_id() }))
             .then(Self::ext(env::current_account_id()).with_static_gas(tg(CB_OWN)).with_unused_gas_weight(2).on_settle_read(user))
     }
@@ -2570,7 +2624,7 @@ mod tests {
     #[test]
     fn a_busy_contract_returns_the_deposit_whole() {
         let mut g = joined();
-        g.lock();
+        g.lock_exit();
         ctx("tkq.testnet", ZERO);
         match g.ft_on_transfer(acc("alice.testnet"), U128(5), String::new()) {
             PromiseOrValue::Value(v) => assert_eq!(v, U128(5)),
@@ -2588,7 +2642,7 @@ mod tests {
         assert_eq!(g.on_deposit_measured(acc("alice.testnet").into(), acc("tkq.testnet"), U128(7), U128(100), U128(3), assets("tkq.testnet", 103)), U128(4));
         assert_eq!(held(&g, "alice.testnet", "tkq.testnet"), 8);
         // Rhea failed: nothing credited, all of it back, and no second read.
-        g.lock();
+        g.lock_exit();
         assert!(matches!(g.on_forwarded(acc("alice.testnet").into(), acc("tkq.testnet"), U128(9), U128(100), Err(PromiseError::Failed)), PromiseOrValue::Value(U128(9))));
         assert_eq!(held(&g, "alice.testnet", "tkq.testnet"), 8);
         assert!(!g.is_busy(), "deposit steps release the lock");
@@ -2599,7 +2653,7 @@ mod tests {
         // M2 (review 30 Oct): the token says Rhea took 10, Rhea's balance grew by 2.
         let mut g = joined();
         ctx("guardian.testnet", ZERO);
-        g.lock();
+        g.lock_exit();
         assert_eq!(g.on_deposit_measured(acc("alice.testnet").into(), acc("tkq.testnet"), U128(10), U128(500), U128(10), assets("tkq.testnet", 502)), U128(0));
         assert_eq!(held(&g, "alice.testnet", "tkq.testnet"), 2);
         assert!(!g.is_busy());
@@ -2612,12 +2666,12 @@ mod tests {
     fn an_unreadable_balance_credits_nothing_and_unlocks() {
         let mut g = joined();
         ctx("guardian.testnet", ZERO);
-        g.lock();
+        g.lock_exit();
         assert_eq!(g.on_deposit_measured(acc("alice.testnet").into(), acc("tkq.testnet"), U128(5), U128(0), U128(5), Err(PromiseError::Failed)), U128(0));
         assert_eq!(held(&g, "alice.testnet", "tkq.testnet"), 0);
         assert!(!g.is_busy());
         // The first read failed: nothing was forwarded, the whole transfer goes back.
-        g.lock();
+        g.lock_exit();
         assert!(matches!(g.on_deposit_before(acc("alice.testnet").into(), acc("tkq.testnet"), U128(5), Err(PromiseError::Failed)), PromiseOrValue::Value(U128(5))));
         assert!(!g.is_busy());
     }
@@ -2638,7 +2692,7 @@ mod tests {
     fn a_refused_add_returns_the_tokens_and_the_lock() {
         let mut g = joined();
         ctx("guardian.testnet", ZERO);
-        g.lock();
+        g.lock_exit();
         let pool = PoolView { token_x: acc("tkq.testnet"), token_y: acc("wrap.testnet"), current_point: 0 };
         let req = RebalanceRequest { pool_id: POOL.into(), left_point: -1400, right_point: 1400 };
         let r = g.added(acc("alice.testnet").into(), req, pool, [U128(10), U128(20), U128(0), U128(0)], Added::Refused);
@@ -2651,7 +2705,7 @@ mod tests {
     fn measured_leftovers_go_back_to_the_ledger() {
         let mut g = joined();
         ctx("guardian.testnet", ZERO);
-        g.lock();
+        g.lock_exit();
         let pool = PoolView { token_x: acc("tkq.testnet"), token_y: acc("wrap.testnet"), current_point: 0 };
         let after: HashMap<AccountId, U128> = [(acc("tkq.testnet"), U128(1_000)), (acc("wrap.testnet"), U128(5_015))].into_iter().collect();
         // Lent 100 x and 200 y; before 1_100 x and 5_200 y: the add took 100 x and 185 y.
@@ -2665,7 +2719,7 @@ mod tests {
     }
     fn refused_payout(g: &mut Guardian, who: &str, token: &str, amount: u128) {
         ctx("guardian.testnet", ZERO);
-        g.lock();
+        g.lock_exit();
         assert!(matches!(g.out_paid(acc(who).into(), vec![(acc(token), U128(amount))], None, vec![false]), PromiseOrValue::Value(false)));
     }
 
@@ -2730,7 +2784,7 @@ mod tests {
         // Less arrived than even that (the wallet holds only Bob's 7 and 50 more): never Bob's share.
         deposited(&mut g, "alice.testnet", "tkq.testnet", 100);
         ctx("guardian.testnet", ZERO);
-        g.lock();
+        g.lock_exit();
         assert!(matches!(g.out_arrived(acc("alice.testnet").into(), vec![(acc("tkq.testnet"), U128(100))], None, vec![Some(106 + 50)]), PromiseOrValue::Promise(_)));
         assert!(near_sdk::test_utils::get_logs().iter().any(|l| l.contains("\"arrived\":\"50\"")));
         // Nothing arrived at all: nothing sent, the chain ends unlocked.
@@ -2852,7 +2906,7 @@ mod tests {
         g.join(policy(), None, None);
         deposited(&mut g, "bob.testnet", "tkq.testnet", 9);
         ctx("guardian.testnet", ZERO);
-        g.lock();
+        g.lock_exit();
         // Rhea closed the position but answered in a shape this code does not know.
         assert!(!g.exited(acc("alice.testnet").into(), tkq_pool(), false, Removed::Unknown));
         assert!(g.get_account(acc("alice.testnet").into()).unwrap().position.is_none(), "the record says the position is gone");
@@ -2896,7 +2950,7 @@ mod tests {
     fn a_payout_where_nothing_arrived_is_not_paid_and_waits_for_settle() {
         let mut g = joined();
         ctx("guardian.testnet", ZERO);
-        g.lock();
+        g.lock_exit();
         assert!(matches!(g.out_arrived(acc("alice.testnet").into(), vec![(acc("tkq.testnet"), U128(100))], None, vec![Some(0)]), PromiseOrValue::Value(false)));
         assert_eq!(g.get_unsettled(), vec![acc("alice.testnet")]);
         assert!(!g.is_busy());
@@ -2906,12 +2960,12 @@ mod tests {
     fn unmeasured_deposits_and_leftovers_wait_for_settle() {
         let mut g = joined();
         ctx("guardian.testnet", ZERO);
-        g.lock();
+        g.lock_exit();
         let _ = g.on_deposit_measured(acc("alice.testnet").into(), acc("tkq.testnet"), U128(10), U128(1_000), U128(10), Err(PromiseError::Failed));
         assert_eq!(g.get_unsettled(), vec![acc("alice.testnet")]);
         assert_eq!(held(&g, "alice.testnet", "tkq.testnet"), 0, "nothing trusted from the token");
         set_unsettled(&[]);
-        g.lock();
+        g.lock_exit();
         let _ = g.on_measured(acc("alice.testnet").into(), tkq_pool(), [U128(10), U128(20), U128(0), U128(0)], Err(PromiseError::Failed));
         assert_eq!(g.get_unsettled(), vec![acc("alice.testnet")]);
         assert!(!g.is_busy());
@@ -2922,7 +2976,7 @@ mod tests {
         let mut g = joined();
         with_position(&mut g);
         ctx("guardian.testnet", ZERO);
-        g.lock();
+        g.lock_exit();
         assert!(matches!(g.fees_claimed(acc("alice.testnet").into(), true, Removed::Unknown), PromiseOrValue::Value(false)));
         assert!(g.get_account(acc("alice.testnet").into()).unwrap().position.is_some(), "claiming fees never closes the position");
         assert_eq!(g.get_unsettled(), vec![acc("alice.testnet")]);
@@ -2932,7 +2986,7 @@ mod tests {
         let mut a = g.get_account(acc("alice.testnet").into()).unwrap();
         a.position = None;
         g.accounts.insert(acc("alice.testnet"), a);
-        g.lock();
+        g.lock_exit();
         let req = RebalanceRequest { pool_id: POOL.into(), left_point: -1400, right_point: 1400 };
         assert!(matches!(g.added(acc("alice.testnet").into(), req, tkq_pool(), [U128(10), U128(20), U128(0), U128(0)], Added::Unknown), PromiseOrValue::Promise(_)));
         assert!(g.get_account(acc("alice.testnet").into()).unwrap().position.is_none());
@@ -2943,7 +2997,7 @@ mod tests {
         let mut g = joined();
         with_position(&mut g);
         ctx("guardian.testnet", ZERO);
-        g.lock();
+        g.lock_exit();
         assert!(matches!(g.cash_out_closed(acc("alice.testnet").into(), true, Removed::Unknown), PromiseOrValue::Value(false)));
         let a = g.get_account(acc("alice.testnet").into()).expect("no leaving before settle");
         assert!(a.position.is_none());
@@ -3331,7 +3385,7 @@ mod tests {
     #[test]
     fn the_lock_expires() {
         let mut g = joined();
-        g.lock();
+        g.lock_exit();
         assert!(g.is_busy());
         testing_env!(VMContextBuilder::new().predecessor_account_id(acc("alice.testnet")).current_account_id(acc("guardian.testnet")).block_timestamp((BUSY_SECS + 1) * 1_000_000_000).build());
         assert!(!g.is_busy());
@@ -3638,7 +3692,7 @@ mod tests {
         ctx("alice.testnet", ZERO);
         tp(&mut g, Some(TakeProfit { point: 5_000, above: true }), None);
         ctx("guardian.testnet", ZERO);
-        g.lock();
+        g.lock_exit();
         let _ = g.cash_out_closed(acc("alice.testnet").into(), false, Removed::Amounts(0, 0));
         assert_eq!(g.get_take_profit(acc("alice.testnet").into()), None);
     }
@@ -3797,7 +3851,7 @@ mod tests {
         let mut g = joined();
         join_slot(&mut g, "alice.testnet", Some("thief.testnet"), 1);
         ctx("guardian.testnet", ZERO);
-        g.lock();
+        g.lock_exit();
         let mut a = g.account(&w("alice.testnet", 0));
         a.position = Some(PositionRef { lpt_id: "t#1".into(), pool_id: POOL.into(), left_point: 0, right_point: 100 });
         g.put(&w("alice.testnet", 0), a);
@@ -3839,7 +3893,7 @@ mod tests {
         ctx("guardian.testnet", ZERO);
         mark_unsettled(&w("alice.testnet", 1), "test");
         assert_eq!(g.get_unsettled(), vec![w("alice.testnet", 1)]);
-        g.lock();
+        g.lock_exit();
         assert!(g.settled(w("alice.testnet", 1), &HashMap::from([(acc("tkq.testnet"), U128(9))])));
         assert_eq!(holds(&g, w("alice.testnet", 1), "tkq.testnet"), 4, "what Rhea holds beyond all ledgers");
         assert_eq!(holds(&g, w("alice.testnet", 0), "tkq.testnet"), 5);
@@ -4041,6 +4095,71 @@ mod tests {
         g.set_policy(policy(), None);
     }
 
+    // ---------- the exit window (v1.8): ordinary steps cannot keep the ways out from the lock ----------
+
+    #[test]
+    #[cfg(not(feature = "legacy-suites"))]
+    fn v18_window_after_an_ordinary_step_only_ways_out_and_the_same_record_pass() {
+        let mut g = fresh();
+        let (alice, bob) = (Who::of(&acc("alice.testnet"), 0), Who::of(&acc("bob.testnet"), 0));
+        at("guardian.testnet", 100);
+        g.assert_free(&bob);
+        g.lock(&bob);
+        assert!(panics(|| g.assert_free_exit()), "the lock itself holds everyone");
+        g.unlock();
+        assert!(!g.is_busy());
+        assert!(panics(|| g.assert_free(&alice)), "another record's ordinary step waits");
+        g.assert_free_exit();
+        // The same record: deposit, deposit, open in one wallet request.
+        for _ in 0..EXIT_WINDOW_OWN_STEPS {
+            g.assert_free(&bob);
+            g.lock(&bob);
+            g.unlock();
+        }
+        assert!(panics(|| g.assert_free(&bob)), "then the same record waits too");
+        assert!(Guardian::window_waits(&alice));
+        at("guardian.testnet", 100 + EXIT_WINDOW_SECS);
+        g.assert_free(&alice);
+        g.assert_free(&bob);
+        assert_eq!(g.get_config()["exit_window"], Value::Null);
+    }
+
+    #[test]
+    #[cfg(not(feature = "legacy-suites"))]
+    fn v18_window_a_way_out_opens_none() {
+        let mut g = fresh();
+        let alice = Who::of(&acc("alice.testnet"), 0);
+        at("guardian.testnet", 100);
+        g.lock_exit();
+        g.unlock();
+        g.assert_free(&alice);
+        // A chain that dies and lets the lock run out opens none either.
+        g.lock(&alice);
+        at("guardian.testnet", 100 + BUSY_SECS);
+        g.assert_free(&Who::of(&acc("bob.testnet"), 0));
+    }
+
+    #[test]
+    #[cfg(not(feature = "legacy-suites"))]
+    fn v18_window_a_full_withdraw_is_a_way_out_and_a_part_is_not() {
+        let mut g = listed_ready();
+        ctx("alice.testnet", JOIN_DEPOSIT);
+        g.join(policy(), None, None);
+        let (alice, bob) = (Who::of(&acc("alice.testnet"), 0), Who::of(&acc("bob.testnet"), 0));
+        let wrap = acc("wrap.testnet");
+        let mut acct = g.account(&alice);
+        acct.credit(&wrap, 100);
+        g.put(&alice, acct);
+        at("guardian.testnet", 100);
+        g.lock(&bob);
+        g.unlock();
+        testing_env!(VMContextBuilder::new().predecessor_account_id(acc("alice.testnet")).current_account_id(acc("guardian.testnet")).block_timestamp(101 * 1_000_000_000).build());
+        assert!(panics(|| drop(g.withdraw(wrap.clone(), Some(U128(40)), None))), "a part waits in another record's window");
+        assert_eq!(g.account(&alice).held(&wrap), 100);
+        let _ = g.withdraw(wrap.clone(), None, None);
+        assert_eq!(g.account(&alice).held(&wrap), 0, "everything goes out inside the window");
+    }
+
     // ---------- the sale after a cut loss (v1.8): every failure ends with the tokens somewhere the user reaches ----------
 
     fn sale_ready() -> (Guardian, Who, Sale, PoolView) {
@@ -4071,7 +4190,7 @@ mod tests {
     #[test]
     fn v18_a_refused_sale_moves_nothing() {
         let (mut g, alice, sale, pool) = sale_ready();
-        g.lock();
+        g.lock_exit();
         // No wallet registration on a token that is not NEAR: the output would sit in Rhea's lost and found.
         let wrong = Sale { pool_id: sale.pool_id.clone(), token_in: sale.token_out.clone(), token_out: sale.token_in.clone() };
         g.put_sale(&alice, &wrong);
@@ -4081,21 +4200,21 @@ mod tests {
         assert!(!g.is_busy());
         g.put_sale(&alice, &sale);
         // No pool read.
-        g.lock();
+        g.lock_exit();
         assert!(matches!(g.sale_checked(alice.clone(), true, None, true), PromiseOrValue::Value(false)));
         assert_eq!(g.account(&alice).held(&acc("tkq.testnet")), 10);
         assert!(!g.is_busy());
         // The agent with no read, and with one too far away.
-        g.lock();
+        g.lock_exit();
         assert!(matches!(g.sale_checked(alice.clone(), false, Some(pool.clone()), true), PromiseOrValue::Value(false)));
         g.seen.insert(acc("alice.testnet"), Seen { point: SALE_BAND_POINTS + 1, at_secs: 9_700 });
         at("guardian.testnet", 10_000);
-        g.lock();
+        g.lock_exit();
         assert!(matches!(g.sale_checked(alice.clone(), false, Some(pool.clone()), true), PromiseOrValue::Value(false)));
         assert_eq!(g.account(&alice).held(&acc("tkq.testnet")), 10);
         // At the edge of the band it starts, and the ledger is debited before anything leaves.
         g.seen.insert(acc("alice.testnet"), Seen { point: SALE_BAND_POINTS, at_secs: 9_700 });
-        g.lock();
+        g.lock_exit();
         assert!(matches!(g.sale_checked(alice.clone(), false, Some(pool), true), PromiseOrValue::Promise(_)));
         assert_eq!(g.account(&alice).held(&acc("tkq.testnet")), 0);
     }
@@ -4103,7 +4222,7 @@ mod tests {
     #[test]
     fn v18_rhea_keeping_the_tokens_puts_them_back_on_the_ledger() {
         let (mut g, alice, sale, pool) = sale_ready();
-        g.lock();
+        g.lock_exit();
         let _ = g.sale_checked(alice.clone(), true, Some(pool), true);
         assert_eq!(g.account(&alice).held(&acc("tkq.testnet")), 0);
         testing_env!(
@@ -4122,14 +4241,14 @@ mod tests {
     #[test]
     fn v18_a_lost_read_leaves_the_tokens_owed_and_the_lock_free() {
         let (mut g, alice, sale, pool) = sale_ready();
-        g.lock();
+        g.lock_exit();
         let _ = g.sale_checked(alice.clone(), true, Some(pool), true);
         assert!(matches!(g.sale_arrived(alice.clone(), sale.clone(), U128(10), -300, None), PromiseOrValue::Value(false)));
         assert_eq!(g.account(&alice).owed_of(&acc("tkq.testnet")), 10);
         assert_eq!(owed_total(&acc("tkq.testnet")), 10);
         assert!(!g.is_busy());
         // The read after the swap, too.
-        g.lock();
+        g.lock_exit();
         assert!(matches!(g.sold(alice.clone(), sale, U128(4), None), PromiseOrValue::Value(false)));
         assert_eq!(g.account(&alice).owed_of(&acc("tkq.testnet")), 14);
         assert!(!g.is_busy());
@@ -4138,7 +4257,7 @@ mod tests {
     #[test]
     fn v18_nothing_arriving_is_marked_for_settle() {
         let (mut g, alice, sale, pool) = sale_ready();
-        g.lock();
+        g.lock_exit();
         let _ = g.sale_checked(alice.clone(), true, Some(pool), true);
         assert!(matches!(g.sale_arrived(alice.clone(), sale, U128(10), -300, Some(0)), PromiseOrValue::Value(false)));
         assert!(unsettled().contains(&alice));
@@ -4149,16 +4268,16 @@ mod tests {
     fn v18_what_the_swap_left_goes_to_the_wallet_never_more_than_was_sent() {
         let (mut g, alice, sale, _) = sale_ready();
         // All sold.
-        g.lock();
+        g.lock_exit();
         assert!(matches!(g.sold(alice.clone(), sale.clone(), U128(10), Some(0)), PromiseOrValue::Value(true)));
         assert!(!g.is_busy());
         // Part sold: a transfer follows, and what others are owed in that wallet is left alone.
         set_owed_total(&acc("tkq.testnet"), 100);
-        g.lock();
+        g.lock_exit();
         assert!(matches!(g.sold(alice.clone(), sale.clone(), U128(10), Some(104)), PromiseOrValue::Promise(_)));
         assert!(near_sdk::test_utils::get_logs().iter().any(|l| l.contains("\"event\":\"sold\"") && l.contains("\"sold\":\"6\"") && l.contains("\"rest\":\"4\"")));
         // A wallet holding more than this sale put in pays no more than this sale put in.
-        g.lock();
+        g.lock_exit();
         assert!(matches!(g.sold(alice, sale, U128(10), Some(1_000)), PromiseOrValue::Promise(_)));
         assert!(near_sdk::test_utils::get_logs().iter().any(|l| l.contains("\"rest\":\"10\"")));
     }

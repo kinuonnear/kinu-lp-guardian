@@ -29,6 +29,14 @@ struct T {
 }
 impl T {
     async fn call_gas(&self, from: &str, to: &str, method: &str, args: Value, deposit: NearToken, tgas: u64) -> String {
+        // Like the page and the agent: wait out the window another record's ordinary step left (v1.8).
+        loop {
+            let w = self.view(G, "get_config", json!({})).await["exit_window"].clone();
+            if w.is_null() || w["for"] == from {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
         let out = Contract(to.parse().unwrap())
             .call_function(method, args)
             .transaction()
@@ -143,6 +151,7 @@ async fn snapshot(t: &T, who: &[&str]) -> Value {
     cfg.as_object_mut().unwrap().remove("version");
     cfg.as_object_mut().unwrap().remove("pauser");
     cfg.as_object_mut().unwrap().remove("deposit_free_at");
+    cfg.as_object_mut().unwrap().remove("exit_window");
     out.insert("config".into(), cfg);
     Value::Object(out)
 }
