@@ -55,7 +55,7 @@ mod run_impl {
     pub const GUARDIAN: &str = "lp.kinuonnear.near";
     // v1.8: the reproducible CI build of 34bb96b (run 41521583452, NEP-330 metadata inside). The metadata
     // names the commit, so only that run's artifact has this hash.
-    pub const GUARDIAN_CODE_HASH: &str = "kcsm8sEcCThKswuPh7uLgAPYKkqvCBk3jDmpvkACETb";
+    pub const GUARDIAN_CODE_HASH: &str = "BrTcgXH9A8U9rtvoGJu3kjZaKjiTvFUs6htt8tMrfNRq";
     pub const DCL: &str = "dclv2.ref-labs.near";
     /// Where `retire` returns the agent's gas: KINU's account, which funds the agent.
     pub const RETIRE_TO: &str = "kinuonnear.near";
