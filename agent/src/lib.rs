@@ -410,10 +410,10 @@ pub fn rebalance_pays(daily_fee_usd: f64, near_usd: f64) -> bool {
 }
 
 /// The one call on the shared contract the agent makes for a user, as (method, args json).
-/// Rhea DCL build Guardian was tested on (2.4.1). When Rhea runs anything else, the agent holds every
+/// Rhea DCL build Guardian was tested on (2.4.2, all suites 6 Nov 2026). When Rhea runs anything else, the agent holds every
 /// re-centre (it closes and re-opens a position on untested code) but still exits by the user's rules and
 /// pokes: an exit only closes, and the tokens stay on the user's Guardian balance.
-pub const RHEA_CODE_HASH: &str = "BzhtCCGJibs9ykCZUuMZ9Diq3gFAi4ZGeMHgEuVqvoiA";
+pub const RHEA_CODE_HASH: &str = "3G34Nhjmir5JPYPtijaA9iCNnHDPR7h3wfC9H77woEGo";
 
 /// The action to send when Rhea runs `rhea_code`: a re-centre becomes a noop unless it is the tested build.
 pub fn hold_on_rhea_change(action: Action, rhea_code: &str) -> Action {
