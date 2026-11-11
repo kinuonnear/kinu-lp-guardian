@@ -9,10 +9,11 @@ cd "$(dirname "$0")/.."
 
 RPC=${NEAR_RPC:-https://free.rpc.fastnear.com}
 G=lp.kinuonnear.near
+DAO=kinu-guardian.sputnik-dao.near
 DCL=dclv2.ref-labs.near
 AGENT=a18c4ac6d011b41a394570c843aa48a47539312e36004c56650cb00cbf7ac810
-# The reproducible CI builds of 34bb96b (run 41521583452) and 077d229 (run 41374566538); v1.7 stands
-# until the upgrade to v1.8 has run.
+# The reproducible CI builds of the contract: v1.8 (78ea017) runs on mainnet since 8 Nov 2026; v1.7 (077d229,
+# run 41374566538) is kept so an older read still names what it saw.
 CODE_V18=BrTcgXH9A8U9rtvoGJu3kjZaKjiTvFUs6htt8tMrfNRq
 CODE_V17=Cs89ihQAYiDCbaV3c9ZxY7rsthKMWmDXR3ijQBb72E9p
 RHEA=3G34Nhjmir5JPYPtijaA9iCNnHDPR7h3wfC9H77woEGo
@@ -35,6 +36,8 @@ cfg=$(config)
 if [ -n "$cfg" ]; then
   delay=$(field admin_delay_secs "$cfg")
   [ "$delay" = 172800 ] && say PASS "every admin action waits 48 hours in public (admin_delay_secs $delay)" || say FAIL "admin delay is $delay"
+  owner=$(field owner "$cfg")
+  [ "$owner" = "\"$DAO\"" ] && say PASS "the owner is the DAO $DAO: an upgrade needs 2 of 3 members, then the 48 hours" || say FAIL "the owner is $owner, not the DAO $DAO"
   say INFO "version $(field version "$cfg"), paused $(field paused "$cfg"), owner $(field owner "$cfg"), waiting actions $(field pending "$cfg")"
 else
   say FAIL "get_config unreadable"
