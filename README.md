@@ -21,8 +21,10 @@ Guide: [kinudefi.com/docs/guardian](https://kinudefi.com/docs/guardian)
 | Agent | OutLayer project `agent.kinuonnear.near/kinu-guardian`, active build `5aaad2670b5b…65dc` (commit `2496b01`), account `a18c4ac6…c810` |
 | Rhea | the agent and the page treat DCL 2.4.2 (`3G34Nhjm…`) as the tested build; on any other code the agent holds re-centres and sales, exits still run |
 
-The contract account still has its own full-access key, held offline by KINU from the deploy. Until it
-is deleted it could deploy code without the DAO; the app says so next to the contract link.
+The contract account has no access key: its last one was deleted on 11 Nov 2026
+([tx](https://nearblocks.io/txns/JDob5Uba3wbvxaQNjtNyyCstu69VosMXuFT9me7y5Agc)). The code can change only by
+the DAO's vote and then the 48 hours: anyone may stage a build (with a deposit for its storage), only the
+DAO can propose it, and anyone can run it once the wait is over.
 
 ## Check it yourself
 
@@ -30,7 +32,7 @@ Each line is something to run, and what you should see.
 
 | Run | You see |
 | --- | --- |
-| `./scripts/verify.sh` (about 2 min, needs curl and python3; cargo for the unit tests) | `PASS` for the code hash, the 48 h delay, the DAO owner, the agent's limited key, the Rhea build, the TEE check and the 18 refusals; `ALL CHECKS PASSED` |
+| `./scripts/verify.sh` (about 2 min, needs curl and python3; cargo for the unit tests) | `PASS` for the code hash, the 48 h delay, the DAO owner, the contract account having no key, the agent's limited key, the Rhea build, the TEE check and the 18 refusals; `ALL CHECKS PASSED` |
 | `python3 scripts/check-agent-tee.py` | 8 `PASS` lines: the attested run executed the active agent wasm, through the agent's project; input and output hash to the attested values; it returned the agent's account, whose only key it is; the five TDX measurements are approved on `worker.outlayer.near`; Intel's signature, approved build and binding (job 1353205) |
 | `outlayer-verify bundle demo/tee-proof-5aaad267.json --offline` | `PROVEN`: the same proof with no network at all ([outlayer-verify](https://github.com/out-layer/outlayer-verify)) |
 | [app.outlayer.ai/attestation/1353205](https://app.outlayer.ai/attestation/1353205?network=mainnet), press Verify | Authenticity, Identity and Binding pass; executed binary `5aaad267…` |

@@ -42,6 +42,8 @@ if [ -n "$cfg" ]; then
 else
   say FAIL "get_config unreadable"
 fi
+own=$(rpc "{\"request_type\":\"view_access_key_list\",\"finality\":\"final\",\"account_id\":\"$G\"}" | python3 -I -c 'import json,sys; print(len(json.load(sys.stdin)["result"]["keys"]))' 2>/dev/null)
+[ "$own" = 0 ] && say PASS "$G has no access key: only the DAO's vote and the 48 hours can change its code" || say FAIL "$G has ${own:-unreadable} access key(s)"
 keys=$(rpc "{\"request_type\":\"view_access_key_list\",\"finality\":\"final\",\"account_id\":\"$AGENT\"}")
 python3 -I - "$keys" "$G" <<'PY'
 import json, sys
