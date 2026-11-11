@@ -54,6 +54,10 @@ pub struct MockDcl {
     pools: IterableMap<String, Pool>,
     positions: IterableMap<String, Position>,
     next_id: u64,
+    /// Test hook, a Rhea upgrade: TGas its liquidity and withdraw calls now need.
+    burn: u64,
+    /// Test hook, a Rhea upgrade: which answer changed its shape, or which method went ("gone").
+    shape: String,
 }
 
 fn akey(user: &AccountId, token: &AccountId) -> String {
@@ -64,7 +68,7 @@ fn akey(user: &AccountId, token: &AccountId) -> String {
 impl MockDcl {
     #[init]
     pub fn new() -> Self {
-        Self { users: LookupMap::new(Key::Users), assets: IterableMap::new(Key::Assets), pools: IterableMap::new(Key::Pools), positions: IterableMap::new(Key::Positions), next_id: 0 }
+        Self { users: LookupMap::new(Key::Users), assets: IterableMap::new(Key::Assets), pools: IterableMap::new(Key::Pools), positions: IterableMap::new(Key::Positions), next_id: 0, burn: 0, shape: String::new() }
     }
 
     #[payable]
@@ -83,13 +87,29 @@ impl MockDcl {
         pool_id
     }
 
+    /// Test hook: what a Rhea upgrade changed.
+    pub fn set_change(&mut self, burn: u64, shape: String) {
+        self.burn = burn;
+        self.shape = shape;
+    }
+
+    fn burn_gas(&self) {
+        let mut h = [0u8; 32];
+        while env::used_gas().as_tgas() < self.burn {
+            h = env::sha256_array(h);
+        }
+    }
+
     /// Test hook: move a pool's price.
     pub fn set_point(&mut self, pool_id: String, point: i32) {
         self.pools.get_mut(&pool_id).expect("E403: pool not exist").current_point = point;
     }
 
-    pub fn get_pool(&self, pool_id: String) -> Option<Pool> {
-        self.pools.get(&pool_id).cloned()
+    pub fn get_pool(&self, pool_id: String) -> near_sdk::serde_json::Value {
+        if self.shape == "pool" {
+            return near_sdk::serde_json::json!({ "id": pool_id });
+        }
+        near_sdk::serde_json::json!(self.pools.get(&pool_id))
     }
 
     /// msg "\"Deposit\"": credits the sender's internal balance of the calling token.
@@ -133,19 +153,26 @@ impl MockDcl {
         lpt_id
     }
 
-    pub fn get_liquidity(&self, lpt_id: String) -> Option<Position> {
-        self.positions.get(&lpt_id).cloned()
+    pub fn get_liquidity(&self, lpt_id: String) -> near_sdk::serde_json::Value {
+        if self.shape == "liquidity" {
+            return near_sdk::serde_json::json!({ "liquidity_now": "1" });
+        }
+        near_sdk::serde_json::json!(self.positions.get(&lpt_id))
     }
 
     /// As in Rhea DCL: amount 0 only claims fees (nothing is removed); the full liquidity closes it.
-    pub fn remove_liquidity(&mut self, lpt_id: String, amount: U128, min_amount_x: U128, min_amount_y: U128) -> (U128, U128) {
+    pub fn remove_liquidity(&mut self, lpt_id: String, amount: U128, min_amount_x: U128, min_amount_y: U128) -> near_sdk::serde_json::Value {
+        self.burn_gas();
+        if self.shape == "gone" {
+            env::panic_str("E000: method changed");
+        }
         let user = env::predecessor_account_id();
         let p = self.positions.get(&lpt_id).cloned().unwrap_or_else(|| env::panic_str("E207: lpt not exist"));
         if p.owner_id != user {
             env::panic_str("E215: not lpt owner");
         }
         if amount.0 == 0 {
-            return (U128(0), U128(0));
+            return near_sdk::serde_json::json!([U128(0), U128(0)]);
         }
         if amount.0 != p.amount.0 {
             env::panic_str("mock: only full removal is modelled");
@@ -157,7 +184,10 @@ impl MockDcl {
         self.give(&user, &pool.token_x, p.amount_x.0);
         self.give(&user, &pool.token_y, p.amount_y.0);
         self.positions.remove(&lpt_id);
-        (p.amount_x, p.amount_y)
+        if self.shape == "removed" {
+            return near_sdk::serde_json::json!({ "x": p.amount_x, "y": p.amount_y });
+        }
+        near_sdk::serde_json::json!([p.amount_x, p.amount_y])
     }
 
     pub fn list_liquidities(&self, account_id: AccountId) -> Vec<Position> {
@@ -165,17 +195,21 @@ impl MockDcl {
     }
 
     /// Same shape as Rhea DCL: every token with a non-zero internal balance.
-    pub fn list_user_assets(&self, account_id: AccountId) -> HashMap<AccountId, U128> {
+    pub fn list_user_assets(&self, account_id: AccountId) -> near_sdk::serde_json::Value {
+        if self.shape == "assets" {
+            return near_sdk::serde_json::json!([]);
+        }
         let prefix = format!("{account_id}#");
-        self.assets
-            .iter()
-            .filter(|(k, v)| k.starts_with(&prefix) && **v > 0)
-            .map(|(k, v)| (k[prefix.len()..].parse().unwrap(), U128(*v)))
-            .collect()
+        let list: HashMap<AccountId, U128> = self.assets.iter().filter(|(k, v)| k.starts_with(&prefix) && **v > 0).map(|(k, v)| (k[prefix.len()..].parse().unwrap(), U128(*v))).collect();
+        near_sdk::serde_json::json!(list)
     }
 
     /// Sends the whole internal balance of a token back to the caller.
     pub fn withdraw_asset(&mut self, token_id: AccountId, amount: Option<U128>) -> Promise {
+        self.burn_gas();
+        if self.shape == "gone" {
+            env::panic_str("E000: method changed");
+        }
         let user = env::predecessor_account_id();
         let k = akey(&user, &token_id);
         let have = self.assets.get(&k).copied().unwrap_or(0);

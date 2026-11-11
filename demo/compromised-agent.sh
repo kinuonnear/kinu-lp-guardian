@@ -39,6 +39,8 @@ setup)
   fi
   step 'wrap 0.1 NEAR' "$VF" "$V" "$WRAP" near_deposit '{}' '0.1 NEAR'
   P="{\"policy\":{\"allowed_pools\":[\"$POOL\"],\"min_width\":1400,\"max_width\":5600,\"max_distance\":3000,\"max_actions\":12,\"window_secs\":86400,\"max_slippage_bps\":100,\"exit_drop_points\":0,\"exit_on_rise\":false,\"rebalance_buffer_points\":3000},\"agent\":\"$A\"}"
+  step 'list both tokens from Rhea' "$VF" "$V" "$G" list_from_rhea "{\"token\":\"$WRAP\"}" '0 NEAR'
+  step 'list both tokens from Rhea' "$VF" "$V" "$G" list_from_rhea "{\"token\":\"${POOL%%|*}\"}" '0 NEAR'
   step 'join, agent = attacker' "$VF" "$V" "$G" join "$P" '0.01 NEAR'
   step 'deposit 0.1 wNEAR' "$VF" "$V" "$WRAP" ft_transfer_call "{\"receiver_id\":\"$G\",\"amount\":\"100000000000000000000000\",\"msg\":\"\"}" '1 yoctoNEAR'
   c=$(point); r=$((c-40)); l=$((r-1800)); echo "point $c, range $l..$r"
@@ -48,19 +50,24 @@ setup)
 attack)
   before=$(account); c=$(point)
   lpt=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["position"]["lpt_id"])' "$before")
-  { echo "# Compromised agent, mainnet run $(date -u +%F\ %H:%M) UTC"; echo; echo "Contract $G v1.5.0. Agent key held by the attacker: \`$A\`. Victim: \`$V\`, lpt \`$lpt\`, pool point $c."; echo; echo '| Attempt | Result | Contract answer | Proof |'; echo '| --- | --- | --- | --- |'; } | tee "$OUT"
+  { echo "# Compromised agent, mainnet run $(date -u +%F\ %H:%M) UTC"; echo; echo "Contract $G v$(view "$G" get_config '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])'). Agent key held by the attacker: \`$A\`. Victim: \`$V\`, lpt \`$lpt\`, pool point $c."; echo; echo '| Attempt | Result | Contract answer | Proof |'; echo '| --- | --- | --- | --- |'; } | tee "$OUT"
   try 'Move the funds to another pool' "$G" request_rebalance "{\"user\":\"$V\",\"request\":{\"pool_id\":\"$WRAP|evil.near|100\",\"left_point\":$((c-700)),\"right_point\":$((c+700))}}" "not in the owner's allowed list"
   try 'Range wider than the owner allows' "$G" request_rebalance "{\"user\":\"$V\",\"request\":{\"pool_id\":\"$POOL\",\"left_point\":$((c-4000)),\"right_point\":$((c+4000))}}" "wider than the owner"
   try 'Range narrower than the minimum' "$G" request_rebalance "{\"user\":\"$V\",\"request\":{\"pool_id\":\"$POOL\",\"left_point\":$((c-50)),\"right_point\":$((c+50))}}" "narrower than the owner"
   try 'Range far from the price' "$G" request_rebalance "{\"user\":\"$V\",\"request\":{\"pool_id\":\"$POOL\",\"left_point\":$((c+10000)),\"right_point\":$((c+11400))}}" "too far from the pool"
   try 'Churn a position for fees and gas' "$G" request_rebalance "{\"user\":\"$V\",\"request\":{\"pool_id\":\"$POOL\",\"left_point\":$((c-700)),\"right_point\":$((c+700))}}" "not far enough outside"
   try 'Close the position (no exit allowed)' "$G" exit "{\"user\":\"$V\"}" "has not allowed the agent to exit"
+  try 'Drop a sale for its own ends' "$G" cancel_sale '{}' "exactly 1 yoctoNEAR"
   try 'Withdraw the tokens' "$G" withdraw "{\"token\":\"$WRAP\"}" "has not joined"
   try 'Cash out' "$G" cash_out '{"leave":false}' "has not joined"
-  try 'Change the rules' "$G" set_policy '{"policy":{"allowed_pools":["x|y|100"],"min_width":1,"max_width":1,"max_distance":1,"max_actions":1,"window_secs":1,"max_slippage_bps":1,"exit_drop_points":1,"exit_on_rise":false,"rebalance_buffer_points":0}}' "has not joined"
-  try 'Name another agent' "$G" set_agent "{\"agent\":\"$A\"}" "has not joined"
+  try 'Change the rules' "$G" set_policy '{"policy":{"allowed_pools":["x|y|100"],"min_width":1,"max_width":1,"max_distance":1,"max_actions":1,"window_secs":1,"max_slippage_bps":1,"exit_drop_points":1,"exit_on_rise":false,"rebalance_buffer_points":0}}' "exactly 1 yoctoNEAR"
+  try 'Name another agent' "$G" set_agent "{\"agent\":\"$A\"}" "exactly 1 yoctoNEAR"
   try 'Take over as owner' "$G" propose '{"action":{"SetOwner":{"owner":"'"$A"'"}}}' "Only the owner"
   try 'Pause the contract' "$G" set_paused '{"paused":true}' "Only the owner"
+  try 'Pause through the pauser role' "$G" pause '{}' "Only the pauser"
+  try 'List its own token' "$G" list_tokens '{"tokens":["evil.near"],"listed":true}' "Only the owner"
+  try 'Trust its own factory' "$G" list_factories '{"parents":["evil.near"],"trusted":true}' "Only the owner"
+  try 'Name itself pauser' "$G" propose '{"action":{"SetPauser":{"pauser":"'"$A"'"}}}' "Only the owner"
   try 'Pull the position from Rhea directly' "$DCL" remove_liquidity "{\"lpt_id\":\"$lpt\",\"amount\":\"1\",\"min_amount_x\":\"0\",\"min_amount_y\":\"0\"}" "panicked"
   after=$(account)
   if [ "$before" = "$after" ]; then s='The victim record is byte for byte the same before and after.'; else s='VICTIM RECORD CHANGED'; fi
